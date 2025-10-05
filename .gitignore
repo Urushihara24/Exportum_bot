@@ -1,0 +1,17 @@
+venv/
+env/
+.env
+credentials.json
+service_account_credentials.json
+*.pickle
+data/
+*.json
+!requirements.json
+*.log
+logs/
+__pycache__/
+*.py[cod]
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
