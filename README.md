@@ -107,6 +107,8 @@
 
 ---
 
+---
+
 ## 🛠️ Технологии
 
 <div align="center">
@@ -128,29 +130,108 @@
 
 </div>
 
-### Детальный список библиотек:
+---
 
-| Библиотека | Версия | Назначение |
-|------------|--------|------------|
-| `aiogram` | 3.0+ | Асинхронный фреймворк для Telegram Bot API |
-| `gspread` | 5.0+ | Работа с Google Sheets |
-| `oauth2client` | 4.1+ | Авторизация Google API |
-| `beautifulsoup4` | 4.12+ | Парсинг веб-страниц |
-| `requests` | 2.31+ | HTTP-запросы для парсинга |
-| `pandas` | 2.0+ | Обработка и анализ данных |
-| `python-dotenv` | 1.0+ | Управление переменными окружения |
-| `apscheduler` | 3.10+ | Планировщик задач |
+<div align="center">
+
+### 📚 Детальный список библиотек
+
+<table width="90%">
+<thead>
+<tr>
+<th align="center" width="30%">Библиотека</th>
+<th align="center" width="15%">Версия</th>
+<th align="left" width="55%">Назначение</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td align="center"><code>aiogram</code></td>
+<td align="center">3.0+</td>
+<td>Асинхронный фреймворк для Telegram Bot API</td>
+</tr>
+<tr>
+<td align="center"><code>gspread</code></td>
+<td align="center">5.0+</td>
+<td>Работа с Google Sheets</td>
+</tr>
+<tr>
+<td align="center"><code>oauth2client</code></td>
+<td align="center">4.1+</td>
+<td>Авторизация Google API</td>
+</tr>
+<tr>
+<td align="center"><code>beautifulsoup4</code></td>
+<td align="center">4.12+</td>
+<td>Парсинг веб-страниц</td>
+</tr>
+<tr>
+<td align="center"><code>requests</code></td>
+<td align="center">2.31+</td>
+<td>HTTP-запросы для парсинга</td>
+</tr>
+<tr>
+<td align="center"><code>pandas</code></td>
+<td align="center">2.0+</td>
+<td>Обработка и анализ данных</td>
+</tr>
+<tr>
+<td align="center"><code>python-dotenv</code></td>
+<td align="center">1.0+</td>
+<td>Управление переменными окружения</td>
+</tr>
+<tr>
+<td align="center"><code>apscheduler</code></td>
+<td align="center">3.10+</td>
+<td>Планировщик задач</td>
+</tr>
+</tbody>
+</table>
+
+</div>
 
 ---
 
 ## 📦 Установка
 
-### Требования:
+<div align="center">
 
-- ✅ Python 3.10 или выше
-- ✅ Telegram Bot Token (от [@BotFather](https://t.me/BotFather))
-- ✅ Google Cloud Project с включенным Google Sheets API
-- ✅ Учетная запись Google для Sheets
+### ✅ Требования
 
-### Шаг 1: Клонирование репозитория
+<table width="80%">
+<tr>
+<td align="center" width="50%">
+  
+**🐍 Python 3.10+**  
+Современная версия Python
+
+</td>
+<td align="center" width="50%">
+  
+**🤖 Telegram Bot Token**  
+От [@BotFather](https://t.me/BotFather)
+
+</td>
+</tr>
+<tr>
+<td align="center" width="50%">
+  
+**☁️ Google Cloud Project**  
+С включенным Google Sheets API
+
+</td>
+<td align="center" width="50%">
+  
+**📊 Google Account**  
+Для работы со Sheets
+
+</td>
+</tr>
+</table>
+
+</div>
+
+---
+
+
 
