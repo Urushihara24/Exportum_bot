@@ -56,8 +56,8 @@ logging.basicConfig(
 )
 
 
-API_TOKEN = os.getenv('BOT_TOKEN', '8180339161:AAFRk8446gKMagAkUTGjGyFDTFHa__mVOY0')
-ADMIN_ID = int(os.getenv('173014517', '1481790360'))
+API_TOKEN = os.getenv('BOT_TOKEN', '')
+ADMIN_ID = int(os.getenv('', ''))
 
 CONFIG = {
     'timeout': 15,
@@ -224,14 +224,8 @@ DEAL_STATUSES = {
     'cancelled': '❌ Отменена'
 }
 
-# ============================================================================
-# КРИТИЧНЫЕ НЕДОСТАЮЩИЕ ФУНКЦИИ (добавлены при исправлении)
-# ============================================================================
-# ==================== НОВЫЕ ФУНКЦИИ ====================
 def translate_pull_status(status: str, current_volume: float = None, target_volume: float = None) -> str:
     '''Переводит статус пула на русский с эмодзи'''
-    
-    # Если статус не задан, но известны объёмы — определяем автоматически
     if not status and current_volume is not None and target_volume is not None:
         if current_volume >= target_volume:
             status = 'filled'
