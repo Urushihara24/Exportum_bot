@@ -92,7 +92,7 @@ NEWS_FILE = 'data/news.json'
 SHIPPINGREQUESTSFILE = 'shippingrequests.pkl'
 
 GOOGLE_SHEETS_CREDENTIALS = 'credentials.json'
-SPREADSHEET_ID = "1DywxtuWW4-1Q0O71ajVaBB5Ih15nZjA4rvlpV7P7NOA"
+SPREADSHEET_ID = ""
 
 bot = Bot(token=API_TOKEN)
 storage = MemoryStorage()
