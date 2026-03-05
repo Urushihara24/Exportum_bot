@@ -1,17 +1,53 @@
-venv/
-env/
-.env
-credentials.json
-service_account_credentials.json
-*.pickle
-data/
-*.json
-!requirements.json
-*.log
-logs/
+# ------------------------------
+# Python / Build / Tool caches
+# ------------------------------
 __pycache__/
 *.py[cod]
-.vscode/
-.idea/
+*.pyo
+*.pyd
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# ------------------------------
+# Virtual environments
+# ------------------------------
+.venv/
+venv/
+env/
+
+# ------------------------------
+# Local env and secrets
+# ------------------------------
+.env
+.env.*
+!.env.example
+credentials.json
+*.pem
+*.key
+
+# ------------------------------
+# Runtime artifacts / local data
+# ------------------------------
+logs/
+*.log
+bot.out
+bot_logs.log
+data/
+requests.json
+users.json
+archive/
+
+# ------------------------------
+# OS / IDE noise
+# ------------------------------
 .DS_Store
-Thumbs.db
+.idea/
+.vscode/

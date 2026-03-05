@@ -12,8 +12,6 @@ import re
 import time
 import json
 import pickle
-import sqlite3
-import traceback
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -30,14 +28,9 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
     KeyboardButton,
-    Message,
     CallbackQuery,
-    ContentType,
-    InputFile,
-    ChatMember,
 )
 from aiogram.dispatcher import FSMContext
-from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.dispatcher.filters import Text
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.utils import executor
@@ -73,10 +66,7 @@ logging.basicConfig(
 # ════════════════════════════════════════════════════════════════════
 # КОНФИГУРАЦИЯ
 # ════════════════════════════════════════════════════════════════════
-API_TOKEN = os.getenv("BOT_TOKEN", "")
-ADMIN_ID = int(os.getenv("ADMIN_ID", ""))
 DB_PATH = "bot_data.db"
-CHANNEL_ID = "@your_channel"  # Замените на ID канала (-1001234567890)
 
 CONFIG = {
     "timeout": 15,
@@ -108,9 +98,6 @@ PULLS_JSON = os.path.join(DATA_DIR, "pulls.json")
 PRICES_FILE = os.path.join(DATA_DIR, "prices.json")
 NEWS_FILE = os.path.join(DATA_DIR, "news.json")
 GOOGLE_SHEETS_CREDENTIALS = "credentials.json"
-SPREADSHEET_ID = ""
-USERS_FILE = "users.json"
-BATCHES_FILE = "batches.pkl"
 # ════════════════════════════════════════════════════════════════════
 # ИНИЦИАЛИЗАЦИЯ БОТА - ТОЛЬКО ОДИН РАЗ!
 # ════════════════════════════════════════════════════════════════════
@@ -163,13 +150,6 @@ news_cache = {"data": [], "updated": None}
 last_prices_update = None
 last_news_update = None
 
-shipping_requests = {}
-logistics_requests = {}
-logistic_offers = {}
-deliveries = {}
-logistics_offers = {}
-# Экспедитор
-expeditor_offers = {}
 
 # ============================================================================
 # КОНСТАНТЫ
@@ -205,7 +185,6 @@ ROLES = {
     "farmer": "🌾 Фермер",
     "exporter": "📦 Экспортёр",
     "logistic": "🚚 Логист",
-    "expeditor": "🚛 Экспедитор",
 }
 
 CULTURES = ["Пшеница", "Ячмень", "Кукуруза", "Подсолнечник", "Рапс", "Соя"]
@@ -232,7 +211,6 @@ PORTS = [
     "Агрофуд",
     "Моспорт",
     "ЦГП",
-    "ФЗТ",
     "АМП",
     "Армада",
     "Стрелец",
@@ -282,8 +260,6 @@ def translate_pull_status(
 
 def migrate_all_existing_pulls():
     """✅ КРИТИЧЕСКАЯ МИГРАЦИЯ: Добавляем новые поля во ВСЕ старые пулы"""
-    global pulls
-
     logging.info("🔄 ЗАПУСК МИГРАЦИИ ПУЛОВ...")
     migrated = 0
 
@@ -344,7 +320,6 @@ def migrate_all_existing_pulls():
 def migrate_old_pulls():
     """Устанавливает статус для старых пулов без статуса"""
     migrated_count = 0
-    valid_statuses = ["active", "filled", "closed", "completed", "cancelled"]
 
     all_pulls = pulls.get("pulls", {})  # ✅ ДОБАВЛЕНО
 
@@ -396,74 +371,9 @@ def migrate_old_pulls():
         logging.info("ℹ️ Миграция не требуется: все пулы уже имеют корректный статус")
 
 
-# ════════════════════════════════════════════════════════════════════════════════
-# 🔄 КОНВЕРТЕРЫ ДАННЫХ - для чтения текущего формата
-# ════════════════════════════════════════════════════════════════════════════════
-
-
-def get_pull_with_participants(pull_id):
-    """Получить пул с участниками в одном объекте (твой текущий формат)"""
-    global pulls
-
-    if not pulls or "pulls" not in pulls:
-        return None
-
-    all_pulls = pulls.get("pulls", {})
-
-    if pull_id in all_pulls:
-        return all_pulls[pull_id]  # ✅ Вернёт пул со ВСЕМИ данными включая участников
-
-    return None
-
-
-def get_farmers_from_pull(pull_id):
-    """Получить фермеров, присоединившихся к пулу"""
-    global pulls
-
-    pull_data = get_pull_with_participants(pull_id)
-    if not pull_data:
-        return []
-
-    # ✅ Читаем данные в твоём текущем формате
-    farmer_ids = pull_data.get("farmer_ids", [])
-
-    if isinstance(farmer_ids, list):
-        return farmer_ids
-
-    return []
-
-
-def get_batches_from_pull(pull_id):
-    """Получить партии, присоединившиеся к пулу"""
-    global pulls
-
-    pull_data = get_pull_with_participants(pull_id)
-    if not pull_data:
-        return []
-
-    # ✅ Читаем батчи в твоём формате
-    batches = pull_data.get("batches", [])
-
-    if isinstance(batches, list):
-        return batches
-
-    return []
-
-
-def get_all_pulls_with_format():
-    """Получить ВСЕ пулы в твоём текущем формате"""
-    global pulls
-
-    if not pulls or "pulls" not in pulls:
-        return {}
-
-    return pulls.get("pulls", {})
-
-
 # ✅ БЕЗ async - только обычная функция!
 def find_matching_batches(pull_data):
     """Поиск подходящих партий для пула"""
-    global batches
     matching_batches = []
 
     if not batches or not isinstance(batches, dict):
@@ -506,12 +416,8 @@ def find_matching_batches(pull_data):
 def _batch_matches_pull(batch, pull_data):
     """✅ Логика сравнения батча и пула"""
     return (
-        batch.get("culture", "").lower() == pull_data.get("culture", "").lower()
-        and batch.get("status") == "Активна"
         and batch.get("price", float("inf"))
         <= pull_data.get("price", float("inf")) * 0.75
-        and batch.get("humidity", 999) <= pull_data.get("moisture", 0)
-        and batch.get("impurity", 999) <= pull_data.get("impurity", 0)
     )
 
 
@@ -547,11 +453,8 @@ def validate_batch_volume(batch: dict, pull: dict) -> tuple:
 
 async def check_and_close_pool_if_full(pull_id: int):
     """Автоматически закрывает пул если current_volume >= target_volume"""
-    if pull_id not in pulls.get("pulls", {}):
         logging.error(f"❌ Пул #{pull_id} не найден")
         return
-
-    pull = pulls["pulls"][pull_id]
     current = pull.get("current_volume", 0)
     target = pull.get("target_volume", 0)
 
@@ -568,7 +471,6 @@ async def check_and_close_pool_if_full(pull_id: int):
             f"🎉 <b>Пул #{pull_id} закрыт!</b>\n\n"
             f"📦 Культура: {pull.get('culture', 'Неизвестна')}\n"
             f"📊 Объём: {current}/{target} т\n"
-            f"✅ Пул заполнен и готов к отгрузке."
         )
 
         keyboard = InlineKeyboardMarkup()
@@ -633,12 +535,8 @@ def save_deals_to_pickle():
 
 
 def save_farmers_logistics():
-    """Сохранение заявок фермеров на логистику"""
     try:
-        path = os.path.join(DATA_DIR, "farmer_logistics_requests.pkl")
-        with open(path, "wb") as f:
             pickle.dump(farmer_logistics_requests, f)
-        logging.info(f"✅ Заявки фермеров: {len(farmer_logistics_requests)}")
     except Exception as e:
         logging.error(f"❌ Ошибка сохранения farmer_logistics: {e}")
 
@@ -668,29 +566,22 @@ def save_shipping_requests_data():
 def save_logistics_offers_data():
     """Сохранение предложений логистов"""
     try:
-        if logistics_offers:
-            path = os.path.join(DATA_DIR, "logistics_offers.pkl")
-            with open(path, "wb") as f:
-                pickle.dump(logistics_offers, f)
-            logging.info(f"✅ Предложения логистов: {len(logistics_offers)}")
+        with open(path, "wb") as f:
     except Exception as e:
-        logging.error(f"❌ Ошибка сохранения logistics_offers: {e}")
 
 
 def save_expeditor_data():
     """Сохранение данных экспедиторов"""
     try:
-        if expeditor_cards:
-            path = os.path.join(DATA_DIR, "expeditor_cards.pkl")
-            with open(path, "wb") as f:
-                pickle.dump(expeditor_cards, f)
-            logging.info(f"✅ Карточки экспедиторов: {len(expeditor_cards)}")
+        path = os.path.join(DATA_DIR, "expeditor_cards.pkl")
+        with open(path, "wb") as f:
+            pickle.dump(expeditor_cards, f)
+        logging.info(f"✅ Карточки экспедиторов: {len(expeditor_cards)}")
 
-        if expeditor_offers:
-            path = os.path.join(DATA_DIR, "expeditor_offers.pkl")
-            with open(path, "wb") as f:
-                pickle.dump(expeditor_offers, f)
-            logging.info(f"✅ Предложения экспедиторов: {len(expeditor_offers)}")
+        path = os.path.join(DATA_DIR, "expeditor_offers.pkl")
+        with open(path, "wb") as f:
+            pickle.dump(expeditor_offers, f)
+        logging.info(f"✅ Предложения экспедиторов: {len(expeditor_offers)}")
     except Exception as e:
         logging.error(f"❌ Ошибка сохранения expeditor: {e}")
 
@@ -698,11 +589,10 @@ def save_expeditor_data():
 def save_logistics_cards_data():
     """Сохранение карточек логистов"""
     try:
-        if logistics_cards:
-            path = os.path.join(DATA_DIR, "logistics_cards.pkl")
-            with open(path, "wb") as f:
-                pickle.dump(logistics_cards, f)
-            logging.info(f"✅ Карточки логистов: {len(logistics_cards)}")
+        path = os.path.join(DATA_DIR, "logistics_cards.pkl")
+        with open(path, "wb") as f:
+            pickle.dump(logistics_cards, f)
+        logging.info(f"✅ Карточки логистов: {len(logistics_cards)}")
     except Exception as e:
         logging.error(f"❌ Ошибка сохранения logistics_cards: {e}")
 
@@ -741,9 +631,6 @@ def save_data():
 
 def load_data():
     """✅ Загрузка ВСЕ данных при старте"""
-    global farmer_logistics_requests, logistics_requests, shipping_requests
-    global logistics_offers, expeditor_cards, expeditor_offers, logistics_cards
-    global pulls, users, batches  # ✅ ВАЖНО!
 
     try:
         logging.info("🔄 Начинаю загрузку данных...")
@@ -752,9 +639,6 @@ def load_data():
         # ════════════════════════════════════════════════════════════════════════════
         # ✅ ЗАГРУЖАЕМ USERS
         # ════════════════════════════════════════════════════════════════════════════
-        if os.path.exists(os.path.join(DATA_DIR, "users.json")):
-            with open(os.path.join(DATA_DIR, "users.json"), "r", encoding="utf-8") as f:
-                users = json.load(f)
                 logging.info(f"✅ Пользователи загружены: {len(users)}")
 
         # ════════════════════════════════════════════════════════════════════════════
@@ -762,8 +646,6 @@ def load_data():
         # ════════════════════════════════════════════════════════════════════════════
         if os.path.exists(os.path.join(DATA_DIR, "batches.pkl")):
             with open(os.path.join(DATA_DIR, "batches.pkl"), "rb") as f:
-                batches = pickle.load(f)
-                logging.info(f"✅ Партии загружены")
 
         # ════════════════════════════════════════════════════════════════════════════
         # ✅ ЗАГРУЖАЕМ PULLS С PULLPARTICIPANTS (КРИТИЧНОЕ!)
@@ -794,7 +676,6 @@ def load_data():
                                 )
                             else:
                                 # ✅ Это словарь пулов
-                                pulls["pulls"] = pulls_data
                         else:
                             pulls["pulls"] = {}
                     else:
@@ -823,7 +704,6 @@ def load_data():
                                 pulls["pullparticipants"] = {}
                             else:
                                 # ✅ Это словарь участников (ключи = ID пулов)
-                                pulls["pullparticipants"] = pullparticipants_data
                         else:
                             pulls["pullparticipants"] = {}
                     else:
@@ -872,11 +752,7 @@ def load_data():
                 logging.info(f"✅ Заявки доставки загружены: {len(shipping_requests)}")
 
         # Загружаем предложения
-        if os.path.exists(os.path.join(DATA_DIR, "logistics_offers.pkl")):
-            with open(os.path.join(DATA_DIR, "logistics_offers.pkl"), "rb") as f:
-                logistics_offers = pickle.load(f)
                 logging.info(
-                    f"✅ Предложения логистов загружены: {len(logistics_offers)}"
                 )
 
         if os.path.exists(os.path.join(DATA_DIR, "expeditor_cards.pkl")):
@@ -907,11 +783,6 @@ def load_data():
         else:
             # Если файла нет, вычисляем максимальный ID из существующих партий
             max_id = 0
-            for user_batches in batches.values():
-                for batch in user_batches:
-                    batch_id = batch.get("id", 0)
-                    if batch_id > max_id:
-                        max_id = batch_id
             batch_counter = max_id
             logging.info(f"✅ batch_counter вычислен из партий: {batch_counter}")
 
@@ -931,7 +802,6 @@ def get_logistics_by_port(port):
         if isinstance(ports, str):
             ports = [p.strip() for p in ports.split(",")]
         if port in ports or "Все порты" in ports:
-            user = users.get(uid, {})
             result.append(
                 {
                     "user_id": uid,
@@ -948,26 +818,16 @@ def get_logistics_by_port(port):
     return result
 
 
-def get_expeditors_by_port(port):
-    """Поиск экспедиторов по порту с полной информацией"""
     result = []
     for uid, card in expeditor_cards.items():
         ports = card.get("ports", [])
         if isinstance(ports, str):
-            ports = [p.strip() for p in ports.split(",")]
         if port in ports or "Все порты" in ports:
-            user = users.get(uid, {})
             result.append(
                 {
                     "user_id": uid,
                     "name": user.get("name", "Н/Д"),
-                    "company": card.get("company", user.get("name", "Н/Д")),
-                    "inn": user.get("inn", "Н/Д"),  # ✅ ДОБАВИЛИ
-                    "ogrn": user.get("ogrn", "Не указан"),  # ✅ ДОБАВИЛИ
                     "phone": user.get("phone", "Н/Д"),
-                    "email": user.get("email", "Н/Д"),  # ✅ ДОБАВИЛИ
-                    "services": card.get("services", "Н/Д"),
-                    "dt_price": card.get("dt_price", 0),
                 }
             )
     return result
@@ -980,23 +840,13 @@ def get_expeditors_by_port(port):
 
 def get_pull_with_participants(pull_id):
     """Получить пул с участниками в одном объекте (твой текущий формат)"""
-    global pulls
-
     if not pulls or "pulls" not in pulls:
         return None
 
-    all_pulls = pulls.get("pulls", {})
-
-    if pull_id in all_pulls:
-        return all_pulls[pull_id]  # ✅ Вернёт пул со ВСЕМИ данными включая участников
-
-    return None
 
 
 def get_farmers_from_pull(pull_id):
     """Получить фермеров, присоединившихся к пулу"""
-    global pulls
-
     pull_data = get_pull_with_participants(pull_id)
     if not pull_data:
         return []
@@ -1012,8 +862,6 @@ def get_farmers_from_pull(pull_id):
 
 def get_batches_from_pull(pull_id):
     """Получить партии, присоединившиеся к пулу"""
-    global pulls
-
     pull_data = get_pull_with_participants(pull_id)
     if not pull_data:
         return []
@@ -1029,8 +877,6 @@ def get_batches_from_pull(pull_id):
 
 def get_all_pulls_with_format():
     """Получить ВСЕ пулы в твоём текущем формате"""
-    global pulls
-
     if not pulls or "pulls" not in pulls:
         return {}
 
@@ -1117,37 +963,24 @@ def format_logistics_cards(logistics):
     return text
 
 
-def format_expeditors_cards(expeditors):
-    """Форматирование карточек экспедиторов для отображения в списке"""
     if not expeditors:
         return "❌ Экспедиторы не найдены для данного портового комплекса"
 
     text = "<b>📋 НАЙДЕННЫЕ ЭКСПЕДИТОРЫ:</b>\n\n"
 
     for i, exp in enumerate(expeditors[:5], 1):
-        # Основные данные
         company = exp.get("company", exp.get("name", "Н/Д"))
         phone = exp.get("phone", "Н/Д")
-        services = exp.get("services", "Н/Д")
-        dt_price = exp.get("dt_price", 0)
-
-        # Реквизиты
         inn = exp.get("inn", "Н/Д")
         ogrn = exp.get("ogrn", "Не указан")
-        email = exp.get("email", "Н/Д")
 
-        # Формируем карточку
         text += f"{i}. 📋 <b>{company}</b>\n"
         text += f"   🏢 ИНН: {inn} | ОГРН: {ogrn}\n"
         text += f"   📱 <code>{phone}</code>\n"
-
         if email != "Н/Д":
             text += f"   📧 <code>{email}</code>\n"
 
-        text += f"   🛠️ {services}\n"
-        text += f"   💰 {dt_price:,.0f} ₽\n\n"
 
-    # Информация об остальных
     if len(expeditors) > 5:
         text += f"<i>ℹ️ Ещё {len(expeditors) - 5} экспедиторов в результатах</i>\n"
         text += "❓ Запросите доступ к полному списку"
@@ -1168,8 +1001,6 @@ def save_logistics_requests_to_pickle():
 def save_logistics_offers_to_pickle():
     """Сохранение предложений"""
     try:
-        with open(os.path.join(DATA_DIR, "logistics_offers.pkl"), "wb") as f:
-            pickle.dump(logistics_offers, f)
         logging.info("✅ Предложения сохранены")
     except Exception as e:
         logging.error(f"❌ Ошибка: {e}")
@@ -1210,7 +1041,6 @@ def load_logistic_offers():
         filepath = os.path.join(DATA_DIR, "logistic_offers.pkl")
         if os.path.exists(filepath):
             with open(filepath, "rb") as f:
-                logistic_offers = pickle.load(f)
             logging.info(f"✅ Loaded {len(logistic_offers)} logistic offers")
         else:
             logistic_offers = {}
@@ -1234,7 +1064,6 @@ def load_deliveries():
         filepath = os.path.join(DATA_DIR, "deliveries.pkl")
         if os.path.exists(filepath):
             with open(filepath, "rb") as f:
-                deliveries = pickle.load(f)
             logging.info(f"✅ Loaded {len(deliveries)} deliveries")
         else:
             deliveries = {}
@@ -1246,7 +1075,6 @@ def load_deliveries():
 def save_expeditor_offers():
     """Сохранение предложений экспедиторов"""
     try:
-        with open("data/expeditor_offers.pkl", "wb") as f:
             pickle.dump(expeditor_offers, f)
         logging.info(f"✅ Сохранено {len(expeditor_offers)} предложений экспедиторов")
     except Exception as e:
@@ -1270,7 +1098,6 @@ def load_expeditor_offers():
         file_path = os.path.join(DATA_DIR, "expeditor_offers.pkl")
         if os.path.exists(file_path):
             with open(file_path, "rb") as f:
-                expeditor_offers = pickle.load(f)
             logging.info(f"✅ Loaded {len(expeditor_offers)} expeditor offers")
         else:
             expeditor_offers = {}
@@ -1288,7 +1115,6 @@ def load_expeditor_cards():
         file_path = os.path.join(DATA_DIR, "expeditor_cards.pkl")
         if os.path.exists(file_path):
             with open(file_path, "rb") as f:
-                expeditor_cards = pickle.load(f)
             logging.info(f"✅ Загружено карточек экспедиторов: {len(expeditor_cards)}")
         else:
             expeditor_cards = {}
@@ -1303,8 +1129,6 @@ def load_expeditor_cards():
 # ============================================================================
 
 
-def parse_callback_id(callback_data: str) -> int:
-    """✅ ПРАВИЛЬНЫЙ парсинг ID из callback_data"""
 
     # ✅ Список префиксов которые НЕ содержат ID
     non_id_prefixes = ["culture:", "port:", "region:", "back_to_pulls"]
@@ -1322,12 +1146,7 @@ def parse_callback_id(callback_data: str) -> int:
         else:
             id_str = callback_data
 
-        # ✅ Проверяем что это число
-        if not id_str.isdigit():
-            logging.warning(f"⚠️ parse_callback_id: не числовой ID: {id_str}")
-            return None
-
-        return int(id_str)
+        return None
 
     except (ValueError, IndexError) as e:
         logging.error(f"❌ parse_callback_id ошибка: {e} для {callback_data}")
@@ -1352,10 +1171,8 @@ class EditRequestStates(StatesGroup):
 
 
 class FarmerShippingRequestStates(StatesGroup):
-    """State Group для создания заявки на доставку"""
 
     select_batch = State()
-    select_destination = State()
     select_transport = State()
     confirm = State()
 
@@ -1378,20 +1195,7 @@ class CreateLogisticCardStates(StatesGroup):
 
 # FSM для создания карточки экспедитора
 class CreateExpeditorCardStates(StatesGroup):
-    services = State()
-    dt_price = State()
-    ports = State()
     experience = State()
-    additional_info = State()
-
-
-class ExpeditorCardStates(StatesGroup):
-    """Состояния для создания карточки экспедитора"""
-
-    vehicle_type = State()
-    capacity = State()
-    regions = State()
-    price_per_km = State()
     description = State()
 
 
@@ -1687,7 +1491,6 @@ def farmer_keyboard():
     keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
     keyboard.add("➕ Добавить партию")
     keyboard.add("🚚 Создать заявку на доставку")
-    keyboard.add("📬 МОИ ЗАЯВКИ")  # ← ПРОСТО ТЕКСТ, как и остальные
     keyboard.row("🔧 Мои партии", "🎯 Пулы")
     keyboard.row("🔍 Поиск экспортёров", "📋 Мои сделки")
     keyboard.row("🚚 Предложения логистов")
@@ -1776,26 +1579,11 @@ async def expeditor_view_deal_details(callback: types.CallbackQuery, state: FSMC
         await callback.answer("❌ Ошибка", show_alert=True)
         return
 
-    # Ищем сделку
-    deal = None
-    for exporter_deals in deals.values():
-        for d in exporter_deals:
-            if d["id"] == deal_id:
-                deal = d
-                break
-        if deal:
-            break
-
     if not deal:
         await callback.answer("❌ Сделка не найдена", show_alert=True)
         return
 
     msg = f"📋 <b>Сделка #{deal_id}</b>\n\n"
-    msg += f"🌾 Культура: {deal['culture']}\n"
-    msg += f"📦 Объём: {deal['total_volume']} т\n"
-    msg += f"💰 Цена: {deal['price']:,.0f} ₽/т\n"
-    msg += f"🚢 Порт: {deal['port']}\n"
-    msg += f"👥 Участников: {len(deal.get('participants', []))}\n\n"
 
     keyboard = InlineKeyboardMarkup(row_width=1)
     keyboard.add(
@@ -1822,16 +1610,6 @@ async def expeditor_take_deal(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer("❌ Ошибка", show_alert=True)
         return
 
-    # Ищем сделку
-    deal = None
-    for exporter_deals in deals.values():
-        for d in exporter_deals:
-            if d["id"] == deal_id:
-                deal = d
-                break
-        if deal:
-            break
-
     if not deal:
         await callback.answer("❌ Сделка не найдена", show_alert=True)
         return
@@ -1844,7 +1622,6 @@ async def expeditor_take_deal(callback: types.CallbackQuery, state: FSMContext):
 
     # Назначаем экспедитора
     deal["expeditor_id"] = user_id
-    deal["expeditor_name"] = users[user_id].get("name", "Неизвестно")
     deal["status"] = "in_progress"
 
     save_deals_to_pickle()
@@ -1853,9 +1630,6 @@ async def expeditor_take_deal(callback: types.CallbackQuery, state: FSMContext):
 
     await callback.message.edit_text(
         f"✅ <b>Сделка #{deal_id} взята в работу!</b>\n\n"
-        f"🌾 {deal['culture']} • {deal['total_volume']} т\n"
-        f"🚢 Порт: {deal['port']}\n\n"
-        f"Перейдите в '📋 Мои сделки' для работы с документами.",
         parse_mode="HTML",
     )
 
@@ -1864,22 +1638,12 @@ async def expeditor_take_deal(callback: types.CallbackQuery, state: FSMContext):
         await bot.send_message(
             deal["exporter_id"],
             f"✅ <b>Сделка #{deal_id} взята в работу!</b>\n\n"
-            f"📋 Экспедитор: {users[user_id].get('name')}\n"
-            f"📱 Телефон: {users[user_id].get('phone')}\n\n"
-            f"Экспедитор начнёт оформление документов.",
             parse_mode="HTML",
         )
     except Exception as e:
         logging.error(f"Ошибка уведомления экспортёра: {e}")
 
 
-def admin_keyboard():
-    """Клавиатура для админа"""
-    keyboard = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    keyboard.add(KeyboardButton("👥 Пользователи"), KeyboardButton("📊 Статистика"))
-    keyboard.add(KeyboardButton("📢 Рассылка"), KeyboardButton("📥 Экспорт данных"))
-    keyboard.add(KeyboardButton("🔄 Обновить цены"), KeyboardButton("📈 Аналитика"))
-    keyboard.add(KeyboardButton("🏠 Главное меню"))
     return keyboard
 
 
@@ -1889,41 +1653,24 @@ def adminkeyboard():
 
 
 def format_admin_statistics():
-    """Форматирование статистики для админа"""
     total_users = len(users)
-    farmers_count = len([u for u in users.values() if u.get("role") == "farmer"])
-    exporters_count = len([u for u in users.values() if u.get("role") == "exporter"])
-    logistics_count = len([u for u in users.values() if u.get("role") == "logistic"])
-    expeditors_count = len([u for u in users.values() if u.get("role") == "expeditor"])
 
-    total_pulls = len(pulls)
-    active_pulls = len([p for p in pulls.values() if p.get("status") == "active"])
 
-    total_batches = sum(len(batches) for user_batches in batches.values())
 
     total_requests = len(shipping_requests)
-    active_requests = len(
-        [r for r in shipping_requests.values() if r.get("status") == "active"]
     )
 
     msg = "📊 <b>Статистика бота</b>\n\n"
     msg += "👥 <b>Пользователи:</b>\n"
-    msg += f"  • Всего: {total_users}\n"
-    msg += f"  • Фермеры: {farmers_count}\n"
-    msg += f"  • Экспортёры: {exporters_count}\n"
-    msg += f"  • Логисты: {logistics_count}\n"
-    msg += f"  • Экспедиторы: {expeditors_count}\n\n"
+    msg += f"• Всего: {total_users}\n"
 
-    msg += "🎯 <b>Пулы:</b>\n"
-    msg += f"  • Всего: {total_pulls}\n"
-    msg += f"  • Активные: {active_pulls}\n\n"
+    msg += f"• Всего: {total_pulls}\n"
+    msg += f"• Активные: {active_pulls}\n\n"
 
-    msg += "📦 <b>Партии:</b>\n"
-    msg += f"  • Всего: {total_batches}\n\n"
+    msg += f"• Всего: {total_batches}\n\n"
 
     msg += "🚚 <b>Заявки на логистику:</b>\n"
-    msg += f"  • Всего: {total_requests}\n"
-    msg += f"  • Активные: {active_requests}\n"
+    msg += f"• Всего: {total_requests}\n"
 
     return msg
 
@@ -1961,11 +1708,7 @@ async def reset_account(message: types.Message, state: FSMContext):
 
 @dp.callback_query_handler(lambda c: c.data.startswith("confirm_reset:"), state="*")
 async def confirm_reset_account(callback: CallbackQuery, state: FSMContext):
-    """Подтверждение удаления аккаунта пользователя с синхронизацией ссылок на партии в пуле, и сохранением данных."""
-
     user_id = parse_callback_id(callback.data)
-
-    if callback.from_user.id != user_id:
         await callback.answer("❌ Это не ваш аккаунт", show_alert=True)
         return
 
@@ -1973,23 +1716,17 @@ async def confirm_reset_account(callback: CallbackQuery, state: FSMContext):
 
     # 1. Удаляем пользователя из памяти
     if user_id in users:
-        role = users[user_id].get("role", "user")
         del users[user_id]
         deleted_items.append(f"профиль ({role})")
         logging.info(f"✅ Удалён user {user_id} из памяти")
 
-    # 2. Удаляем партии пользователя и синхронизируем пулы
     user_batches = batches.pop(user_id, [])
-    batch_ids_to_delete = [b["id"] for b in user_batches if "id" in b]
     batch_count = len(user_batches)
     if batch_count > 0:
         deleted_items.append(f"{batch_count} партий")
         logging.info(f"✅ Удалено {batch_count} партий фермера {user_id}")
 
-        # Удаляем ссылки на партии юзера из пулов
-        if "pulls" in pulls:
             for pull in pulls["pulls"].values():
-                # Удаляем из списков партии пользователя
                 pull["batch_ids"] = [
                     bid
                     for bid in pull.get("batch_ids", [])
@@ -2001,76 +1738,54 @@ async def confirm_reset_account(callback: CallbackQuery, state: FSMContext):
                     if bid not in batch_ids_to_delete
                 ]
                 pull["farmer_ids"] = [
-                    fid for fid in pull.get("farmer_ids", []) if fid != user_id
                 ]
-                # Пересчитать текущий объем после удаления партий
-                pull["current_volume"] = (
-                    sum(
-                        b["volume"]
-                        for b in pull.get("batches_data", [])
-                        if b.get("id") not in batch_ids_to_delete
-                    )
+                    for b in pull.get("batches_data", [])
+                    if b.get("id") not in batch_ids_to_delete
                     if pull.get("batches_data")
                     else 0
                 )
-                # Если объем < целевого, пул снова активен
-                if pull["current_volume"] < pull.get("target_volume", 0):
                     pull["status"] = "active"
 
-            # После изменений СРАЗУ сохраняем актуальное состояние пулов
-            save_pulls_to_pickle(pulls)
-            logging.info(
-                "✅ Сохранены изменения пулов после каскадного удаления партий"
-            )
+        logging.info(
+        )
 
-    # 3. Удаляем пользователя и партии из Google Sheets
-    try:
-        worksheet = spreadsheet.worksheet("Users")
-        cell = worksheet.find(str(user_id))
-        if cell:
-            worksheet.delete_rows(cell.row)
-            deleted_items.append("запись в Google Sheets (Users)")
-            logging.info(f"✅ Удалён аккаунт {user_id} из Google Sheets (Users)")
-    except Exception as e:
-        logging.error(f"❌ Ошибка удаления из Google Sheets (Users): {e}")
+        try:
+            cell = worksheet.find(str(user_id))
+            if cell:
+                worksheet.delete_rows(cell.row)
+                deleted_items.append("запись в Google Sheets (Users)")
+                logging.info(f"✅ Удалён аккаунт {user_id} из Google Sheets (Users)")
+        except Exception as e:
+            logging.error(f"❌ Ошибка удаления из Google Sheets (Users): {e}")
 
-    try:
-        worksheet = spreadsheet.worksheet("Batches")
-        all_values = worksheet.get_all_values()
-        rows_to_delete = []
-        for i, row in enumerate(all_values[1:], start=2):
-            if row and len(row) > 1 and str(row[1]) == str(user_id):
-                rows_to_delete.append(i)
-        for row_num in reversed(rows_to_delete):
-            worksheet.delete_rows(row_num)
-        if rows_to_delete:
-            deleted_items.append(f"{len(rows_to_delete)} партий из Google Sheets")
-            logging.info(f"✅ Удалено {len(rows_to_delete)} партий из Google Sheets")
-    except Exception as e:
-        logging.error(f"❌ Ошибка удаления партий из Google Sheets: {e}")
+        try:
+            all_values = worksheet.get_all_values()
+            rows_to_delete = []
+            for i, row in enumerate(all_values[1:], start=2):
+                    rows_to_delete.append(i)
+            for row_num in reversed(rows_to_delete):
+                worksheet.delete_rows(row_num)
+            if rows_to_delete:
+                deleted_items.append(f"{len(rows_to_delete)} партий из Google Sheets")
+        except Exception as e:
+            logging.error(f"❌ Ошибка удаления партий из Google Sheets: {e}")
 
-    try:
-        worksheet = spreadsheet.worksheet("Pulls")
-        all_values = worksheet.get_all_values()
-        rows_to_delete = []
-        for i, row in enumerate(all_values[1:], start=2):
-            if row and len(row) > 1 and str(row[1]) == str(user_id):
-                rows_to_delete.append(i)
-        for row_num in reversed(rows_to_delete):
-            worksheet.delete_rows(row_num)
-        if rows_to_delete:
-            deleted_items.append(f"{len(rows_to_delete)} пуллов из Google Sheets")
-            logging.info(f"✅ Удалено {len(rows_to_delete)} пуллов из Google Sheets")
-    except Exception as e:
-        logging.error(f"❌ Ошибка удаления пуллов из Google Sheets: {e}")
+        try:
+            all_values = worksheet.get_all_values()
+            rows_to_delete = []
+            for i, row in enumerate(all_values[1:], start=2):
+                    rows_to_delete.append(i)
+            for row_num in reversed(rows_to_delete):
+                worksheet.delete_rows(row_num)
+            if rows_to_delete:
+                deleted_items.append(f"{len(rows_to_delete)} пуллов из Google Sheets")
+        except Exception as e:
+            logging.error(f"❌ Ошибка удаления пуллов из Google Sheets: {e}")
 
-    # Формируем сообщение о результатах
     if deleted_items:
         items_text = "\n".join([f"• {item}" for item in deleted_items])
         result_msg = (
-            f"✅ *Аккаунт удалён!*\n\n"
             f"Удалено:\n{items_text}\n\n"
-            f"Вы можете зарегистрироваться заново командой /start"
         )
     else:
         result_msg = "⚠️ Аккаунт не найден или уже удалён"
@@ -2087,45 +1802,19 @@ async def cancel_reset_account(callback: CallbackQuery):
 
 
 def format_admin_analytics():
-    """Форматирование аналитики для админа"""
-    regions_count = {}
     for user in users.values():
         region = user.get("region", "Не указан")
-        regions_count[region] = regions_count.get(region, 0) + 1
 
-    top_regions = sorted(regions_count.items(), key=lambda x: x[1], reverse=True)[:5]
 
-    cultures_count = {}
-    for user_batches in batches.values():
-        for batch in user_batches:
-            culture = batch.get("culture", "Не указана")
-            cultures_count[culture] = cultures_count.get(culture, 0) + 1
 
-    top_cultures = sorted(cultures_count.items(), key=lambda x: x[1], reverse=True)[:5]
 
-    pool_stats = {"forming": 0, "active": 0, "completed": 0, "cancelled": 0}
-    for pull in pulls.values():
-        status = pull.get("status", "unknown")
-        if status in pool_stats:
-            pool_stats[status] += 1
 
     msg = "📈 <b>Аналитика бота</b>\n\n"
 
-    if top_regions:
-        msg += "🗺 <b>Топ-5 регионов:</b>\n"
-        for idx, (region, count) in enumerate(top_regions, 1):
-            msg += f"  {idx}. {region}: {count} польз.\n"
+    msg += "🗺 <b>Топ-5 регионов:</b>\n"
 
-    if top_cultures:
-        msg += "\n🌾 <b>Топ-5 культур:</b>\n"
-        for idx, (culture, count) in enumerate(top_cultures, 1):
-            msg += f"  {idx}. {culture}: {count} партий\n"
+    msg += "\n🌾 <b>Топ-5 культур:</b>\n"
 
-    msg += "\n🎯 <b>Статусы пулов:</b>\n"
-    msg += f"  • Формируется: {pool_stats['forming']}\n"
-    msg += f"  • Активные: {pool_stats['active']}\n"
-    msg += f"  • Завершённые: {pool_stats['completed']}\n"
-    msg += f"  • Отменённые: {pool_stats['cancelled']}\n"
 
     return msg
 
@@ -2134,8 +1823,6 @@ def format_admin_users():
     """Форматирование списка пользователей для админа"""
     farmers = [u for u in users.values() if u.get("role") == "farmer"]
     exporters = [u for u in users.values() if u.get("role") == "exporter"]
-    logistics = [u for u in users.values() if u.get("role") == "logistic"]
-    expeditors = [u for u in users.values() if u.get("role") == "expeditor"]
 
     msg = "👥 <b>Пользователи системы</b>\n\n"
     msg += f"Всего: {len(users)}\n\n"
@@ -2187,12 +1874,6 @@ def join_pull_keyboard(pull_id):
     """Клавиатура для присоединения к пулу"""
     keyboard = InlineKeyboardMarkup(row_width=2)
     keyboard.add(
-        InlineKeyboardButton(
-            "✅ Присоединиться", callback_data=f"confirm_join_pull:{pull_id}"
-        ),
-        InlineKeyboardButton(
-            "📋 Выбрать партию", callback_data=f"select_batch_for_pull:{pull_id}"
-        ),
         InlineKeyboardButton("◀️ Назад", callback_data="back_to_pools_list"),
     )
     return keyboard
@@ -2202,7 +1883,6 @@ def get_pull_details_keyboard(pull_id, user_id, pull):
     """Создание клавиатуры для карточки пула"""
     keyboard = InlineKeyboardMarkup(row_width=2)
 
-    if user_id == pull.get("exporter_id"):
         keyboard.add(
             InlineKeyboardButton(
                 "👥 Участники", callback_data=f"viewparticipants:{pull_id}"
@@ -2213,12 +1893,10 @@ def get_pull_details_keyboard(pull_id, user_id, pull):
         )
         keyboard.add(
             InlineKeyboardButton(
-                "✅ Закрыть пул", callback_data=f"closepull_{pull_id}"
             ),
             InlineKeyboardButton("❌ Удалить", callback_data=f"deletepull_{pull_id}"),
         )
 
-    elif user_id in users and users[user_id].get("role") == "farmer":
         keyboard.add(
             InlineKeyboardButton(
                 "✅ Присоединиться", callback_data=f"join_pull:{pull_id}"
@@ -2308,7 +1986,6 @@ def port_keyboard():
         "Агрофуд",
         "Моспорт",
         "ЦГП",
-        "ФЗТ",
         "АМП",
         "Армада",
         "Стрелец",
@@ -2372,7 +2049,6 @@ def batch_actions_keyboard(batch_id: int) -> InlineKeyboardMarkup:
     )
     keyboard.add(
         InlineKeyboardButton(
-            "🔍 Найти экспортёров", callback_data=f"find_exporters:{batch_id}"
         )
     )
     keyboard.add(InlineKeyboardButton("🔙 Назад", callback_data="back_to_my_batches"))
@@ -2461,14 +2137,11 @@ async def back_to_main_handler(callback: types.CallbackQuery, state: FSMContext)
 
     user_id = callback.from_user.id
 
-    if user_id not in users:
         await callback.message.answer(
             "❌ Пользователь не найден. Используйте /start для регистрации"
         )
         await callback.answer()
         return
-
-    user = users[user_id]
     role = user.get("role", "unknown")
     name = user.get("name", "Пользователь")
 
@@ -2476,8 +2149,6 @@ async def back_to_main_handler(callback: types.CallbackQuery, state: FSMContext)
     try:
         await callback.message.delete()
     except Exception as e:
-        print(f"Ошибка: {e}")
-        pass
 
     # Отправляем новое сообщение с ReplyKeyboard для роли
     if role == "farmer":
@@ -2486,15 +2157,12 @@ async def back_to_main_handler(callback: types.CallbackQuery, state: FSMContext)
     elif role == "exporter":
         keyboard = exporter_keyboard()
         welcome_text = f"👋 С возвращением, {name}!\n\n📦 <b>Меню экспортёра</b>"
-    elif role == "logistic":
         keyboard = logistic_keyboard()
         welcome_text = f"👋 С возвращением, {name}!\n\n🚚 <b>Меню логиста</b>"
-    elif role == "expeditor":
         keyboard = expeditor_keyboard()
         welcome_text = f"👋 С возвращением, {name}!\n\n🏭 <b>Меню экспедитора</b>"
     else:
         keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
-        keyboard.add(KeyboardButton("📋 Меню"))
         welcome_text = f"👋 С возвращением, {name}!"
 
     await callback.message.answer(
@@ -2619,10 +2287,7 @@ def format_prices_message():
 
 def format_farmer_card(farmer_id, batch_id=None):
     """Форматирование полной карточки фермера с контактами"""
-    if farmer_id not in users:
         return "❌ Фермер не найден"
-
-    farmer = users[farmer_id]
 
     msg = f"👤 <b>Фермер: {farmer.get('name', 'Неизвестно')}</b>\n\n"
     msg += "<b>📞 Контакты:</b>\n"
@@ -2643,8 +2308,6 @@ def format_farmer_card(farmer_id, batch_id=None):
         msg += "\n"
 
     # ✅ ИСПРАВЛЕНО: безопасное обращение к полям партии
-    if batch_id and farmer_id in batches:
-        for batch in batches[farmer_id]:
             if batch["id"] == batch_id:
                 msg += f"<b>📦 Партия #{batch_id}:</b>\n"
                 msg += f"🌾 Культура: {batch.get('culture', 'Не указано')}\n"
@@ -2673,7 +2336,6 @@ def format_farmer_card(farmer_id, batch_id=None):
     if farmer_id in batches:
         total_batches = len(batches[farmer_id])
         active_batches = len(
-            [b for b in batches[farmer_id] if b.get("status") == "Активна"]
         )
 
         msg += "\n<b>📊 Статистика:</b>\n"
@@ -2689,7 +2351,6 @@ def get_role_keyboard(role):
         return farmer_keyboard()
     elif role in ["exporter", "экспортёр"]:
         return exporter_keyboard()
-    elif role in ["logistic", "логист"]:
         return logistic_keyboard()
     elif role in ["expeditor", "экспедитор", "broker", "брокер"]:
         return expeditor_keyboard()
@@ -2718,7 +2379,6 @@ def validate_date(date_str):
     try:
         datetime.strptime(date_str, "%d.%m.%Y")
         return True
-    except Exception as e:
         return False
 
 
@@ -2743,13 +2403,11 @@ async def find_matching_exporters(batch):
                 continue
 
             pull_culture = pull.get("culture", "").strip()
-            pull_status = pull.get("status", "")
             pull_current_volume = pull.get("current_volume", 0)
             pull_target_volume = pull.get("target_volume", 0)
 
             if (
                 pull_culture.lower() == batch_culture.lower()
-                and pull_status != "completed"
                 and pull_current_volume < pull_target_volume
             ):
 
@@ -2757,7 +2415,6 @@ async def find_matching_exporters(batch):
 
                 if free_space > 0:
                     exporter_id = pull.get("exporter_id")
-                    exporter = users.get(exporter_id, {})
 
                     matching_pulls.append(
                         {
@@ -2814,7 +2471,6 @@ async def notify_match(farmer_id, batch, matching_pulls, extra=None, *args, **kw
         if not matching_pulls:
             return
 
-        batch_id = batch.get("id", "?")
         batch_culture = batch.get("culture", "Неизвестно")
         batch_volume = batch.get("volume", 0)
 
@@ -2832,7 +2488,6 @@ async def notify_match(farmer_id, batch, matching_pulls, extra=None, *args, **kw
             exporter_id = pull_data.get("exporter_id")
 
             # ✅ Получаем данные экспортёра из базы users
-            exporter_info = users.get(exporter_id, {})
             exporter_name = pull_data.get("exporter_name", "Не указано")
             company_name = exporter_info.get("company_name", exporter_name)
             phone = exporter_info.get("phone", "Не указан")
@@ -2886,8 +2541,6 @@ async def auto_match_batches_and_pulls():
     """
     try:
         logging.info("🔄 Запуск автоматического поиска совпадений...")
-        global batches, pulls
-
         if "pulls" not in pulls or not isinstance(pulls["pulls"], dict):
             logging.warning(
                 "⚠️ Структура pulls некорректна или ключ 'pulls' отсутствует"
@@ -2897,30 +2550,20 @@ async def auto_match_batches_and_pulls():
         matching_count = 0
 
         for pull_id, pull_data in pulls["pulls"].items():
-            if not isinstance(pull_id, int) or not isinstance(pull_data, dict):
                 continue
 
             # Проверяем статус пула и культуру
-            pull_status = pull_data.get("status", "").lower()
             pull_culture = pull_data.get("culture", "").lower().strip()
 
             if pull_status == "filled":
                 continue  # Пропускаем полностью заполненные пулы
 
-            # ✅ ИСПРАВЛЕНО: batches — это {batch_id: batch_data}, а не {farmer_id: batches}
-            for batch_id, batch in batches.items():
-                if not isinstance(batch, dict):
-                    continue
-
-                # Получаем ID фермера из партии
-                farmer_id = batch.get("farmer_id")
 
                 # ✅ ПРОВЕРКА РОЛИ: Только фермеры получают уведомления
                 if farmer_id not in users:
                     logging.debug(f"⚠️ Пользователь {farmer_id} не найден в базе")
                     continue
 
-                user_role = users[farmer_id].get("role", "").lower()
                 if user_role != "farmer":
                     logging.debug(
                         f"⚠️ Пользователь {farmer_id} (партия #{batch_id}) имеет роль '{user_role}', а не 'farmer'. Пропускаем."
@@ -2937,7 +2580,6 @@ async def auto_match_batches_and_pulls():
                     "available",
                 ]:
                     logging.info(
-                        f"✅ Совпадение:\n"
                         f"  Фермер {farmer_id} (роль: {user_role}): Партия #{batch_id} ({batch_culture})\n"
                         f"  Пул #{pull_id} ({pull_culture})"
                     )
@@ -2992,8 +2634,6 @@ async def cmd_start(message: types.Message, state: FSMContext):
     # ✅ СРАЗУ УДАЛЯЕМ КОМАНДУ /start
     try:
         await message.delete()
-    except:
-        pass
 
     # ✅ ПРОВЕРКА 1: Если идёт регистрация, игнорируем
     current_state = await state.get_state()
@@ -3017,7 +2657,6 @@ async def cmd_start(message: types.Message, state: FSMContext):
 
     if user_id in users:
         # Зарегистрированный пользователь
-        user = users[user_id]
         role = user.get("role", "unknown")
         name = user.get("name", "Пользователь")
 
@@ -3029,15 +2668,12 @@ async def cmd_start(message: types.Message, state: FSMContext):
             keyboard = farmer_keyboard()
         elif role == "exporter":
             keyboard = exporter_keyboard()
-        elif role == "logistic":
             keyboard = logistic_keyboard()
-        elif role == "expeditor":
             keyboard = expeditor_keyboard()
         elif role == "admin":
             keyboard = admin_keyboard()
         else:
             keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
-            keyboard.add(KeyboardButton("📝 Регистрация"))
 
         await message.answer(welcome_text, reply_markup=keyboard, parse_mode="HTML")
 
@@ -3071,22 +2707,14 @@ async def cmd_start(message: types.Message, state: FSMContext):
 # ============================================================================
 # ADMIN CALLBACK HANDLERS - ВЫСОКИЙ ПРИОРИТЕТ (ПЕРЕД ВСЕМИ ОСТАЛЬНЫМИ!)
 # ============================================================================
-def format_admin_statistics():
     """Форматирование статистики"""
     total_users = len(users)
-    farmers = sum(1 for u in users.values() if u.get("role") == "farmer")
-    exporters = sum(1 for u in users.values() if u.get("role") == "exporter")
-    logists = sum(1 for u in users.values() if u.get("role") == "logistic")
-    expeditors = sum(1 for u in users.values() if u.get("role") == "expeditor")
 
     total_pulls = len(pulls)
-    active_pulls = sum(1 for p in pulls.values() if p.get("status") == "active")
 
-    total_batches = sum(len(b) for b in batches.values())
 
     total_requests = len(shipping_requests)
     active_requests = sum(
-        1 for r in shipping_requests.values() if r.get("status") == "active"
     )
 
     msg = "📊 <b>Статистика бота</b>\n\n"
@@ -3111,7 +2739,6 @@ def format_admin_statistics():
     return msg
 
 
-def format_admin_analytics():
     """Форматирование аналитики"""
     regions = {}
     for user in users.values():
@@ -3121,15 +2748,12 @@ def format_admin_analytics():
     top_regions = sorted(regions.items(), key=lambda x: x[1], reverse=True)[:5]
 
     cultures = {}
-    for user_batches in batches.values():
-        for batch in user_batches:
-            culture = batch.get("culture", "Неизвестно")
-            cultures[culture] = cultures.get(culture, 0) + 1
+        culture = batch.get("culture", "Неизвестно")
+        cultures[culture] = cultures.get(culture, 0) + 1
 
     top_cultures = sorted(cultures.items(), key=lambda x: x[1], reverse=True)[:5]
 
     pull_statuses = {}
-    for pull in pulls.values():
         status = pull.get("status", "Неизвестно")
         pull_statuses[status] = pull_statuses.get(status, 0) + 1
 
@@ -3145,13 +2769,11 @@ def format_admin_analytics():
 
     msg += "\n💼 <b>Статусы пулов:</b>\n"
     for status, count in pull_statuses.items():
-        status_emoji = "✅" if status == "active" else "⏸"
         msg += f"{status_emoji} {status.capitalize()}: {count}\n"
 
     return msg
 
 
-def format_admin_users():
     """Форматирование списка пользователей"""
     if not users:
         return "❌ Нет пользователей"
@@ -3180,27 +2802,17 @@ def format_admin_users():
     return msg
 
 
-# Admin callback handlers - регистрируем ПЕРВЫМИ!
-@dp.callback_query_handler(lambda c: c.data and c.data.startswith("admin"), state="*")
-async def admin_callbacks_router(callback: types.CallbackQuery, state: FSMContext):
-    """Роутер для всех admin callback handlers"""
 
-    # КРИТИЧНО: Сбрасываем state СРАЗУ!
     current_state = await state.get_state()
     if current_state:
         logging.info(f"⚠️ Сбрасываем state: {current_state}")
         await state.finish()
 
-    # Проверяем права админа
     if callback.from_user.id != ADMIN_ID:
         await callback.answer("❌ Нет доступа", show_alert=True)
         return
 
-    data = callback.data
-    logging.info(f"🔑 Admin callback: {data} from {callback.from_user.id}")
 
-    # Обрабатываем каждый callback
-    if data == "adminstat":
         msg = format_admin_statistics()
         keyboard = InlineKeyboardMarkup(row_width=2)
         keyboard.add(
@@ -3210,7 +2822,6 @@ async def admin_callbacks_router(callback: types.CallbackQuery, state: FSMContex
         await callback.message.edit_text(msg, reply_markup=keyboard, parse_mode="HTML")
         await callback.answer("✅ Статистика обновлена")
 
-    elif data == "adminanalytics":
         msg = format_admin_analytics()
         keyboard = InlineKeyboardMarkup(row_width=2)
         keyboard.add(
@@ -3220,29 +2831,24 @@ async def admin_callbacks_router(callback: types.CallbackQuery, state: FSMContex
         await callback.message.edit_text(msg, reply_markup=keyboard, parse_mode="HTML")
         await callback.answer("✅ Аналитика обновлена")
 
-    elif data == "adminexport":
-        keyboard = InlineKeyboardMarkup(row_width=2)
-        keyboard.add(
-            InlineKeyboardButton("👥 Пользователи", callback_data="exportusers"),
-            InlineKeyboardButton("📦 Пуллы", callback_data="exportpulls"),
-        )
-        keyboard.add(
-            InlineKeyboardButton("🌾 Партии", callback_data="exportbatches"),
-            InlineKeyboardButton("📋 Заявки", callback_data="exportrequests"),
-        )
-        keyboard.add(
-            InlineKeyboardButton("💼 Полный бэкап", callback_data="exportfull")
-        )
-        keyboard.add(InlineKeyboardButton("◀️ Назад", callback_data="backtoadmin"))
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        InlineKeyboardButton("👥 Пользователи", callback_data="exportusers"),
+    )
+    keyboard.add(
+        InlineKeyboardButton("🌾 Партии", callback_data="exportbatches"),
+        InlineKeyboardButton("📋 Заявки", callback_data="exportrequests"),
+    )
+    keyboard.add(
+    )
 
-        await callback.message.edit_text(
-            "📤 <b>Экспорт данных</b>\n\nВыберите данные для экспорта:",
-            reply_markup=keyboard,
-            parse_mode="HTML",
-        )
-        await callback.answer()
+    await callback.message.edit_text(
+        "📤 <b>Экспорт данных</b>\n\nВыберите данные для экспорта:",
+        reply_markup=keyboard,
+        parse_mode="HTML",
+    )
+    await callback.answer()
 
-    elif data == "adminusers":
         msg = format_admin_users()
         keyboard = InlineKeyboardMarkup(row_width=2)
         keyboard.add(
@@ -3250,92 +2856,45 @@ async def admin_callbacks_router(callback: types.CallbackQuery, state: FSMContex
             InlineKeyboardButton("◀️ Назад", callback_data="backtoadmin"),
         )
         await callback.message.edit_text(msg, reply_markup=keyboard, parse_mode="HTML")
-        await callback.answer()
 
-    elif data == "adminbroadcast":
-        keyboard = InlineKeyboardMarkup(row_width=1)
-        keyboard.add(InlineKeyboardButton("◀️ Назад", callback_data="backtoadmin"))
-
-        await callback.message.edit_text(
-            "📧 <b>Рассылка</b>\n\nОтправьте сообщение для рассылки всем пользователям.",
-            reply_markup=keyboard,
-            parse_mode="HTML",
-        )
-        await callback.answer()
-
-    elif data == "adminprices":
-        await callback.answer("⏳ Запускаю обновление цен...")
-
-        try:
-            await update_prices_cache()
-
-            keyboard = InlineKeyboardMarkup(row_width=1)
-            keyboard.add(InlineKeyboardButton("◀️ Назад", callback_data="backtoadmin"))
-
-            await callback.message.edit_text(
-                "✅ <b>Цены обновлены успешно!</b>",
-                reply_markup=keyboard,
-                parse_mode="HTML",
-            )
-        except Exception as e:
-            logging.error(f"Ошибка обновления цен: {e}")
-            await callback.message.edit_text(f"❌ Ошибка обновления: {e}")
-
-
-@dp.callback_query_handler(lambda c: c.data == "backtoadmin", state="*")
-async def back_to_admin_callback(callback: types.CallbackQuery, state: FSMContext):
-    """Возврат в админ меню"""
-
-    # Сбрасываем state
-    current_state = await state.get_state()
-    if current_state:
-        logging.info(f"⚠️ Сбрасываем state: {current_state}")
-        await state.finish()
-
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("❌ Нет доступа", show_alert=True)
-        return
-
-    logging.info(f"◀️ Back to admin menu by {callback.from_user.id}")
-
-    keyboard = InlineKeyboardMarkup(row_width=2)
-    keyboard.add(
-        InlineKeyboardButton("📊 Статистика", callback_data="adminstat"),
-        InlineKeyboardButton("📈 Аналитика", callback_data="adminanalytics"),
-    )
-    keyboard.add(
-        InlineKeyboardButton("📤 Экспорт данных", callback_data="adminexport"),
-        InlineKeyboardButton("👥 Пользователи", callback_data="adminusers"),
-    )
-    keyboard.add(
-        InlineKeyboardButton("📧 Рассылка", callback_data="adminbroadcast"),
-        InlineKeyboardButton("💰 Обновить цены", callback_data="adminprices"),
-    )
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    keyboard.add(InlineKeyboardButton("◀️ Назад", callback_data="backtoadmin"))
 
     await callback.message.edit_text(
-        "🔐 <b>Админ панель EXPORTUM</b>\n\nВыберите действие:",
         reply_markup=keyboard,
         parse_mode="HTML",
     )
     await callback.answer()
 
 
+
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    keyboard.add(InlineKeyboardButton("◀️ Назад", callback_data="backtoadmin"))
+
+        await callback.message.edit_text(
+            reply_markup=keyboard,
+            parse_mode="HTML",
+        )
+    except Exception as e:
+
+
+
+    await state.finish()
+
+    if callback.from_user.id != ADMIN_ID:
+        return
+
+
+
 # ============================================================================
 # АВТОМАТИЧЕСКОЕ ЗАКРЫТИЕ ПУЛА И СОЗДАНИЕ СДЕЛКИ
 # ============================================================================
-
-
 def check_and_close_pull_if_full(pull_id):
     """Проверяет заполненность пула и закрывает его при 100%"""
-    if pull_id not in pulls.get("pulls", {}):
         return False
-
-    pull = pulls["pulls"][pull_id]
     current = pull.get("current_volume", 0)
     target = pull.get("target_volume", 0)
 
-    if current >= target and pull.get("status") == "Открыт":
-        pull["status"] = "Заполнен"
         pull["closed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         deal_id = create_deal_from_full_pull(pull)
@@ -3373,7 +2932,6 @@ def create_deal_from_full_pull(pull):
                 "farmer_id": f_id,
                 "batch_id": b_id,
                 "volume": volume,
-                "farmer_name": users.get(f_id, {}).get("name", "Неизвестно"),
             }
         )
 
@@ -3415,24 +2973,13 @@ def create_deal_from_full_pull(pull):
 async def notify_all_about_pull_closure(pull, deal_id):
     """
     Массовое уведомление всем логистам и фермерам-участникам о закрытии или сборе пула.
-    Вся работа логируется!
     """
     pull_id = pull["id"]
     exporter_id = pull["exporter_id"]
     port = pull.get("port", "Не указан")
 
-    # ИСПРАВЛЕНИЕ фильтрации ролей на точное совпадение 'logistic'
-    logist_ids = [uid for uid, u in users.items() if u.get("role") == "logistic"]
-    logging.info(f"[NOTIFY DEBUG] logist_ids for pull {pull_id}: {logist_ids}")
-
-    participants = pullparticipants.get(pull_id, [])
-    logging.info(f"[NOTIFY DEBUG] pullparticipants for pull {pull_id}: {participants}")
-
-    farmer_ids = [p.get("farmer_id") for p in participants if p.get("farmer_id")]
-    logging.info(f"[NOTIFY DEBUG] farmer_ids for pull {pull_id}: {farmer_ids}")
 
     all_notify_ids = set(farmer_ids) | set(logist_ids)
-    logging.info(f"[NOTIFY DEBUG] all_notify_ids for pull {pull_id}: {all_notify_ids}")
 
     notify_text = (
         f"🔒 <b>ПУЛ #{pull_id} СОБРАН/ЗАКРЫТ!</b>\n\n"
@@ -3445,10 +2992,8 @@ async def notify_all_about_pull_closure(pull, deal_id):
 
     sent_count = 0
     failed_ids = []
-    for notify_id in all_notify_ids:
         try:
             await bot.send_message(notify_id, notify_text, parse_mode="HTML")
-            logging.info(f"[NOTIFY DEBUG] Отправлено уведомление user_id={notify_id}")
             sent_count += 1
         except Exception as e:
             logging.error(
@@ -3457,78 +3002,34 @@ async def notify_all_about_pull_closure(pull, deal_id):
             failed_ids.append(notify_id)
 
     logging.info(
-        f"[NOTIFY RESULT] Итог: {sent_count} уведомлений отправлено, "
         f"{len(failed_ids)} не отправлено: {failed_ids}"
     )
 
-    # -- Карточки логистов/экспедиторов для экспортёра --
-    logistics = get_logistics_by_port(port)
-    expeditors = get_expeditors_by_port(port)
-
     exporter_text = (
-        f"🎉 <b>ПУЛ #{pull_id} СОБРАН!</b>\n"
-        f"\n"
         f"📦 Культура: {pull.get('culture')}\n"
         f"🎯 Объём: {pull.get('current_volume')} / {pull.get('target_volume')} т\n"
         f"🏢 Порт: {port}\n"
-        f"💰 Цена: {pull.get('price', 0):,.0f} ₽/т\n"
-        f"\n"
-        f"✅ Сделка #{deal_id} создана\n"
     )
 
     try:
-        await bot.send_message(exporter_id, exporter_text, parse_mode="HTML")
-        logging.info(f"[NOTIFY DEBUG] Отправлено экспортёру user_id={exporter_id}")
-        if logistics:
-            logistics_text = f"\n🚚 <b>ДОСТУПНЫЕ ЛОГИСТЫ ({len(logistics)}):</b>\n\n"
-            logistics_text += format_logistics_cards(logistics)
-            logistics_keyboard = InlineKeyboardMarkup(row_width=1)
-            for log in logistics[:5]:
-                company = log.get("company", "Без названия")[:30]
-                user_id = log.get("user_id")
-                logistics_keyboard.add(
-                    InlineKeyboardButton(
-                        f"🚚 {company}",
-                        callback_data=f"select_logistic_{user_id}_{deal_id}",
-                    )
-                )
-            await bot.send_message(
-                exporter_id,
-                logistics_text,
-                reply_markup=logistics_keyboard,
-                parse_mode="HTML",
+            InlineKeyboardButton(
             )
-            logging.info(f"[NOTIFY DEBUG] Отправлены карточки логистов экспортёру")
+        )
+        await bot.send_message(
+        )
 
-        if expeditors:
-            expeditors_text = (
-                f"\n📜 <b>ДОСТУПНЫЕ ЭКСПЕДИТОРЫ ({len(expeditors)}):</b>\n\n"
-            )
-            expeditors_text += format_expeditors_cards(expeditors)
-            expeditors_keyboard = InlineKeyboardMarkup(row_width=1)
-            for exp in expeditors[:5]:
-                company = exp.get("company", "Без названия")[:30]
-                user_id = exp.get("user_id")
-                expeditors_keyboard.add(
+    if expeditors:
+        )
                     InlineKeyboardButton(
-                        f"📜 {company}",
-                        callback_data=f"select_expeditor_{user_id}_{deal_id}",
                     )
                 )
-            await bot.send_message(
-                exporter_id,
-                expeditors_text,
-                reply_markup=expeditors_keyboard,
-                parse_mode="HTML",
-            )
-            logging.info(f"[NOTIFY DEBUG] Отправлены карточки экспедиторов экспортёру")
-    except Exception as e:
-        logging.error(f"Error sending to exporter {exporter_id}: {e}")
+                await bot.send_message(
+                )
+            except Exception as e:
 
     logging.info(f"✅ Mass notifications sent for pull {pull_id}, deal {deal_id}")
 
 
-@dp.callback_query_handler(lambda c: c.data.startswith("export"), state="*")
 async def export_callbacks_router(callback: types.CallbackQuery, state: FSMContext):
     """Роутер для всех export callback handlers"""
 
@@ -3614,7 +3115,6 @@ async def export_callbacks_router(callback: types.CallbackQuery, state: FSMConte
         elif data == "exportbatches":
             batches_data = []
             for farmer_id, user_batches in batches.items():
-                farmer_name = users.get(farmer_id, {}).get("name", "Неизвестен")
                 for batch in user_batches:
                     batches_data.append(
                         {
@@ -3697,7 +3197,6 @@ async def export_callbacks_router(callback: types.CallbackQuery, state: FSMConte
                     "created_at": datetime.now().isoformat(),
                     "total_users": len(users),
                     "total_pulls": len(pulls.get("pulls", {})),  # ✅ ИСПРАВЛЕНО
-                    "total_batches": sum(len(b) for b in batches.values()),
                 }
                 zip_file.writestr(
                     "backup_info.json",
@@ -3709,10 +3208,8 @@ async def export_callbacks_router(callback: types.CallbackQuery, state: FSMConte
             filename = f'exportum_backup_{datetime.now().strftime("%Y%m%d_%H%M%S")}.zip'
             await callback.message.answer_document(
                 types.InputFile(zip_buffer, filename=filename),
-                caption=f"💼 Полный бэкап\n\n"
                 f"👥 Пользователей: {len(users)}\n"
                 f"📦 Пуллов: {len(pulls.get('pulls', {}))}\n"  # ✅ ИСПРАВЛЕНО
-                f"🌾 Партий: {sum(len(b) for b in batches.values())}",
             )
 
         keyboard = InlineKeyboardMarkup(row_width=1)
@@ -3735,14 +3232,9 @@ async def registration_entry(message: types.Message, state: FSMContext):
     # ✅ УДАЛЯЕМ ТОЛЬКО НАЖАТИЕ КНОПКИ
     try:
         await message.delete()
-    except:
-        pass
-
-    # ✅ ПРИВЕТСТВИЕ ОСТАЁТСЯ В ЧАТЕ
 
     # НАЧИНАЕМ РЕГИСТРАЦИЮ
     msg = await message.answer(
-        "📝 <b>Регистрация</b>\n\n" "▓░░░░░░░ 1/8\n\n" "Введите ваше полное имя:",
         parse_mode="HTML",
         reply_markup=ReplyKeyboardRemove(),
     )
@@ -3926,8 +3418,6 @@ async def skip_ogrn(callback: types.CallbackQuery, state: FSMContext):
     # Удаляем сообщение с кнопкой
     try:
         await callback.message.delete()
-    except:
-        pass
 
     msg = await callback.message.answer(
         "📝 <b>Регистрация</b>\n\n"
@@ -3992,8 +3482,6 @@ async def registration_role(callback: types.CallbackQuery, state: FSMContext):
     # Удаляем сообщение с кнопками
     try:
         await callback.message.delete()
-    except:
-        pass
 
     msg = await callback.message.answer(
         "📝 <b>Регистрация</b>\n\n" "▓▓▓▓▓▓▓▓ 8/8\n\n" "Выберите ваш регион:",
@@ -4021,44 +3509,29 @@ async def join_pull_start(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer("❌ Ошибка обработки данных", show_alert=True)
         return
 
-    # ✅ ИСПРАВЛЕНО: Получаем пулы из правильного места
     all_pulls = pulls.get("pulls", {})
 
-    if pull_id not in all_pulls:
         logging.warning(
             f"❌ Пул {pull_id} не найден. Доступные: {list(all_pulls.keys())}"
         )
         await callback.answer("❌ Пул не найден", show_alert=True)
         return
 
-    pull = all_pulls.get(pull_id) or all_pulls.get(str(pull_id))
-
-    if not pull:
-        logging.warning(f"❌ Пул {pull_id} не найден после get()")
-        await callback.answer("❌ Пул не найден", show_alert=True)
-        return
-
-    # ✅ НОВОЕ: Проверка на закрытый пул
-    if pull.get("status") == "filled":
         await callback.answer(
-            "❌ Этот пул уже заполнен на 100%!\n\nПопробуйте другие доступные пулы.",
             show_alert=True,
         )
         return
 
     user_id = callback.from_user.id
 
-    if user_id not in users:
         await callback.answer("❌ Пользователь не зарегистрирован", show_alert=True)
         return
 
-    if users[user_id].get("role") != "farmer":
         await callback.answer(
             "❌ Только фермеры могут присоединяться к пулам", show_alert=True
         )
         return
 
-    if user_id not in batches:
         keyboard = InlineKeyboardMarkup(row_width=1)
         keyboard.add(
             InlineKeyboardButton(
@@ -4069,51 +3542,29 @@ async def join_pull_start(callback: types.CallbackQuery, state: FSMContext):
         )
         await callback.message.answer(
             f"🌾 У вас нет партий культуры <b>{pull.get('culture', '?')}</b> для этого пула.\n\n"
-            f"Хотите создать новую партию прямо сейчас?",
             reply_markup=keyboard,
             parse_mode="HTML",
         )
         await callback.answer()
         return
 
-    # ✅ ИСПРАВЛЕНО: Получаем участников из правильного места
-    all_pullparticipants = pulls.get("pullparticipants", {})
-
     already_joined_batch_ids = []
-    pull_id_str = str(pull_id)
 
-    if pull_id_str in all_pullparticipants:
-        already_joined_batch_ids = [
-            p["batch_id"]
-            for p in all_pullparticipants[pull_id_str]
-            if p.get("farmer_id") == user_id
-        ]
+                    p["batch_id"]
+                ]
 
     # 🔍 ДИАГНОСТИКА - КРИТИЧНО ДЛЯ ОТЛАДКИ
     logging.info(
-        f"🔍 Участники пула {pull_id_str}: {all_pullparticipants.get(pull_id_str, [])}"
-    )
-    logging.info(
         f"🔍 Партии уже в пуле от фермера {user_id}: {already_joined_batch_ids}"
     )
-    logging.info(
-        f"🔍 Партия 3 в списке присоединённых: {3 in already_joined_batch_ids}"
-    )
 
-    # ✅ ДОБАВЛЕНО: Диагностика
     logging.info(f"📋 Культура пула: '{pull.get('culture')}'")
     logging.info(f"📋 Партии пользователя {user_id}:")
-    for b in batches.get(user_id, []):
         logging.info(
-            f"   - ID: {b['id']}, Культура: '{b.get('culture')}', Статус: '{b.get('status')}', Уже присоединена: {b['id'] in already_joined_batch_ids}"
         )
 
     active_batches = [
         b
-        for b in batches.get(user_id, [])
-        if b.get("culture") == pull.get("culture")
-        and b.get("status", "").lower() in ["активна", "active", "открыта"]
-        and b["id"] not in already_joined_batch_ids
     ]
 
     logging.info(f"✅ Найдено активных партий: {len(active_batches)}")
@@ -4129,7 +3580,6 @@ async def join_pull_start(callback: types.CallbackQuery, state: FSMContext):
         )
         await callback.message.answer(
             f"🌾 У вас нет партий культуры <b>{pull.get('culture', 'Неизвестно')}</b> для этого пула.\n\n"
-            f"Хотите создать новую партию прямо сейчас?",
             reply_markup=keyboard,
             parse_mode="HTML",
         )
@@ -4141,11 +3591,9 @@ async def join_pull_start(callback: types.CallbackQuery, state: FSMContext):
     keyboard = InlineKeyboardMarkup(row_width=1)
     for batch in active_batches:
         button_text = (
-            f"{batch['culture']} - {batch['volume']} т - {batch['price']:,.0f} ₽/т"
         )
         keyboard.add(
             InlineKeyboardButton(
-                button_text, callback_data=f"selectbatchjoin:{batch['id']}"
             )
         )
         logging.info(f"   Добавлена партия: {button_text}")
@@ -4160,7 +3608,6 @@ async def join_pull_start(callback: types.CallbackQuery, state: FSMContext):
         f"📦 Целевой объём: {pull.get('target_volume', 0)} т\n"
         f"📊 Текущий объём: {pull.get('current_volume', 0)} т\n"
         f"📉 Доступно: {pull.get('target_volume', 0) - pull.get('current_volume', 0)} т\n\n"
-        f"Выберите партию из списка ниже:",
         reply_markup=keyboard,
         parse_mode="HTML",
     )
@@ -4173,7 +3620,6 @@ async def quick_batch_start(callback: types.CallbackQuery, state: FSMContext):
     """Начать создание партии для присоединения к пуллу"""
     await state.finish()
 
-    pull_id = callback.data.split(":")[1]
 
     # ✅ ИСПРАВЛЕНО: Получаем пулы из правильного места
     all_pulls = pulls.get("pulls", {})
@@ -4196,11 +3642,9 @@ async def quick_batch_start(callback: types.CallbackQuery, state: FSMContext):
     available_volume = target_volume - current_volume
 
     msg = (
-        f"📦 <b>Создание партии для пулла</b>\n\n"
         f"🌾 Культура: {pull.get('culture', '?')}\n"
         f"📍 Регион: {pull.get('region', '?')}\n"
         f"📊 Доступно в пулле: {available_volume:,.0f} т\n\n"
-        f"Введите объём вашей партии (тонн):"
     )
 
     await callback.message.edit_text(msg, parse_mode="HTML")
@@ -4244,9 +3688,7 @@ async def quick_batch_volume(message: types.Message, state: FSMContext):
         await state.update_data(volume=volume)
         await QuickBatchStatesGroup.price.set()
         await message.answer(
-            f"💰 <b>Введите цену</b>\n\n"
             f"Цена пула: {pull.get('price', 0):,.0f} ₽/т\n\n"
-            f"Введите вашу цену (₽/т):",
             parse_mode="HTML",
         )
 
@@ -4288,7 +3730,6 @@ async def quick_batch_price(message: types.Message, state: FSMContext):
 )
 async def quick_batch_quality_choice(callback: types.CallbackQuery, state: FSMContext):
     """Выбор - указывать параметры качества"""
-    choice = callback.data.split(":")[1]
 
     if choice == "yes":
         await QuickBatchStatesGroup.quality.set()
@@ -4361,14 +3802,10 @@ async def finish_quick_batch(message_or_callback, state: FSMContext, user_id: in
         await state.finish()
         return
 
-    # Создаём партию
-    batch_id = generate_id()
     batch = {
         "id": batch_id,
         "farmer_id": user_id,
         "culture": pull.get("culture"),
-        "volume": data.get("volume"),
-        "price": data.get("price"),
         "region": pull.get("region", "?"),
         "status": "active",
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -4385,19 +3822,12 @@ async def finish_quick_batch(message_or_callback, state: FSMContext, user_id: in
         batches[user_id] = []
     batches[user_id].append(batch)
 
-    # ✅ ИСПРАВЛЕНО: Добавляем в pullparticipants
-    all_pullparticipants = pulls.get("pullparticipants", {})
     pull_id_str = str(pull_id)
 
-    if pull_id_str not in all_pullparticipants:
-        all_pullparticipants[pull_id_str] = []
 
-    all_pullparticipants[pull_id_str].append(
         {
             "farmer_id": user_id,
-            "farmer_name": users[user_id].get("name", "?"),
             "batch_id": batch_id,
-            "volume": data.get("volume"),
             "joined_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
     )
@@ -4414,7 +3844,6 @@ async def finish_quick_batch(message_or_callback, state: FSMContext, user_id: in
             "volume": batch.get("volume"),
             "price": batch.get("price"),
             "moisture": batch.get("moisture", 0),
-            "impurities": batch.get("impurity", 0),
             "joined_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
     )
@@ -4425,14 +3854,10 @@ async def finish_quick_batch(message_or_callback, state: FSMContext, user_id: in
 
     if "farmer_ids" not in pull:
         pull["farmer_ids"] = []
-    if user_id not in pull["farmer_ids"]:
         pull["farmer_ids"].append(user_id)
 
     # ✅ ИСПРАВЛЕНО: Используем current_volume
-    pull["current_volume"] = pull.get("current_volume", 0) + data.get("volume")
 
-    # Создаём сделку
-    deal_id = generate_id()
     deal = {
         "id": deal_id,
         "pull_id": pull_id,
@@ -4450,10 +3875,7 @@ async def finish_quick_batch(message_or_callback, state: FSMContext, user_id: in
     save_deals_to_pickle()
 
     # Уведомления
-    farmer = users[user_id]
     exporter_id = pull.get("exporter_id")
-    exporter = users.get(exporter_id, {})
-
     target_volume = pull.get("target_volume", 0)
     fill_percent = (
         (pull["current_volume"] / target_volume * 100) if target_volume > 0 else 0
@@ -4461,7 +3883,6 @@ async def finish_quick_batch(message_or_callback, state: FSMContext, user_id: in
 
     await bot.send_message(
         user_id,
-        f"✅ <b>Партия создана и добавлена в пулл!</b>\n\n"
         f"🌾 {batch['culture']} • {batch['volume']:,.0f} т • {batch['price']:,.0f} ₽/т\n"
         f"📊 Пулл заполнен: {pull['current_volume']:,.0f}/{target_volume:,.0f} т ({fill_percent:.0f}%)",
         parse_mode="HTML",
@@ -4478,12 +3899,9 @@ async def finish_quick_batch(message_or_callback, state: FSMContext, user_id: in
         )
 
     # Проверяем заполнение пулла
-    is_full = False
     if pull["current_volume"] >= target_volume:
         pull["status"] = "filled"
-        is_full = True
         logging.info(f"🎉 Пул #{pull_id} заполнен!")
-        # await notify_pull_filled(pull_id)  # Если есть такая функция
 
     # Возвращаемся к пуллу
     keyboard = InlineKeyboardMarkup()
@@ -4500,7 +3918,6 @@ async def finish_quick_batch(message_or_callback, state: FSMContext, user_id: in
             await message_or_callback.message.edit_text(
                 "✅ Готово! Партия добавлена в пулл", reply_markup=keyboard
             )
-        except:
             await message_or_callback.message.answer(
                 "✅ Готово! Партия добавлена в пулл", reply_markup=keyboard
             )
@@ -4519,19 +3936,13 @@ async def create_batch_for_pull_callback(
         await callback.answer("❌ Ошибка обработки данных", show_alert=True)
         return
 
-    if pull_id not in pulls.get("pulls", {}):
         await callback.answer("❌ Пул не найден", show_alert=True)
         return
 
-    pull = pulls["pulls"][pull_id]
-
     # Сохраняем ID пула и культуру для последующего присоединения
-    await state.update_data(create_batch_for_pull_id=pull_id, culture=pull["culture"])
 
     await callback.message.answer(
         f"**📦 Создание партии для пула #{pull_id}**\n\n"
-        f"🌾 Культура: **{pull['culture']}**\n\n"
-        f"**Шаг 1/8:** Укажите регион производства:",
         reply_markup=region_keyboard(),
         parse_mode="Markdown",
     )
@@ -4570,17 +3981,6 @@ async def select_batch_for_join(callback: types.CallbackQuery, state: FSMContext
 
     user_id = callback.from_user.id
 
-    # Поиск партии по всем фермерским партийным данным
-    batch = None
-    farmer_id = None
-    for uid, user_batches in batches.items():
-        for b in user_batches:
-            if b.get("id") == batch_id:
-                batch = b
-                farmer_id = uid
-                break
-        if batch:
-            break
 
     if not batch:
         await callback.answer("❌ Партия не найдена", show_alert=True)
@@ -4608,42 +4008,32 @@ async def select_batch_for_join(callback: types.CallbackQuery, state: FSMContext
         await state.finish()
         return
 
-    all_pullparticipants = pulls.setdefault("pullparticipants", {})
     pull_id_str = str(pull_id)
-    if pull_id_str not in all_pullparticipants:
-        all_pullparticipants[pull_id_str] = []
 
     participant = {
         "farmer_id": user_id,
-        "farmer_name": users.get(user_id, {}).get("name", ""),
         "batch_id": batch_id,
         "volume": batch.get("volume", 0),
         "joined_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
-    all_pullparticipants[pull_id_str].append(participant)
 
     pull.setdefault("batch_ids", [])
-    if batch_id not in pull["batch_ids"]:
-        pull["batch_ids"].append(batch_id)
 
     pull.setdefault("farmer_ids", [])
-    if user_id not in pull["farmer_ids"]:
         pull["farmer_ids"].append(user_id)
 
     pull.setdefault("batches", [])
-    pull["batches"].append(
-        {
-            "id": batch_id,
-            "farmer_id": user_id,
-            "culture": batch.get("culture"),
-            "volume": batch.get("volume"),
-            "price": batch.get("price"),
-            "moisture": batch.get("moisture", 0),
-            "impurities": batch.get("impurities", 0),
-            "quality_class": batch.get("quality_class", ""),
-            "joined_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        }
-    )
+        pull["batches"].append(
+            {
+                "farmer_id": user_id,
+                "culture": batch.get("culture"),
+                "volume": batch.get("volume"),
+                "price": batch.get("price"),
+                "moisture": batch.get("moisture", 0),
+                "quality_class": batch.get("quality_class", ""),
+                "joined_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+        )
 
     pull["current_volume"] = current_volume + batch.get("volume", 0)
 
@@ -4655,20 +4045,13 @@ async def select_batch_for_join(callback: types.CallbackQuery, state: FSMContext
     # Уведомление экспортера с данными фермера
     exporter_id = pull.get("exporter_id")
     if exporter_id:
-        farmer = users.get(farmer_id, {})
         farmer_name = farmer.get("name", "Неизвестно")
         farmer_phone = farmer.get("phone", "Не указан")
         farmer_email = farmer.get("email", "Не указан")
         farmer_company = farmer.get("company_details", "Не указано")
 
         message_exporter = (
-            f"🎉 <b>Пул #{pull_id} заполнен!</b>\n"
             f"Культура: {pull.get('culture')}\n"
-            f"Объём: {pull['current_volume']:,.0f} т\n"
-            f"Цена: ₽{pull.get('price', 0):,.0f}/т\n"
-            f"Порт: {pull.get('port')}\n"
-            f"Готов к отгрузке!\n\n"
-            f"👤 <b>Данные фермера:</b>\n"
             f"Имя: {farmer_name}\n"
             f"Компания: {farmer_company}\n"
             f"Телефон: {farmer_phone}\n"
@@ -4680,7 +4063,6 @@ async def select_batch_for_join(callback: types.CallbackQuery, state: FSMContext
             logging.error(f"Ошибка уведомления экспортёру: {e}")
 
     # Уведомление фермера с данными экспортера
-    exporter = users.get(exporter_id, {})
     if exporter:
         exporter_name = exporter.get("name", "Неизвестно")
         exporter_phone = exporter.get("phone", "Не указан")
@@ -4692,7 +4074,6 @@ async def select_batch_for_join(callback: types.CallbackQuery, state: FSMContext
             f"Культура: {batch.get('culture')}\n"
             f"Объём: {batch.get('volume')} т\n"
             f"Цена: {batch.get('price'):,.0f} ₽/т\n\n"
-            f"👤 <b>Данные экспортера:</b>\n"
             f"Имя: {exporter_name}\n"
             f"Компания: {exporter_company}\n"
             f"Телефон: {exporter_phone}\n"
@@ -4703,7 +4084,6 @@ async def select_batch_for_join(callback: types.CallbackQuery, state: FSMContext
         except Exception as e:
             logging.error(f"Ошибка уведомления фермеру: {e}")
 
-    batch["status"] = "Зарезервирована"
 
     save_pulls_to_pickle()
     save_batches_to_pickle()
@@ -4713,12 +4093,6 @@ async def select_batch_for_join(callback: types.CallbackQuery, state: FSMContext
     except Exception as e:
         logging.warning(f"Не удалось удалить сообщение: {e}")
 
-    fill_percent = (
-        (pull["current_volume"] / target_volume) * 100 if target_volume else 0
-    )
-    remaining = target_volume - pull["current_volume"]
-
-    if pull["status"] == "filled":
         await callback.answer(
             "✅ Партия добавлена! Пул заполнен на 100%!", show_alert=True
         )
@@ -4738,23 +4112,13 @@ async def view_pullparticipants(callback: types.CallbackQuery, state: FSMContext
     except (IndexError, ValueError):
         await callback.answer("❌ Ошибка", show_alert=True)
         return
-
-    # ✅ ИСПРАВЛЕНО: Получаем пулы из правильного места
-    all_pulls = pulls.get("pulls", {})
-
-    if pull_id not in all_pulls:
-        await callback.answer("❌ Пул не найден", show_alert=True)
         return
 
-    pull = all_pulls.get(pull_id) or all_pulls.get(str(pull_id))
 
     if not pull:
         await callback.answer("❌ Пул не найден", show_alert=True)
         return
 
-    # ✅ ИСПРАВЛЕНО: Получаем участников из правильного места
-    all_pullparticipants = pulls.get("pullparticipants", {})
-    participants = all_pullparticipants.get(pull_id, [])
 
     if not participants:
         await callback.answer("В пуле пока нет участников", show_alert=True)
@@ -4774,7 +4138,6 @@ async def view_pullparticipants(callback: types.CallbackQuery, state: FSMContext
 
     for i, p in enumerate(participants, 1):
         farmer_id = p.get("farmer_id")
-        farmer = users.get(farmer_id, {})
 
         msg += f"{i}. <b>{p.get('farmer_name', '?')}</b>\n"
         msg += f"   📦 Объём: {p.get('volume', 0)} т\n"
@@ -4783,7 +4146,6 @@ async def view_pullparticipants(callback: types.CallbackQuery, state: FSMContext
         batch = None
         if farmer_id in batches:
             for b in batches[farmer_id]:
-                if b.get("id") == batch_id:
                     batch = b
                     break
 
@@ -4796,8 +4158,8 @@ async def view_pullparticipants(callback: types.CallbackQuery, state: FSMContext
         phone = farmer.get("phone", "Не указан")
         email = farmer.get("email", "Не указан")
 
-        msg += f"   📱 Телефон: <code>{phone}</code>\n"
-        msg += f"   📧 Email: <code>{email}</code>\n"
+            msg += f"   📱 Телефон: <code>{phone}</code>\n"
+            msg += f"   📧 Email: <code>{email}</code>\n"
         msg += "\n"
 
     keyboard = InlineKeyboardMarkup(row_width=1)
@@ -4871,13 +4233,11 @@ async def registration_region(callback: types.CallbackQuery, state: FSMContext):
 
     # ✅ ОТПРАВЛЯЕМ НОВОЕ СООБЩЕНИЕ (не редактируем)
     await callback.message.answer(
-        f"✅ <b>Регистрация завершена!</b>\n\n"
         f"👤 Имя: {data.get('name')}\n"
         f"📱 Телефон: {data.get('phone')}\n"
         f"📧 Email: {data.get('email')}\n"
         f"🎭 Роль: {role_names_display.get(role, role)}\n"
         f"📍 Регион: {region}\n\n"
-        f"Добро пожаловать в EXPORTUM!",
         reply_markup=keyboard,
         parse_mode="HTML",
     )
@@ -4885,7 +4245,6 @@ async def registration_region(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer("✅ Регистрация завершена!")
 
 
-@dp.message_handler(commands=["admin"], state="*")
 async def admin_menu(message: types.Message, state: FSMContext):
     """Админ меню"""
     await state.finish()
@@ -4921,8 +4280,6 @@ async def admin_stats_button(message: types.Message, state: FSMContext):
         total_users = len(users)
         farmers = len([u for u in users.values() if u.get("role") == "farmer"])
         exporters = len([u for u in users.values() if u.get("role") == "exporter"])
-        logists = len([u for u in users.values() if u.get("role") == "logist"])
-        expeditors = len([u for u in users.values() if u.get("role") == "expeditor"])
 
         # ✅ ИСПРАВЛЕНО: Правильный перебор batches
         total_batches = sum(len(farmer_batches) for farmer_batches in batches.values())
@@ -4937,9 +4294,7 @@ async def admin_stats_button(message: types.Message, state: FSMContext):
             for farmer_batches in batches.values()
         )
 
-        total_pulls = len(pulls)
         open_pulls = len(
-            [p for p in pulls.values() if p.get("status") in ["open", "active"]]
         )
 
         total_deals = len(deals) if "deals" in dir() else 0
@@ -4948,7 +4303,6 @@ async def admin_stats_button(message: types.Message, state: FSMContext):
                 [
                     d
                     for d in deals.values()
-                    if d.get("status") not in ["completed", "cancelled"]
                 ]
             )
             if "deals" in dir()
@@ -4957,7 +4311,6 @@ async def admin_stats_button(message: types.Message, state: FSMContext):
 
         total_matches = len(matches) if "matches" in dir() else 0
         active_matches = (
-            len([m for m in matches.values() if m.get("status") == "active"])
             if "matches" in dir()
             else 0
         )
@@ -5089,10 +4442,8 @@ async def admin_export_button(message: types.Message, state: FSMContext):
         with open(filename, "rb") as f:
             await message.answer_document(
                 f,
-                caption=f"📂 <b>Экспорт данных</b>\n\n"
                 f"📅 {datetime.now().strftime('%d.%m.%Y %H:%M')}\n"
                 f"👥 Пользователей: {len(users)}\n"
-                f"📦 Партий: {sum(len(b) for b in batches.values())}\n"
                 f"🎯 Пулов: {len(pulls)}",
                 parse_mode="HTML",
             )
@@ -5119,7 +4470,6 @@ async def admin_manual_match(message: types.Message, state: FSMContext):
     matches_found = await auto_match_batches_and_pulls()
 
     await message.answer(
-        f"✅ <b>Поиск завершён!</b>\n\n"
         f"🔍 Найдено совпадений: {matches_found}\n"
         f"📊 Всего активных: {len([m for m in matches.values() if m.get('status') == 'active'])}",
         parse_mode="HTML",
@@ -5135,7 +4485,6 @@ async def admin_back(message: types.Message, state: FSMContext):
     if user_id != ADMIN_ID:
         return
     if user_id in users:
-        role = users[user_id].get("role")
         keyboard = get_role_keyboard(role)
         await message.answer("◀️ Возврат в главное меню", reply_markup=keyboard)
     else:
@@ -5157,9 +4506,7 @@ async def cmd_manual_match(message: types.Message, state: FSMContext):
     matches_found = await auto_match_batches_and_pulls()
 
     await message.answer(
-        f"✅ Поиск завершен!\n\n"
         f"Найдено новых совпадений: {matches_found}\n"
-        f"Всего активных совпадений: {len([m for m in matches.values() if m['status'] == 'active'])}"
     )
 
 
@@ -5169,24 +4516,10 @@ async def cmd_profile(message: types.Message, state: FSMContext):
     await state.finish()
 
     user_id = message.from_user.id
-    if user_id not in users:
         await message.answer("❌ Вы не зарегистрированы. Используйте /start")
         return
 
-    user = users[user_id]
 
-    profile_text = f"""
-👤 <b>Ваш профиль</b>
-
-📝 Имя: {user.get('name', 'Не указано')}
-🎭 Роль: {ROLES.get(user.get('role'), 'Не указана')}
-📱 Телефон: {user.get('phone', 'Не указан')}
-📧 Email: {user.get('email', 'Не указан')}
-🏢 ИНН: {user.get('inn', 'Не указан')}
-📋 ОГРН: {user.get('ogrn', 'Не указан')}
-📍 Регион: {user.get('region', 'Не указан')}
-📅 Регистрация: {user.get('registered_at', 'Неизвестно')}
-"""
 
     if user.get("company_details"):
         profile_text += f"\n🏢 <b>Реквизиты компании:</b>\n{user['company_details']}"
@@ -5238,7 +4571,6 @@ async def edit_profile_region(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer("❌ Ошибка")
         return
 
-    old_value = users[user_id].get("region", "Не указан")
     users[user_id]["region"] = new_region
 
     save_users_to_json()
@@ -5248,11 +4580,9 @@ async def edit_profile_region(callback: types.CallbackQuery, state: FSMContext):
 
     await state.finish()
 
-    role = users[user_id].get("role")
     keyboard = get_role_keyboard(role)
 
     await callback.message.edit_text(
-        f"✅ Регион обновлён!\n\n"
         f"Старое значение: {old_value}\n"
         f"Новое значение: {new_region}"
     )
@@ -5278,7 +4608,6 @@ async def edit_profile_value(message: types.Message, state: FSMContext):
             await message.answer("❌ Некорректный номер телефона. Попробуйте ещё раз:")
             return
 
-    old_value = users[user_id].get(field, "Не указано")
     users[user_id][field] = new_value
 
     save_users_to_json()
@@ -5288,7 +4617,6 @@ async def edit_profile_value(message: types.Message, state: FSMContext):
 
     await state.finish()
 
-    role = users[user_id].get("role")
     keyboard = get_role_keyboard(role)
 
     field_names = {
@@ -5402,7 +4730,6 @@ def parse_soy_from_zol():
                                 # Валидация (18,000 - 60,000 ₽/т)
                                 if 18000 <= price_ton <= 60000:
                                     prices.append(price_ton)
-                            except Exception as e:
                                 continue
 
                 # Убираем дубликаты
@@ -5473,7 +4800,6 @@ def parse_russia_regional_prices():
                                         logging.info(
                                             f"✅ Пшеница: {price_value} ₽/т из {region}"
                                         )
-                            except Exception as e:
                                 continue
                     else:
                         try:
@@ -5485,7 +4811,6 @@ def parse_russia_regional_prices():
                                     logging.info(
                                         f"✅ Пшеница: {price_value} ₽/т из {region}"
                                     )
-                        except Exception as e:
                             continue
 
             if wheat_prices:
@@ -5599,7 +4924,6 @@ def parse_russia_regional_prices():
                             prices.append(price_value)
                             logging.info(f"✅ {culture}: {price_value} ₽/т из {city}")
                             break  # Нашли цену, переходим к следующей строке
-                    except Exception as e:
                         continue
 
             # Результат
@@ -5825,7 +5149,6 @@ def load_users_from_json():
         if os.path.exists(USERS_FILE):
             with open(USERS_FILE, "r", encoding="utf-8") as f:
                 loaded = json.load(f)
-                users = {int(k): v for k, v in loaded.items()}
             logging.info(f"✅ Пользователи загружены: {len(users)}")
         else:
             logging.info("ℹ️ Файл пользователей не найден, создан новый")
@@ -5879,7 +5202,6 @@ def load_batches_from_pickle():
                                 batches[user_id] = []
                             batches[user_id].append(batch)
 
-                    total_batches = sum(len(b) for b in batches.values())
                     logging.info(
                         f"✅ Конвертировано {total_batches} партий в правильный формат"
                     )
@@ -5901,9 +5223,7 @@ async def load_requests_from_file():
     """Загружает заявки из файла при старте бота"""
     global user_requests
     try:
-        with open("requests.json", "r", encoding="utf-8") as f:
             data = json.load(f)
-            user_requests = {int(k): v for k, v in data.items()}
             logging.info(f"✅ Загружено {len(user_requests)} заявок из файла")
     except FileNotFoundError:
         logging.info("ℹ️ Файл requests.json не найден (первый запуск)")
@@ -5915,9 +5235,7 @@ async def load_requests_from_file():
 
 def save_requests_to_file():
     """Сохраняет заявки в JSON файл"""
-    global user_requests
     try:
-        with open("requests.json", "w", encoding="utf-8") as f:
             data_to_save = {str(k): v for k, v in user_requests.items()}
             json.dump(data_to_save, f, ensure_ascii=False, indent=2)
         logging.info(f"✅ Заявки сохранены: {len(user_requests)} заявок")
@@ -5925,25 +5243,19 @@ def save_requests_to_file():
         logging.error(f"❌ Ошибка сохранения заявок: {e}")
 
 
-def save_batches_to_pickle():
     """Сохранение партий в pickle"""
-    global batch_counter
     try:
-        os.makedirs("data", exist_ok=True)
 
         # ✅ ПРОВЕРЯЕМ ЧТО СОХРАНЯЕМ СЛОВАРЬ
         if not isinstance(batches, dict):
             logging.error(f"❌ batches имеет неправильный тип: {type(batches)}")
             return
 
-        with open("data/batches.pkl", "wb") as f:
             pickle.dump(batches, f)
 
         # ✅ СОХРАНЯЕМ batch_counter
-        with open("data/batch_counter.pkl", "wb") as f:
             pickle.dump(batch_counter, f)
 
-        total_batches = sum(len(batch_list) for batch_list in batches.values())
         logging.info(
             f"✅ Партии сохранены: {total_batches} партий, batch_counter={batch_counter}"
         )
@@ -5961,15 +5273,11 @@ def save_pulls_to_pickle():
     global pulls
 
     try:
-        # Проверка структуры
         if not isinstance(pulls, dict):
             logging.error(f"❌ pulls должен быть dict, а не {type(pulls)}")
-            pulls = {"pulls": {}, "pullparticipants": {}}
 
         if "pulls" not in pulls:
             pulls["pulls"] = {}
-        if "pullparticipants" not in pulls:
-            pulls["pullparticipants"] = {}
 
         pulls_dict = pulls.get("pulls", {})
         if pulls_dict:
@@ -5981,7 +5289,6 @@ def save_pulls_to_pickle():
             ):
                 logging.error("❌ КРИТИЧЕСКАЯ ОШИБКА: pulls['pulls'] - это ОДИН пул!")
                 logging.warning("🔧 Исправляю структуру на пустую...")
-                pulls = {"pulls": {}, "pullparticipants": {}}
 
         # Создаем папку, если не существует
         dir_path = os.path.dirname(PULLS_FILE)
@@ -5991,10 +5298,7 @@ def save_pulls_to_pickle():
 
         # Сохраняем файл
         with open(PULLS_FILE, "wb") as f:
-            pickle.dump(pulls, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-        pulls_count = len(pulls.get("pulls", {}))
-        participants_count = len(pulls.get("pullparticipants", {}))
 
         logging.info(f"✅ save_pulls_to_pickle() - сохранено {pulls_count} пулов")
         logging.info(
@@ -6017,112 +5321,12 @@ def save_pulls_to_pickle():
 
 
 def load_pulls_from_pickle():
-    """Загрузка пулов из pickle файла с проверкой структуры"""
-    global pulls, pull_counter
-    pull_counter = 0
-
-    try:
-        if os.path.exists(PULLS_FILE):
-            with open(PULLS_FILE, "rb") as f:
-                data = pickle.load(f)
-
-            logging.info(f"📂 Загружен файл pulls.pkl, тип: {type(data)}")
-
-            if isinstance(data, dict):
-                if "pulls" in data and "pullparticipants" in data:
-                    logging.info(
-                        "✅ Обнаружена новая структура с 'pulls' и 'pullparticipants'"
-                    )
-                    if isinstance(data.get("pulls"), dict):
-                        if (
-                            "farmer_ids" in data["pulls"]
-                            or "batch_ids" in data["pulls"]
-                        ):
-                            logging.error("❌ ОШИБКА: pulls['pulls'] - это ОДИН пул!")
-                            logging.warning("🔧 Исправляю структуру...")
-                            pulls = {"pulls": {}, "pullparticipants": {}}
-                            pull_counter = 0
-                            logging.info("✅ Создана правильная пустая структура")
-                        else:
-                            pulls = data
-                            if pulls.get("pulls"):
-                                try:
-                                    pull_counter = (
-                                        max(int(k) for k in pulls["pulls"].keys()) + 1
-                                    )
-                                except (ValueError, TypeError):
-                                    pull_counter = len(pulls.get("pulls", {})) + 1
-                            else:
-                                pull_counter = 0
-                    else:
-                        logging.warning("⚠️ pulls['pulls'] не является dict")
-                        pulls = {"pulls": {}, "pullparticipants": {}}
-                        pull_counter = 0
-                else:
-                    logging.warning("⚠️ Обнаружена старая структура")
-                    pulls = {"pulls": data, "pullparticipants": {}}
-                    try:
-                        pull_counter = max(int(k) for k in data.keys()) + 1
-                    except (ValueError, TypeError):
-                        pull_counter = len(data) + 1
-            else:
-                logging.warning(f"⚠️ Неожиданный тип данных: {type(data)}")
-                pulls = {"pulls": {}, "pullparticipants": {}}
-                pull_counter = 0
-
-            pulls_count = len(pulls.get("pulls", {}))
-            participants_count = len(pulls.get("pullparticipants", {}))
-            logging.info(
-                f"✅ load_pulls_from_pickle() - загружено {pulls_count} пулов, pull_counter={pull_counter}"
-            )
-            logging.info(
-                f"✅ load_pulls_from_pickle() - {participants_count} групп участников"
-            )
-
-            if pulls.get("pullparticipants"):
-                logging.info(
-                    f"   📊 pullparticipants.keys() = {list(pulls.get('pullparticipants', {}).keys())}"
-                )
-
-            return True
-
-        else:
-            logging.info("pulls.pkl не существует, создаю новую структуру")
-            pulls = {"pulls": {}, "pullparticipants": {}}
-            pull_counter = 0
-            return False
-
-    except Exception as e:
-        logging.error(f"❌ load_pulls_from_pickle() error: {e}", exc_info=True)
-        pulls = {"pulls": {}, "pullparticipants": {}}
-        pull_counter = 0
-        return False
-
-
-def save_batches_to_pickle():
-    """✅ ПРАВИЛЬНОЕ сохранение партий"""
-    global batches
-    try:
-        with open(BATCHESFILE, "wb") as f:
-            pickle.dump(batches, f, protocol=pickle.HIGHEST_PROTOCOL)
-        logging.info(
-            f"✅ save_batches_to_pickle() - сохранено {sum(len(b) for b in batches.values())} партий"
-        )
-        return True
-    except Exception as e:
-        logging.error(f"❌ Ошибка сохранения партий: {e}", exc_info=True)
-        return False
-
-
-def load_pulls_from_pickle():
     """Загрузка пулов из pickle файла"""
-    global pulls, pull_counter
     pull_counter = 0
 
     try:
         if not os.path.exists(PULLS_FILE):
             logging.info("ℹ️ pulls.pkl не существует, создаю новую структуру")
-            pulls = {"pulls": {}, "pullparticipants": {}}
             pull_counter = 0
             return False
 
@@ -6134,7 +5338,6 @@ def load_pulls_from_pickle():
         # Проверяем структуру данных
         if not isinstance(data, dict):
             logging.error(f"❌ Некорректный тип данных: {type(data)}")
-            pulls = {"pulls": {}, "pullparticipants": {}}
             pull_counter = 0
             return False
 
@@ -6154,7 +5357,6 @@ def load_pulls_from_pickle():
                 first_key = next(iter(pulls_dict))
                 first_value = pulls_dict[first_key]
 
-                # Если первый элемент - это СЛОВАРЬ с полями пула (а не один пул)
                 if isinstance(first_value, dict):
                     # Проверяем что это действительно СЛОВАРЬ пулов
                     has_pull_fields = any(
@@ -6170,30 +5372,23 @@ def load_pulls_from_pickle():
                     )
 
                     if has_pull_fields:
-                        # ✅ ПРАВИЛЬНО: Это словарь пулов {'PULL_1': {pull}, 'PULL_2': {pull}}
                         logging.info(
                             "✅ pulls['pulls'] - это СЛОВАРЬ пулов (правильно)"
                         )
-                        pulls = data
-                        pull_counter = len(pulls_dict)
                     else:
                         # ❌ ОШИБКА: Один пул попал в структуру
                         logging.error(
-                            "❌ ОШИБКА: pulls['pulls'] содержит ОДН ПУЛ вместо словаря!"
                         )
                         logging.warning("🔧 Исправляю структуру...")
-                        pulls = {"pulls": {}, "pullparticipants": {}}
                         pull_counter = 0
                 else:
                     logging.error(
                         f"❌ Некорректный тип значения в pulls['pulls']: {type(first_value)}"
                     )
-                    pulls = {"pulls": {}, "pullparticipants": {}}
                     pull_counter = 0
             else:
                 # pulls['pulls'] пуст - это нормально
                 logging.info("ℹ️ pulls['pulls'] пуст")
-                pulls = data
                 pull_counter = 0
 
         else:
@@ -6213,15 +5408,12 @@ def load_pulls_from_pickle():
                 ):
                     # Это словарь пулов - конвертируем в новую структуру
                     logging.info("🔄 Конвертирую старую структуру в новую...")
-                    pulls = {"pulls": data, "pullparticipants": {}}
                     pull_counter = len(data)
                 else:
                     # Один пул - инициализируем пусто
                     logging.error("❌ Неизвестная структура, инициализирую пусто")
-                    pulls = {"pulls": {}, "pullparticipants": {}}
                     pull_counter = 0
             else:
-                pulls = {"pulls": {}, "pullparticipants": {}}
                 pull_counter = 0
 
         # ════════════════════════════════════════════════════════════════════════════
@@ -6229,7 +5421,6 @@ def load_pulls_from_pickle():
         # ════════════════════════════════════════════════════════════════════════════
 
         pulls_count = len(pulls.get("pulls", {}))
-        participants_count = len(pulls.get("pullparticipants", {}))
 
         logging.info(
             f"✅ load_pulls_from_pickle() - загружено {pulls_count} пулов (pull_counter={pull_counter})"
@@ -6239,25 +5430,21 @@ def load_pulls_from_pickle():
         )
 
         if pulls_count > 0:
-            pull_ids = list(pulls.get("pulls", {}).keys())[:3]  # Первые 3 ID
             logging.info(f"   📊 Примеры pull_id: {pull_ids}")
 
         if participants_count > 0:
-            participant_ids = list(pulls.get("pullparticipants", {}).keys())[:3]
             logging.info(f"   📊 Примеры pullparticipants: {participant_ids}")
 
         return True
 
     except Exception as e:
         logging.error(f"❌ load_pulls_from_pickle() error: {e}", exc_info=True)
-        pulls = {"pulls": {}, "pullparticipants": {}}
         pull_counter = 0
         return False
 
 
 def save_users_to_pickle():
     """✅ ПРАВИЛЬНОЕ сохранение пользователей"""
-    global users
     try:
         with open(USERSFILE, "wb") as f:
             pickle.dump(users, f, protocol=pickle.HIGHEST_PROTOCOL)
@@ -6278,7 +5465,6 @@ def load_users_from_pickle():
             with open(USERSFILE, "rb") as f:
                 loaded = pickle.load(f)
                 if isinstance(loaded, dict):
-                    users = loaded
                     logging.info(
                         f"✅ load_users_from_pickle() - загружено {len(users)} пользователей"
                     )
@@ -6334,7 +5520,6 @@ class GoogleSheetsManager:
 
         try:
             worksheet = self.spreadsheet.worksheet(title)
-        except Exception as e:
             worksheet = self.spreadsheet.add_worksheet(
                 title=title, rows=1000, cols=len(headers)
             )
@@ -6393,7 +5578,6 @@ class GoogleSheetsManager:
                 else:
                     worksheet.append_row(row_data)
                     logging.info(f"✅ Пользователь {user_id} добавлен в Google Sheets")
-            except Exception as e:
                 worksheet.append_row(row_data)
                 logging.info(f"✅ Пользователь {user_id} добавлен в Google Sheets")
 
@@ -6454,7 +5638,6 @@ class GoogleSheetsManager:
                 else:
                     worksheet.append_row(row_data)
                     logging.info(f"✅ Партия {batch_id} добавлена в Google Sheets")
-            except Exception as e:
                 worksheet.append_row(row_data)
                 logging.info(f"✅ Партия {batch_id} добавлена в Google Sheets")
 
@@ -6529,7 +5712,6 @@ class GoogleSheetsManager:
                 else:
                     worksheet.append_row(row_data)
                     logging.info(f"✅ Пул {pull_id} добавлен в Google Sheets")
-            except Exception as e:
                 worksheet.append_row(row_data)
                 logging.info(f"✅ Пул {pull_id} добавлен в Google Sheets")
 
@@ -6582,389 +5764,6 @@ class GoogleSheetsManager:
             logging.error(f"❌ Ошибка синхронизации сделки в Google Sheets: {e}")
 
 
-def sync_user_to_sheets(self, user_id, user_data):
-    """Синхронизация пользователя в Google Sheets"""
-    if not self.spreadsheet:
-        return
-
-    try:
-        headers = [
-            "user_id",
-            "username",
-            "name",
-            "phone",
-            "email",
-            "inn",
-            "company_details",
-            "region",
-            "role",
-            "registered_at",
-        ]
-
-        worksheet = self.get_or_create_worksheet("Users", headers)
-        if not worksheet:
-            return
-
-        try:
-            cell = worksheet.find(str(user_id))
-            row_num = cell.row
-
-            row_data = [
-                str(user_id),
-                clean_text(user_data.get("username", "")),
-                clean_text(user_data.get("name", "")),
-                clean_text(user_data.get("phone", "")),
-                clean_text(user_data.get("email", "")),
-                clean_text(user_data.get("inn", "")),
-                clean_text(user_data.get("company_details", "")),
-                clean_text(user_data.get("region", "")),
-                user_data.get("role", ""),
-                user_data.get("registered_at", ""),
-            ]
-
-            worksheet.update(values=[row_data], range_name=f"A{row_num}:J{row_num}")
-            logging.info(f"✅ Обновлен пользователь {user_id}")
-
-        except Exception as e:
-            # Пользователь не найден - добавляем новую строку
-            row_data = [
-                str(user_id),
-                clean_text(user_data.get("username", "")),
-                clean_text(user_data.get("name", "")),
-                clean_text(user_data.get("phone", "")),
-                clean_text(user_data.get("email", "")),
-                clean_text(user_data.get("inn", "")),
-                clean_text(user_data.get("company_details", "")),
-                clean_text(user_data.get("region", "")),
-                clean_text(user_data.get("role", "")),
-                clean_text(user_data.get("registered_at", "")),
-            ]
-
-            worksheet.append_row(row_data)
-            logging.info(f"✅ Добавлен пользователь {user_id}")
-
-    except Exception as e:
-        logging.error(f"❌ Ошибка синхронизации пользователя: {e}")
-
-
-def sync_batch_to_sheets(self, batch_data):
-    """Синхронизация партии в Google Sheets"""
-    if not self.spreadsheet:
-        logging.warning("⚠️ Google Sheets не подключен")
-        return
-
-    try:
-        headers = [
-            "batch_id",
-            "farmer_id",
-            "farmer_name",
-            "culture",
-            "region",
-            "volume",
-            "price",
-            "humidity",
-            "impurity",
-            "quality_class",
-            "storage_type",
-            "readiness_date",
-            "status",
-            "created_at",
-        ]
-
-        worksheet = self.get_or_create_worksheet("Batches", headers)
-        if not worksheet:
-            return
-
-        try:
-            cell = worksheet.find(str(batch_data["id"]))
-            row_num = cell.row
-
-            row_data = [
-                str(batch_data["id"]),
-                str(batch_data["farmer_id"]),
-                clean_text(batch_data.get("farmer_name", "")),
-                clean_text(batch_data.get("culture", "")),
-                clean_text(batch_data.get("region", "")),
-                str(batch_data.get("volume", "")),
-                str(batch_data.get("price", "")),
-                str(batch_data.get("humidity", "")),
-                str(batch_data.get("impurity", "")),
-                clean_text(batch_data.get("quality_class", "")),
-                clean_text(batch_data.get("storage_type", "")),
-                clean_text(batch_data.get("readiness_date", "")),
-                batch_data.get("status", ""),
-                batch_data.get("created_at", ""),
-            ]
-
-            worksheet.update(values=[row_data], range_name=f"A{row_num}:N{row_num}")
-            logging.info(f"✅ Обновлена партия {batch_data['id']}")
-
-        except Exception as e:
-            # Партия не найдена - добавляем новую
-            row_data = [
-                str(batch_data["id"]),
-                str(batch_data["farmer_id"]),
-                clean_text(batch_data.get("farmer_name", "")),
-                clean_text(batch_data.get("culture", "")),
-                clean_text(batch_data.get("region", "")),
-                str(batch_data.get("volume", "")),
-                str(batch_data.get("price", "")),
-                str(batch_data.get("humidity", "")),
-                str(batch_data.get("impurity", "")),
-                clean_text(batch_data.get("quality_class", "")),
-                clean_text(batch_data.get("storage_type", "")),
-                clean_text(batch_data.get("readiness_date", "")),
-                batch_data.get("status", ""),
-                batch_data.get("created_at", ""),
-            ]
-
-            worksheet.append_row(row_data)
-            logging.info(f"✅ Добавлена партия {batch_data['id']}")
-
-    except Exception as e:
-        logging.error(f"❌ Ошибка синхронизации партии: {e}")
-
-    def sync_pull_to_sheets(self, pull_data):
-        """Синхронизация пула в Google Sheets"""
-        if not self.spreadsheet:
-            return
-
-        try:
-            headers = [
-                "pull_id",
-                "exporter_id",
-                "exporter_name",
-                "culture",
-                "target_volume",
-                "current_volume",
-                "price",
-                "port",
-                "moisture",
-                "nature",
-                "impurity",
-                "weed",
-                "documents",
-                "doc_type",
-                "status",
-                "created_at",
-            ]
-
-            worksheet = self.get_or_create_worksheet("Pulls", headers)
-            if not worksheet:
-                return
-
-            try:
-                cell = worksheet.find(str(pull_data["id"]))
-                row_num = cell.row
-
-                row_data = [
-                    str(pull_data["id"]),
-                    str(pull_data["exporter_id"]),
-                    pull_data.get("exporter_name", ""),
-                    pull_data.get("culture", ""),
-                    str(pull_data.get("target_volume", "")),
-                    str(pull_data.get("current_volume", "")),
-                    str(pull_data.get("price", "")),
-                    pull_data.get("port", ""),
-                    str(pull_data.get("moisture", "")),
-                    str(pull_data.get("nature", "")),
-                    str(pull_data.get("impurity", "")),
-                    str(pull_data.get("weed", "")),
-                    pull_data.get("documents", ""),
-                    pull_data.get("doc_type", ""),
-                    pull_data.get("status", ""),
-                    pull_data.get("created_at", ""),
-                ]
-
-                worksheet.update(values=[row_data], range_name=f"A{row_num}:P{row_num}")
-                logging.info(f"✅ Обновлён пул {pull_data['id']}")
-
-            except Exception as e:
-                row_data = [
-                    str(pull_data["id"]),
-                    str(pull_data["exporter_id"]),
-                    pull_data.get("exporter_name", ""),
-                    pull_data.get("culture", ""),
-                    str(pull_data.get("target_volume", "")),
-                    str(pull_data.get("current_volume", "")),
-                    str(pull_data.get("price", "")),
-                    pull_data.get("port", ""),
-                    str(pull_data.get("moisture", "")),
-                    str(pull_data.get("nature", "")),
-                    str(pull_data.get("impurity", "")),
-                    str(pull_data.get("weed", "")),
-                    pull_data.get("documents", ""),
-                    pull_data.get("doc_type", ""),
-                    pull_data.get("status", ""),
-                    pull_data.get("created_at", ""),
-                ]
-                worksheet.append_row(row_data)
-                logging.info(f"✅ Добавлен пул {pull_data['id']}")
-
-        except Exception as e:
-            logging.error(f"❌ Ошибка синхронизации пула: {e}")
-
-    def delete_batch_from_sheets(self, batch_id):
-        """Удаление партии из Google Sheets"""
-        if not self.spreadsheet:
-            return
-
-        try:
-            worksheet = self.get_or_create_worksheet("Batches", [])
-            if not worksheet:
-                return
-
-            cell = worksheet.find(str(batch_id))
-            if cell:
-                worksheet.delete_rows(cell.row)
-                logging.info(f"✅ Удалена партия {batch_id} из Google Sheets")
-
-        except Exception as e:
-            logging.error(f"❌ Ошибка удаления партии {batch_id}: {e}")
-
-    def update_batch_in_sheets(self, batch_data):
-        """Обновление партии в Google Sheets"""
-        self.sync_batch_to_sheets(batch_data)
-
-    def update_user_in_sheets(self, user_id, user_data):
-        """Обновление пользователя в Google Sheets"""
-        self.sync_user_to_sheets(user_id, user_data)
-
-    def update_pull_in_sheets(self, pull_data):
-        """Обновление пула в Google Sheets"""
-        self.sync_pull_to_sheets(pull_data)
-
-    def sync_deal_to_sheets(self, deal_data):
-        """Синхронизация сделки в Google Sheets"""
-        if not self.spreadsheet:
-            return
-
-        try:
-            headers = [
-                "deal_id",
-                "pull_id",
-                "exporter_id",
-                "farmer_ids",
-                "logistic_id",
-                "expeditor_id",
-                "total_volume",
-                "status",
-                "created_at",
-                "completed_at",
-            ]
-
-            worksheet = self.get_or_create_worksheet("Deals", headers)
-            if not worksheet:
-                return
-
-            farmer_ids_str = ",".join(map(str, deal_data.get("farmer_ids", [])))
-
-            try:
-                cell = worksheet.find(str(deal_data["id"]))
-                row_num = cell.row
-
-                row_data = [
-                    str(deal_data["id"]),
-                    str(deal_data.get("pull_id", "")),
-                    str(deal_data.get("exporter_id", "")),
-                    farmer_ids_str,
-                    str(deal_data.get("logistic_id", "")),
-                    str(deal_data.get("expeditor_id", "")),
-                    str(deal_data.get("total_volume", "")),
-                    deal_data.get("status", ""),
-                    deal_data.get("created_at", ""),
-                    deal_data.get("completed_at", ""),
-                ]
-
-                worksheet.update(values=[row_data], range_name=f"A{row_num}:J{row_num}")
-                logging.info(f"✅ Обновлена сделка {deal_data['id']}")
-
-            except Exception as e:
-                row_data = [
-                    str(deal_data["id"]),
-                    str(deal_data.get("pull_id", "")),
-                    str(deal_data.get("exporter_id", "")),
-                    farmer_ids_str,
-                    str(deal_data.get("logistic_id", "")),
-                    str(deal_data.get("expeditor_id", "")),
-                    str(deal_data.get("total_volume", "")),
-                    deal_data.get("status", ""),
-                    deal_data.get("created_at", ""),
-                    deal_data.get("completed_at", ""),
-                ]
-                worksheet.append_row(row_data)
-                logging.info(f"✅ Добавлена сделка {deal_data['id']}")
-
-        except Exception as e:
-            logging.error(f"❌ Ошибка синхронизации сделки: {e}")
-
-    def sync_match_to_sheets(self, match_data):
-        """Синхронизация совпадения в Google Sheets"""
-        if not self.spreadsheet:
-            return
-
-        try:
-            headers = ["match_id", "batch_id", "pull_id", "status", "created_at"]
-
-            worksheet = self.get_or_create_worksheet("Matches", headers)
-            if not worksheet:
-                return
-
-            try:
-                cell = worksheet.find(str(match_data["id"]))
-                row_num = cell.row
-
-                row_data = [
-                    str(match_data["id"]),
-                    str(match_data.get("batch_id", "")),
-                    str(match_data.get("pull_id", "")),
-                    match_data.get("status", ""),
-                    match_data.get("created_at", ""),
-                ]
-
-                worksheet.update(values=[row_data], range_name=f"A{row_num}:E{row_num}")
-
-            except Exception as e:
-                row_data = [
-                    str(match_data["id"]),
-                    str(match_data.get("batch_id", "")),
-                    str(match_data.get("pull_id", "")),
-                    match_data.get("status", ""),
-                    match_data.get("created_at", ""),
-                ]
-                worksheet.append_row(row_data)
-                logging.info(f"✅ Добавлено совпадение {match_data['id']}")
-
-        except Exception as e:
-            logging.error(f"❌ Ошибка синхронизации совпадения: {e}")
-
-    def export_all_data(self):
-        """Экспорт всех данных в Google Sheets"""
-        if not self.spreadsheet:
-            logging.warning("⚠️ Google Sheets не подключен")
-            return False
-
-        try:
-            for user_id, user_data in users.items():
-                self.sync_user_to_sheets(user_id, user_data)
-            for user_batches in batches.values():
-                for batch in user_batches:
-                    self.sync_batch_to_sheets(batch)
-            for pull_data in pulls.values():
-                self.sync_pull_to_sheets(pull_data)
-            for deal_data in deals.values():
-                self.sync_deal_to_sheets(deal_data)
-            for match_data in matches.values():
-                self.sync_match_to_sheets(match_data)
-
-            logging.info("✅ Все данные экспортированы в Google Sheets")
-            return True
-
-        except Exception as e:
-            logging.error(f"❌ Ошибка экспорта данных: {e}")
-            return False
-
-
 # ====================================================================
 # ИНИЦИАЛИЗАЦИЯ GOOGLE SHEETS (асинхронная)
 # ====================================================================
@@ -7007,73 +5806,43 @@ async def init_google_sheets():
 # ============================================================================
 # ОБРАБОТЧИКИ ДЛЯ ПРЕДЛОЖЕНИЙ ЛОГИСТОВ (ФЕРМЕР)
 # ============================================================================
-
-
 @dp.message_handler(
     lambda message: message.text == "🚚 Предложения логистов", state="*"
 )
 async def farmer_view_logistics_offers(message: types.Message, state: FSMContext):
-    """Просмотр предложений логистов для фермера"""
-    global logistics_offers
-    global users
-
     await state.finish()
 
     user_id = message.from_user.id
 
     # Проверяем роль пользователя
-    if user_id not in users or users[user_id].get("role") != "farmer":
         await message.answer("❌ Эта функция доступна только фермерам")
         return
 
-    # Проверяем наличие предложений
-    if not logistics_offers:
         await message.answer(
             "📭 <b>Предложения логистов пока отсутствуют</b>\n\n"
-            "Когда логисты начнут подавать предложения, вы сможете их здесь увидеть.",
             parse_mode="HTML",
         )
         return
 
-    # Фильтруем активные предложения
     active_offers = [
-        offer
-        for offer in logistics_offers.values()
-        if offer.get("status") in ["active", "pending"]
     ]
 
     if not active_offers:
         await message.answer(
-            "📭 <b>Активных предложений нет</b>\n\n"
-            "Все текущие предложения уже приняты или отклонены.",
             parse_mode="HTML",
         )
         return
 
-    # Формируем текст со списком
     text = "<b>🚚 ДОСТУПНЫЕ ПРЕДЛОЖЕНИЯ ЛОГИСТОВ</b>\n\n"
     text += f"📊 Найдено предложений: <b>{len(active_offers)}</b>\n\n"
 
     keyboard = InlineKeyboardMarkup(row_width=1)
 
-    # Выводим первые 10 предложений
-    for offer in active_offers[:10]:
-        offer_id = offer.get("offer_id")
-        logist_id = offer.get("logist_id")
-        logist_user = users.get(logist_id, {})
-        logist_name = logist_user.get("name", "Логист")
 
-        transport_type = offer.get("transport_type", "Не указан")
-        route = offer.get("route", "Не указан")
-        price_per_ton = offer.get("price_per_ton", 0)
 
-        emoji = get_vehicle_emoji(transport_type)
 
-        # Форматируем текст кнопки
         button_text = (
             f"{emoji} {logist_name[:15]} | "
-            f"{route[:20]} | "
-            f"{price_per_ton:,.0f}₽/т"
         )
 
         keyboard.add(
@@ -7082,7 +5851,6 @@ async def farmer_view_logistics_offers(message: types.Message, state: FSMContext
             )
         )
 
-    # Информация об остальных
     if len(active_offers) > 10:
         text += f"\n<i>ℹ️ Ещё {len(active_offers) - 10} предложений доступно</i>"
 
@@ -7093,8 +5861,6 @@ async def farmer_view_logistics_offers(message: types.Message, state: FSMContext
 
 @dp.callback_query_handler(lambda c: c.data.startswith("farmer_view_offer:"), state="*")
 async def farmer_view_offer_details(callback: types.CallbackQuery, state: FSMContext):
-    """Детали предложения логиста для фермера"""
-
     await state.finish()
 
     try:
@@ -7103,54 +5869,28 @@ async def farmer_view_offer_details(callback: types.CallbackQuery, state: FSMCon
         await callback.answer("❌ Ошибка при загрузке предложения", show_alert=True)
         return
 
-    # Проверяем наличие предложения
-    if offer_id not in logistics_offers:
         await callback.answer("❌ Предложение не найдено", show_alert=True)
         return
 
-    offer = logistics_offers[offer_id]
-    logist_id = offer.get("logist_id")
-
-    # Проверяем наличие логиста
-    if logist_id not in users:
         await callback.answer("❌ Логист не найден", show_alert=True)
         return
 
-    logist = users[logist_id]
 
-    # Формируем полную информацию о предложении
     text = f"""
-🚚 <b>ПРЕДЛОЖЕНИЕ ЛОГИСТА</b>
 
-<b>📋 ID предложения:</b> #{offer_id}
 <b>📅 Создано:</b> {offer.get('created_at', 'Не указано')}
-<b>📊 Статус:</b> {'✅ Активно' if offer.get('status') == 'active' else '⏳ На рассмотрении'}
 
-<b>👤 ИНФОРМАЦИЯ О ЛОГИСТЕ:</b>
 Имя: {logist.get('name', 'Не указано')}
-Компания: {logist.get('company_details', 'Не указана')}
 ИНН: <code>{logist.get('inn', 'Не указан')}</code>
 ОГРН: <code>{logist.get('ogrn', 'Не указан')}</code>
 📱 Телефон: <code>{logist.get('phone', 'Не указан')}</code>
 📧 Email: <code>{logist.get('email', 'Не указан')}</code>
 
-<b>🚛 ХАРАКТЕРИСТИКИ ТРАНСПОРТА:</b>
-Тип: {offer.get('transport_type', 'Не указан')}
-Грузоподъёмность: {offer.get('capacity', 'Не указана')} т
-Маршрут: {offer.get('route', 'Не указан')}
-Дней в пути: {offer.get('delivery_days', 'Не указано')}
 
-<b>💰 СТОИМОСТЬ:</b>
-Цена: {offer.get('price_per_ton', 0):,.0f} ₽/т
-Всего: {(offer.get('price_per_ton', 0) * offer.get('capacity', 0)):,.0f} ₽
 
-<b>ℹ️ ДОПОЛНИТЕЛЬНО:</b>
-{offer.get('additional_info', 'Нет доп. информации')}
-"""
 
     keyboard = InlineKeyboardMarkup(row_width=2)
 
-    # Кнопки контакта логиста
     phone = logist.get("phone", "")
     if phone:
         keyboard.add(
@@ -7158,15 +5898,13 @@ async def farmer_view_offer_details(callback: types.CallbackQuery, state: FSMCon
             InlineKeyboardButton("💬 Написать", url=f"tg://user?id={logist_id}"),
         )
 
-    # Кнопка принятия предложения
-    keyboard.add(
-        InlineKeyboardButton(
-            "✅ Принять предложение", callback_data=f"farmer_accept_offer:{offer_id}"
-        ),
-        InlineKeyboardButton(
-            "❌ Отклонить", callback_data=f"farmer_reject_offer:{offer_id}"
-        ),
-    )
+        keyboard.add(
+            InlineKeyboardButton(
+            ),
+            InlineKeyboardButton(
+                "❌ Отклонить", callback_data=f"farmer_reject_offer:{offer_id}"
+            ),
+        )
 
     keyboard.add(
         InlineKeyboardButton("◀️ Назад к списку", callback_data="farmer_back_to_offers")
@@ -7182,66 +5920,36 @@ async def farmer_view_offer_details(callback: types.CallbackQuery, state: FSMCon
 async def farmer_accept_logistics_offer(
     callback: types.CallbackQuery, state: FSMContext
 ):
-    """Фермер принимает предложение логиста"""
-
     await state.finish()
 
     user_id = callback.from_user.id
 
-    # Парсим ID предложения
     try:
         offer_id = parse_callback_id(callback.data)
     except (IndexError, ValueError):
         await callback.answer("❌ Ошибка при обработке", show_alert=True)
         return
 
-    # Проверяем наличие предложения
-    if offer_id not in logistics_offers:
         await callback.answer("❌ Предложение не найдено", show_alert=True)
         return
 
-    offer = logistics_offers[offer_id]
-
-    # Проверяем статус предложения
-    if offer.get("status") != "active":
-        await callback.answer("❌ Это предложение уже неактивно", show_alert=True)
         return
 
-    # Обновляем статус предложения
-    offer["status"] = "accepted_by_farmer"
     offer["farmer_id"] = user_id
-    offer["accepted_at"] = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
 
-    # Сохраняем данные
-    save_logistics_to_pickle()
-    save_logistics_to_json()
 
-    # Получаем информацию о логисте
-    logist_id = offer.get("logist_id")
-    logist_user = users.get(logist_id, {})
-    farmer_user = users.get(user_id, {})
 
-    # Отправляем уведомление фермеру
     farmer_msg = f"""
 ✅ <b>ПРЕДЛОЖЕНИЕ ПРИНЯТО!</b>
 
 📋 ID предложения: #{offer_id}
 📅 Время принятия: {offer['accepted_at']}
 
-<b>👤 ДАННЫЕ ЛОГИСТА:</b>
 Имя: {logist_user.get('name', 'Не указано')}
-Компания: {logist_user.get('company_details', 'Не указана')}
 📱 Телефон: <code>{logist_user.get('phone', 'Не указан')}</code>
 📧 Email: <code>{logist_user.get('email', 'Не указан')}</code>
 
-<b>🚛 ХАРАКТЕРИСТИКИ:</b>
-Тип транспорта: {offer.get('transport_type', 'Не указан')}
-Маршрут: {offer.get('route', 'Не указан')}
-Цена: {offer.get('price_per_ton', 0):,.0f} ₽/т
-Дней в пути: {offer.get('delivery_days', 'Не указано')}
 
-⏳ Логист свяжется с вами в ближайшее время для согласования деталей доставки.
-"""
 
     keyboard = InlineKeyboardMarkup()
     keyboard.add(
@@ -7256,36 +5964,25 @@ async def farmer_accept_logistics_offer(
         farmer_msg, reply_markup=keyboard, parse_mode="HTML"
     )
 
-    # Уведомляем логиста о принятии
-    logist_msg = f"""
-🎉 <b>ВАШЕ ПРЕДЛОЖЕНИЕ ПРИНЯТО!</b>
+        logist_msg = f"""
 
 📋 ID предложения: #{offer_id}
-✅ Статус: ПРИНЯТО
 📅 Время принятия: {offer['accepted_at']}
 
-<b>👨‍🌾 ДАННЫЕ ФЕРМЕРА:</b>
 Имя: {farmer_user.get('name', 'Не указано')}
 Регион: {farmer_user.get('region', 'Не указан')}
 📱 Телефон: <code>{farmer_user.get('phone', 'Не указан')}</code>
 📧 Email: <code>{farmer_user.get('email', 'Не указан')}</code>
 
 <b>🚛 ДЕТАЛИ ПЕРЕВОЗКИ:</b>
-Маршрут: {offer.get('route', 'Не указан')}
-Ваша цена: {offer.get('price_per_ton', 0):,.0f} ₽/т
 
-📞 Свяжитесь с фермером в течение ближайших 24 часов для согласования всех деталей доставки!
 
-<b>Спасибо за использование нашей платформы! 🙏</b>
-"""
+        try:
+            await bot.send_message(logist_id, logist_msg, parse_mode="HTML")
+            logging.info(f"Уведомление логисту #{logist_id} отправлено успешно")
+        except Exception as e:
+            logging.error(f"Ошибка при отправке уведомления логисту: {e}")
 
-    try:
-        await bot.send_message(logist_id, logist_msg, parse_mode="HTML")
-        logging.info(f"Уведомление логисту #{logist_id} отправлено успешно")
-    except Exception as e:
-        logging.error(f"Ошибка при отправке уведомления логисту: {e}")
-
-    # Отправляем сообщение об успехе фермеру
     await callback.answer(
         "✅ Предложение принято! Логист получит уведомление.", show_alert=True
     )
@@ -7297,44 +5994,25 @@ async def farmer_accept_logistics_offer(
 async def farmer_reject_logistics_offer(
     callback: types.CallbackQuery, state: FSMContext
 ):
-    """Фермер отклоняет предложение логиста"""
-
     await state.finish()
 
     user_id = callback.from_user.id
 
-    # Парсим ID предложения
     try:
         offer_id = parse_callback_id(callback.data)
     except (IndexError, ValueError):
         await callback.answer("❌ Ошибка при обработке", show_alert=True)
         return
 
-    # Проверяем наличие предложения
-    if offer_id not in logistics_offers:
         await callback.answer("❌ Предложение не найдено", show_alert=True)
         return
 
-    offer = logistics_offers[offer_id]
-
-    # Проверяем статус предложения
-    if offer.get("status") != "active":
-        await callback.answer("❌ Это предложение уже неактивно", show_alert=True)
         return
 
-    # Обновляем статус предложения
-    offer["status"] = "rejected_by_farmer"
     offer["farmer_id"] = user_id
-    offer["rejected_at"] = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
 
-    # Сохраняем данные
-    save_logistics_to_pickle()
-    save_logistics_to_json()
 
-    # Получаем информацию о логисте
-    logist_id = offer.get("logist_id")
 
-    # Отправляем уведомление фермеру
     farmer_msg = f"""
 ❌ <b>ПРЕДЛОЖЕНИЕ ОТКЛОНЕНО</b>
 
@@ -7343,7 +6021,6 @@ async def farmer_reject_logistics_offer(
 
 Логист получит уведомление об отклонении.
 
-📲 Вы можете просмотреть другие предложения в разделе "Предложения логистов"
 """
 
     keyboard = InlineKeyboardMarkup()
@@ -7358,83 +6035,44 @@ async def farmer_reject_logistics_offer(
         farmer_msg, reply_markup=keyboard, parse_mode="HTML"
     )
 
-    # Уведомляем логиста об отклонении
-    logist_msg = f"""
-❌ <b>ВАШЕ ПРЕДЛОЖЕНИЕ ОТКЛОНЕНО</b>
+        logist_msg = f"""
 
 📋 ID предложения: #{offer_id}
-❌ Статус: ОТКЛОНЕНО
 📅 Время отклонения: {offer['rejected_at']}
 
-Фермер принял решение не использовать ваши услуги для этой перевозки.
 
-Спасибо за участие! Мы ждем ваших новых предложений. 🙏
-
-Рекомендуем:
-• Проанализировать отклоненные предложения
-• Попробовать улучшить условия
-• Подать новое предложение с лучшими параметрами
 """
+        try:
+            await bot.send_message(logist_id, logist_msg, parse_mode="HTML")
+        except Exception as e:
+            logging.error(f"Ошибка при отправке уведомления об отклонении: {e}")
 
-    try:
-        await bot.send_message(logist_id, logist_msg, parse_mode="HTML")
-        logging.info(
-            f"Уведомление об отклонении логисту #{logist_id} отправлено успешно"
-        )
-    except Exception as e:
-        logging.error(f"Ошибка при отправке уведомления об отклонении: {e}")
-
-    # Отправляем сообщение об успехе фермеру
     await callback.answer("✅ Предложение отклонено", show_alert=True)
 
 
-# ✅ ИСТОРИЯ ПРЕДЛОЖЕНИЙ ФЕРМЕРА
 @dp.message_handler(lambda message: message.text == "📋 История предложений", state="*")
 async def view_farmer_offers_history(message: types.Message, state: FSMContext):
-    """Просмотр истории всех предложений логистов"""
-
     await state.finish()
 
     user_id = message.from_user.id
 
-    # Проверяем роль пользователя
-    if user_id not in users or users[user_id].get("role") != "farmer":
         await message.answer("❌ Эта функция доступна только фермерам")
         return
 
-    if not logistics_offers:
         await message.answer("📭 История предложений пуста")
         return
 
-    # Формируем историю
-    text = "<b>📋 ИСТОРИЯ ПРЕДЛОЖЕНИЙ</b>\n\n"
 
-    # Активные
-    active = [o for o in logistics_offers.values() if o.get("status") == "active"]
     if active:
-        text += f"<b>✅ Активные предложения ({len(active)}):</b>\n"
         for offer in active[:5]:
-            text += f"• #{offer.get('offer_id')}: {offer.get('transport_type')} | {offer.get('price_per_ton', 0):,.0f}₽\n"
         text += "\n"
 
-    # Принятые
-    accepted = [
-        o for o in logistics_offers.values() if o.get("status") == "accepted_by_farmer"
-    ]
     if accepted:
-        text += f"<b>✔️ Принятые предложения ({len(accepted)}):</b>\n"
         for offer in accepted[:5]:
-            text += f"• #{offer.get('offer_id')}: {offer.get('transport_type')} | ✅ {offer.get('accepted_at')}\n"
         text += "\n"
 
-    # Отклоненные
-    rejected = [
-        o for o in logistics_offers.values() if o.get("status") == "rejected_by_farmer"
-    ]
     if rejected:
-        text += f"<b>❌ Отклоненные предложения ({len(rejected)}):</b>\n"
         for offer in rejected[:5]:
-            text += f"• #{offer.get('offer_id')}: {offer.get('transport_type')} | ❌ {offer.get('rejected_at')}\n"
 
     keyboard = InlineKeyboardMarkup()
     keyboard.add(
@@ -7448,12 +6086,7 @@ async def view_farmer_offers_history(message: types.Message, state: FSMContext):
 
 
 @dp.callback_query_handler(lambda c: c.data == "farmer_back_to_offers", state="*")
-async def farmer_back_to_offers_list(callback: types.CallbackQuery):
     """Возврат к списку предложений"""
-    await farmer_view_logistics_offers(
-        callback.message,
-        FSMContext(dp.storage, callback.from_user.id, callback.from_user.id),
-    )
     await callback.answer()
 
 
@@ -7462,39 +6095,28 @@ async def view_deal_details(callback: types.CallbackQuery):
     """Просмотр деталей сделки"""
     deal_id = parse_callback_id(callback.data)
 
-    if deal_id not in deals:
         await callback.answer("❌ Сделка не найдена", show_alert=True)
         return
 
-    deal = deals[deal_id]
     text = f"📋 <b>Сделка #{deal_id}</b>\n\n"
 
     text += f"📊 Статус: {DEAL_STATUSES.get(deal.get('status', 'pending'), deal.get('status'))}\n"
 
-    if deal.get("total_volume"):
-        text += f"📦 Объём: {deal['total_volume']} т\n"
 
     if deal.get("exporter_id"):
-        exporter_name = users.get(deal["exporter_id"], {}).get("name", "Неизвестно")
         text += f"📦 Экспортёр: {exporter_name}\n"
 
-    if deal.get("farmer_ids"):
-        farmers_count = len(deal["farmer_ids"])
         text += f"🌾 Фермеров: {farmers_count}\n"
 
     if deal.get("logistic_id"):
-        logistic_name = users.get(deal["logistic_id"], {}).get("name", "Неизвестно")
         text += f"🚚 Логист: {logistic_name}\n"
 
     if deal.get("expeditor_id"):
-        expeditor_name = users.get(deal["expeditor_id"], {}).get("name", "Неизвестно")
         text += f"🚛 Экспедитор: {expeditor_name}\n"
 
     if deal.get("created_at"):
-        text += f"📅 Создана: {deal['created_at']}\n"
 
     if deal.get("completed_at"):
-        text += f"✅ Завершена: {deal['completed_at']}\n"
 
     keyboard = deal_actions_keyboard(deal_id)
 
@@ -7508,7 +6130,6 @@ async def search_exporters(message: types.Message, state: FSMContext):
     await state.finish()
 
     user_id = message.from_user.id
-    if user_id not in users or users[user_id].get("role") != "farmer":
         await message.answer("❌ Эта функция доступна только фермерам")
         return
 
@@ -7522,14 +6143,12 @@ async def search_exporters(message: types.Message, state: FSMContext):
         # Случай 1: Новая структура {batch_id: {farmer_id: ..., ...}}
         if isinstance(value, dict):
             # Проверяем наличие farmer_id в словаре
-            if "farmer_id" in value and value.get("farmer_id") == user_id:
                 if value.get("status") in ["active", "Активна", "активна", "", None]:
                     farmer_batches[key] = value
 
         # Случай 2: Старая структура {user_id: [batch1, batch2, ...]}
         elif isinstance(value, list):
             # Если ключ совпадает с user_id, это список партий этого фермера
-            if key == user_id:
                 for batch in value:
                     if isinstance(batch, dict):
                         batch_id = batch.get("id")
@@ -7577,7 +6196,6 @@ async def process_find_exporters(callback: types.CallbackQuery):
         await callback.answer("❌ Ошибка", show_alert=True)
         return
 
-    user_id = callback.from_user.id
     await callback.answer("🔍 Ищем подходящих экспортёров...")
 
     # ═══════════════════════════════════════════════════════════════
@@ -7595,7 +6213,6 @@ async def process_find_exporters(callback: types.CallbackQuery):
         for key, value in batches.items():
             if isinstance(value, list):
                 for b in value:
-                    if isinstance(b, dict) and b.get("id") == batch_id:
                         batch = b
                         break
             if batch:
@@ -7631,8 +6248,6 @@ async def process_find_exporters(callback: types.CallbackQuery):
             continue
 
         # Проверка статуса
-        pull_status = str(pull.get("status", "")).lower().strip()
-        if pull_status not in ["открыт", "open", "active", ""]:
             continue
 
         # Проверка культуры
@@ -7649,7 +6264,6 @@ async def process_find_exporters(callback: types.CallbackQuery):
 
         # Получаем экспортёра
         exporter_id = pull.get("exporter_id")
-        exporter = users.get(exporter_id, {})
 
         # Флаг предупреждения о цене
         pull_price = pull.get("price", 0)
@@ -7678,11 +6292,6 @@ async def process_find_exporters(callback: types.CallbackQuery):
             f"🔍 <b>Результаты поиска для партии #{batch_id}</b>\n\n"
             f"🌾 {batch.get('culture', '—')} - {batch.get('volume', 0):.0f} т\n"
             f"💰 {batch.get('price', 0):,.0f} ₽/т\n\n"
-            f"❌ К сожалению, подходящих экспортёров не найдено.\n\n"
-            f"💡 Попробуйте:\n"
-            f"• Снизить цену\n"
-            f"• Разделить партию на меньшие объёмы\n"
-            f"• Подождать появления новых пулов",
             reply_markup=keyboard,
             parse_mode="HTML",
         )
@@ -7691,11 +6300,9 @@ async def process_find_exporters(callback: types.CallbackQuery):
     # Формируем сообщение с результатами
     text = (
         f"🎯 <b>Найдено {len(matching_pulls)} подходящих экспортёров</b>\n\n"
-        f"Для партии:\n"
         f"🌾 {batch.get('culture', '—')} - {batch.get('volume', 0):.0f} т\n"
         f"💰 {batch.get('price', 0):,.0f} ₽/т\n"
         f"📍 {batch.get('region', 'Не указан')}\n\n"
-        f"<b>Подходящие предложения:</b>\n\n"
     )
 
     for idx, match in enumerate(matching_pulls[:10], 1):
@@ -7715,7 +6322,6 @@ async def process_find_exporters(callback: types.CallbackQuery):
             text += f" ⚠️ <i>(ниже вашей {batch.get('price', 0):,.0f} ₽/т)</i>"
 
         text += (
-            f"\n"
             f"   📦 Нужно: {pull.get('target_volume', 0):.0f} т (свободно: {match['remaining_volume']:.0f} т)\n"
             f"   🚢 Порт: {pull.get('port', '—')}\n"
             f"   📞 Телефон: <code>{phone}</code>\n"
@@ -7742,7 +6348,6 @@ async def add_batch_start(message: types.Message, state: FSMContext):
     await state.finish()
 
     user_id = message.from_user.id
-    if user_id not in users or users[user_id].get("role") != "farmer":
         await message.answer("❌ Эта функция доступна только фермерам")
         return
 
@@ -7779,17 +6384,6 @@ async def search_by_culture_selected(callback: types.CallbackQuery, state: FSMCo
 
     found_batches = []
 
-    # Правильная структура: batches = {batch_id: {farmer_id: ..., culture: ..., status: ..., ...}}
-    for batch_id, batch in batches.items():
-        # ────────────────────────────────────────────────────────────────────────
-        # ЗАЩИТА: Проверяем, что batch — словарь
-        # ────────────────────────────────────────────────────────────────────────
-        if not isinstance(batch, dict):
-            logging.error(
-                f"❌ Партия #{batch_id} НЕ словарь: type={type(batch)}, value={batch}"
-            )
-            continue
-
         # Извлекаем данные партии
         batch_culture = batch.get("culture", "")
         batch_status = batch.get("status", "")
@@ -7808,10 +6402,6 @@ async def search_by_culture_selected(callback: types.CallbackQuery, state: FSMCo
                 "доступна",
                 "",  # пустой статус = активна
             ]:
-                # Добавляем batch_id в саму партию для удобства
-                batch["batch_id"] = batch_id
-                found_batches.append(batch)
-                logging.info(f"    ✅ НАЙДЕНО!")
 
     logging.info(f"🎯 Итого найдено партий: {len(found_batches)}")
 
@@ -7828,7 +6418,6 @@ async def search_by_culture_selected(callback: types.CallbackQuery, state: FSMCo
 
         await callback.message.edit_text(
             f"❌ <b>По культуре '{culture}' партий не найдено.</b>\n\n"
-            f"Попробуйте выбрать другую культуру.",
             reply_markup=keyboard,
             parse_mode="HTML",
         )
@@ -7858,7 +6447,6 @@ async def search_by_culture_selected(callback: types.CallbackQuery, state: FSMCo
         farmer_id = batch.get("farmer_id")
 
         # Получаем информацию о фермере
-        farmer = users.get(farmer_id, {})
         farmer_name = farmer.get("name", "Не указано")
         farmer_phone = farmer.get("phone", "Не указан")
 
@@ -7913,20 +6501,12 @@ async def search_by_culture_selected(callback: types.CallbackQuery, state: FSMCo
 @dp.callback_query_handler(lambda c: c.data.startswith("contact_farmer:"))
 async def contact_farmer_callback(callback: types.CallbackQuery):
     """Обработчик кнопки Связаться с фермером - показывает полные контакты"""
-    global batches, users
-
     try:
-        # Извлекаем batch_id из callback_data
-        batch_id = int(callback.data.split(":")[1])
         logging.info(f"📞 Запрос контактов для партии {batch_id}")
 
-        # Находим партию в правильной структуре: batches = {batch_id: {farmer_id: ..., ...}}
-        if batch_id not in batches:
             await callback.answer("❌ Партия не найдена", show_alert=True)
             logging.warning(f"❌ Партия {batch_id} не найдена в batches")
             return
-
-        found_batch = batches[batch_id]
 
         # Проверяем, что это словарь
         if not isinstance(found_batch, dict):
@@ -7937,14 +6517,12 @@ async def contact_farmer_callback(callback: types.CallbackQuery):
             return
 
         # Получаем farmer_id из партии
-        farmer_id = found_batch.get("farmer_id")
         if not farmer_id:
             await callback.answer("❌ Фермер не указан", show_alert=True)
             logging.warning(f"❌ У партии {batch_id} нет farmer_id")
             return
 
         # Получаем информацию о фермере
-        farmer = users.get(farmer_id, {})
         farmer_name = farmer.get("name", "Фермер")
         farmer_phone = farmer.get("phone", "Не указан")
         farmer_email = farmer.get("email", "Не указан")
@@ -7964,10 +6542,7 @@ async def contact_farmer_callback(callback: types.CallbackQuery):
         readiness = found_batch.get("readiness_date", "Не указана")
 
         # Формируем красивое сообщение с контактами
-        text = f"📞 <b>Контакты фермера</b>\n\n"
-        text += f"━━━━━━━━━━━━━━━\n"
         text += f"<b>📦 ПАРТИЯ #{batch_id}</b>\n"
-        text += f"━━━━━━━━━━━━━━━\n"
         text += f"<b>Культура:</b> {culture}\n"
         text += f"<b>Объём:</b> {volume:,.1f} т\n"
         text += f"<b>Цена:</b> {price:,.0f} ₽/т\n"
@@ -7977,16 +6552,12 @@ async def contact_farmer_callback(callback: types.CallbackQuery):
         text += f"<b>Сорность:</b> {impurity}%\n"
         text += f"<b>Хранение:</b> {storage}\n"
         text += f"<b>Готовность:</b> {readiness}\n\n"
-        text += f"━━━━━━━━━━━━━━━\n"
-        text += f"<b>👤 КОНТАКТЫ ФЕРМЕРА</b>\n"
-        text += f"━━━━━━━━━━━━━━━\n"
         text += f"<b>Имя:</b> {farmer_name}\n"
         text += f"<b>Компания:</b> {farmer_company}\n"
         text += f"<b>ИНН:</b> {farmer_inn}\n"
         text += f"<b>Регион:</b> {farmer_region}\n"
         text += f"<b>Телефон:</b> <code>{farmer_phone}</code>\n"
         text += f"<b>Email:</b> <code>{farmer_email}</code>\n\n"
-        text += f"💬 Вы можете позвонить или написать фермеру для обсуждения сделки."
 
         keyboard = InlineKeyboardMarkup(row_width=1)
         # Кнопки для прямого контакта
@@ -8189,7 +6760,6 @@ async def add_batch_readiness_date(message: types.Message, state: FSMContext):
     batch = {
         "id": batch_counter,
         "farmer_id": user_id,
-        "farmer_name": users[user_id].get("name", ""),
         "culture": data["culture"],
         "region": data["region"],
         "volume": data["volume"],
@@ -8216,31 +6786,21 @@ async def add_batch_readiness_date(message: types.Message, state: FSMContext):
     if "create_batch_for_pull_id" in data:
         pull_id = data["create_batch_for_pull_id"]
 
-        if pull_id in pulls:
-            pull = pulls["pulls"][pull_id]
-            available = pull["target_volume"] - pull["current_volume"]
 
-            if batch["volume"] <= available and batch["culture"] == pull["culture"]:
-                if pull_id not in pullparticipants:
-                    pullparticipants[pull_id] = []
 
                 # Проверяем что ещё не присоединились
                 already_joined = any(
-                    p["batch_id"] == batch["id"] for p in pullparticipants[pull_id]
                 )
 
                 if not already_joined:
                     participant = {
                         "farmer_id": user_id,
-                        "farmer_name": users[user_id].get("name", ""),
                         "batch_id": batch["id"],
                         "volume": batch["volume"],
                         "joined_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     }
-                    pullparticipants[pull_id].append(participant)
                     pull["current_volume"] += batch["volume"]
 
-                    batch["status"] = "Зарезервирована"
 
                     save_pulls_to_pickle()
                     save_batches_to_pickle()
@@ -8274,7 +6834,6 @@ async def add_batch_readiness_date(message: types.Message, state: FSMContext):
                         f"🌾 {batch['culture']}\n"
                         f"📦 Объём: {batch['volume']} т\n"
                         f"💰 Цена: {batch['price']:,.0f} ₽/т\n\n"
-                        f"Экспортёр получил уведомление и свяжется с вами.",
                         parse_mode="HTML",
                         reply_markup=get_role_keyboard("farmer"),
                     )
@@ -8288,7 +6847,6 @@ async def add_batch_readiness_date(message: types.Message, state: FSMContext):
     if gs and gs.spreadsheet:
         try:
             gs.sync_batch_to_sheets(batch)
-            farmer_name = users[user_id].get("name", "Неизвестно")
             await publish_batch_to_channel(batch, farmer_name)
         except Exception as e:
             logging.error(f"Ошибка синхронизации с Google Sheets: {e}")
@@ -8332,7 +6890,6 @@ async def add_batch_readiness_date(message: types.Message, state: FSMContext):
             match_objs.append(match_obj)
 
             # ✅ СОХРАНЯЕМ В matches
-            match_id = len(matches) + 1
             matches[match_id] = {
                 "id": match_id,
                 "batch_id": batch["id"],
@@ -8358,18 +6915,13 @@ async def view_batch_matches(callback: types.CallbackQuery):
         await callback.answer("❌ Ошибка", show_alert=True)
         return
 
-    user_id = callback.from_user.id
-
     # ✅ ИСПРАВЛЕНО: Поиск партии в структуре {farmer_id: [batch_list]}
     batch = None
-    farmer_id = None
 
     for fid, batch_list in batches.items():
         if isinstance(batch_list, list):
             for b in batch_list:
-                if isinstance(b, dict) and b.get("id") == batch_id:
                     batch = b
-                    farmer_id = fid
                     break
         if batch:
             break
@@ -8381,7 +6933,6 @@ async def view_batch_matches(callback: types.CallbackQuery):
     # Ищем активные совпадения
     batch_matches = []
     for match in matches.values():
-        if match.get("batch_id") == batch_id and match.get("status") == "active":
             batch_matches.append(match)
 
     if not batch_matches:
@@ -8433,22 +6984,17 @@ async def view_batch_matches(callback: types.CallbackQuery):
 async def view_my_batches(message: types.Message, state: FSMContext):
     """Просмотр всех партий фермера с правильными статусами через статус мап"""
 
-    global batches
     await state.finish()
 
     user_id = message.from_user.id
-    if user_id not in users or users[user_id].get("role") != "farmer":
         await message.answer("❌ Эта функция доступна только фермерам")
         return
 
-    if user_id not in batches or not batches[user_id]:
         await message.answer(
             "📦 У вас пока нет добавленных партий.\n\n"
             "Используйте кнопку '➕ Добавить партию' для создания новой."
         )
         return
-
-    user_batches = batches[user_id]
 
     # Статус мап для сопоставления с реальным статусом партии
     status_map = {
@@ -8478,7 +7024,6 @@ async def view_my_batches(message: types.Message, state: FSMContext):
 
     for batch in active_batches:
         has_matches = any(
-            m["batch_id"] == batch["id"] and m["status"] == "active"
             for m in matches.values()
         )
         match_emoji = "🎯 " if has_matches else ""
@@ -8527,7 +7072,6 @@ async def view_my_batches(message: types.Message, state: FSMContext):
         f"🔒 Зарезервированные: {len(reserved_batches)}\n"
         f"💰 Проданные: {len(sold_batches)}\n"
         f"❌ Снятые с продажи: {len(withdrawn_batches)}\n"
-        f"🎯 С совпадениями: {len([b for b in active_batches if any(m['batch_id'] == b['id'] and m['status'] == 'active' for m in matches.values())])}\n\n"
         "Нажмите на партию для просмотра деталей:",
         reply_markup=keyboard,
         parse_mode="HTML",
@@ -8540,7 +7084,6 @@ async def view_pools_menu(message: types.Message, state: FSMContext):
     await state.finish()
 
     user_id = message.from_user.id
-    if user_id not in users or users[user_id].get("role") != "farmer":
         await message.answer("❌ Эта функция доступна только фермерам")
         return
 
@@ -8564,7 +7107,6 @@ async def view_pools_menu(message: types.Message, state: FSMContext):
             logging.warning(f"⚠️ Пул {pull_id} не dict: {type(pull)}")
             continue
 
-        if pull.get("status") in ["active", "Открыт", "open"]:
             pull_data = pull.copy()
             pull_data["pull_id"] = pull_id
             open_pulls.append(pull_data)
@@ -8642,23 +7184,16 @@ async def join_pull_volume(message: types.Message, state: FSMContext):
 
         if volume > available:
             await message.answer(
-                f"❌ Превышен доступный объём!\n"
                 f"Доступно: {available:,.0f} т\n"
                 f"Вы указали: {volume:,.0f} т"
             )
             return
 
-        # ✅ ИСПРАВЛЕНО: Добавляем участника в pullparticipants
-        all_pullparticipants = pulls.get("pullparticipants", {})
         pull_id_str = str(pull_id)
 
-        if pull_id_str not in all_pullparticipants:
-            all_pullparticipants[pull_id_str] = []
 
-        all_pullparticipants[pull_id_str].append(
             {
                 "farmer_id": user_id,
-                "farmer_name": users[user_id].get("name", "?"),
                 "batch_id": batch_id,
                 "volume": volume,
                 "joined_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -8682,11 +7217,8 @@ async def join_pull_volume(message: types.Message, state: FSMContext):
         if is_full:
             # Пул заполнен на 100%
             await message.answer(
-                f"🎉 <b>Поздравляем!</b>\n\n"
                 f"Ваша партия добавлена: {volume:,.0f} т\n\n"
                 f"✅ <b>Пул #{pull_id} заполнен на 100%!</b>\n\n"
-                f"Пул автоматически закрыт и создана сделка.\n"
-                f"Детали сделки придут отдельно.",
                 parse_mode="HTML",
                 reply_markup=farmer_keyboard(),
             )
@@ -8696,14 +7228,11 @@ async def join_pull_volume(message: types.Message, state: FSMContext):
             remaining = pull.get("target_volume", 0) - pull["current_volume"]
 
             await message.answer(
-                f"✅ <b>Партия добавлена в пул!</b>\n\n"
                 f"📦 Ваш объем: {volume:,.0f} т\n"
                 f"💵 Цена: ₽{pull.get('price', 0):,.0f}/т\n"
                 f"💰 Ваша сумма: ₽{volume * pull.get('price', 0):,.0f}\n\n"
-                f"📊 <b>Заполненность пула:</b>\n"
                 f"{pull['current_volume']:,.0f} / {pull.get('target_volume', 0):,.0f} т ({fill_percent:.1f}%)\n"
                 f"Осталось: {remaining:,.0f} т\n\n"
-                f"Вы получите уведомление, когда пул будет заполнен.",
                 parse_mode="HTML",
                 reply_markup=farmer_keyboard(),
             )
@@ -8718,14 +7247,10 @@ async def join_pull_volume(message: types.Message, state: FSMContext):
 
 @dp.callback_query_handler(lambda c: c.data == "refresh_prices", state="*")
 async def refresh_prices(callback: types.CallbackQuery, state: FSMContext):
-    """Обновление отображения цен (показываем текущие)"""
     await state.finish()
 
-    prices_msg = format_prices_message()
-
-    try:
+        prices_msg = format_prices_message()
         await callback.message.edit_text(prices_msg, parse_mode="HTML")
-        await callback.answer("✅ Цены обновлены!")
     except MessageNotModified:
         await callback.answer("ℹ️ Цены актуальны", show_alert=False)
 
@@ -8742,20 +7267,14 @@ async def refresh_news(callback: types.CallbackQuery):
     )
 
 
-@dp.callback_query_handler(
-    lambda c: c.data in ["view_analytics", "view_grain_news", "view_export_news"],
-    state="*",
-)
 @dp.callback_query_handler(lambda c: c.data == "auto_match_all", state="*")
 async def auto_match_all_batches(callback: types.CallbackQuery):
     """Автопоиск экспортёров для всех активных партий"""
     user_id = callback.from_user.id
 
-    if user_id not in batches:
         await callback.answer("❌ У вас нет партий", show_alert=True)
         return
 
-    active_batches = [b for b in batches[user_id] if b.get("status") == "Активна"]
 
     if not active_batches:
         await callback.answer("❌ Нет активных партий", show_alert=True)
@@ -8774,9 +7293,7 @@ async def auto_match_all_batches(callback: types.CallbackQuery):
 
     if total_matches > 0:
         await callback.message.answer(
-            f"✅ Автопоиск завершен!\n\n"
             f"Найдено совпадений: {total_matches}\n"
-            f"Экспортёры получили уведомления о ваших партиях."
         )
     else:
         await callback.message.answer(
@@ -8786,7 +7303,7 @@ async def auto_match_all_batches(callback: types.CallbackQuery):
             "• Уточнить параметры качества\n"
             "• Подождать новых предложений"
         )
-    await callback.answer()
+        await callback.answer()
 
 
 @dp.message_handler(lambda m: m.text == "➕ Создать пул", state="*")
@@ -8794,7 +7311,6 @@ async def create_pull_start(message: types.Message, state: FSMContext):
     await state.finish()
     userid = message.from_user.id
 
-    if userid not in users or users[userid].get("role") != "exporter":
         await message.answer("❌ Эта функция доступна только для экспортеров.")
         return
 
@@ -8832,19 +7348,13 @@ async def create_pull_culture_callback(
 
     try:
         await callback.message.edit_text(
-            f"🌾 <b>Создание пула</b>\n\n"
-            f"<b>Шаг 2 из 10</b>\n\n"
             f"Выбрана культура: <b>{culture}</b>\n\n"
-            f"Введите целевой объем пула (в тоннах):",
             parse_mode="HTML",
         )
     except Exception as e:
         logging.error(f"Error editing message: {e}")
         await callback.message.answer(
-            f"🌾 <b>Создание пула</b>\n\n"
-            f"<b>Шаг 2 из 10</b>\n\n"
             f"Выбрана культура: <b>{culture}</b>\n\n"
-            f"Введите целевой объем пула (в тоннах):",
             parse_mode="HTML",
         )
 
@@ -8862,10 +7372,7 @@ async def create_pull_volume(message: types.Message, state: FSMContext):
             raise ValueError
         await state.update_data(volume=volume)
         await message.answer(
-            f"🌾 <b>Создание пула</b>\n\n"
-            f"<b>Шаг 3 из 10</b>\n\n"
             f"Объем: <b>{volume:,.0f} тонн</b>\n\n"
-            f"Введите цену FOB (₽/тонна):",
             parse_mode="HTML",
         )
         await CreatePullStatesGroup.price.set()
@@ -8882,10 +7389,7 @@ async def create_pull_price(message: types.Message, state: FSMContext):
             raise ValueError
         await state.update_data(price=price)
         await message.answer(
-            f"🌾 <b>Создание пула</b>\n\n"
-            f"<b>Шаг 4 из 10</b>\n\n"
             f"Цена: <b>₽{price:,.0f}/тонна</b>\n\n"
-            f"Выберите порт отгрузки:",
             reply_markup=port_keyboard(),
             parse_mode="HTML",
         )
@@ -8916,19 +7420,13 @@ async def create_pull_port_callback(callback: types.CallbackQuery, state: FSMCon
 
     try:
         await callback.message.edit_text(
-            f"🌾 <b>Создание пула</b>\n\n"
-            f"<b>Шаг 5 из 10</b>\n\n"
             f"Порт: <b>{port}</b>\n\n"
-            f"Введите максимальную влажность (%):",
             parse_mode="HTML",
         )
     except Exception as e:
         logging.error(f"Error editing message: {e}")
         await callback.message.answer(
-            f"🌾 <b>Создание пула</b>\n\n"
-            f"<b>Шаг 5 из 10</b>\n\n"
             f"Порт: <b>{port}</b>\n\n"
-            f"Введите максимальную влажность (%):",
             parse_mode="HTML",
         )
 
@@ -8946,10 +7444,7 @@ async def create_pull_moisture(message: types.Message, state: FSMContext):
             raise ValueError
         await state.update_data(moisture=moisture)
         await message.answer(
-            f"🌾 <b>Создание пула</b>\n\n"
-            f"<b>Шаг 6 из 10</b>\n\n"
             f"Влажность: <b>{moisture}%</b>\n\n"
-            f"Введите минимальную натуру (г/л):",
             parse_mode="HTML",
         )
         await CreatePullStatesGroup.nature.set()
@@ -8966,10 +7461,7 @@ async def create_pull_nature(message: types.Message, state: FSMContext):
             raise ValueError
         await state.update_data(nature=nature)
         await message.answer(
-            f"🌾 <b>Создание пула</b>\n\n"
-            f"<b>Шаг 7 из 10</b>\n\n"
             f"Натура: <b>{nature} г/л</b>\n\n"
-            f"Введите максимальную сорную примесь (%):",
             parse_mode="HTML",
         )
         await CreatePullStatesGroup.impurity.set()
@@ -8986,10 +7478,7 @@ async def create_pull_impurity(message: types.Message, state: FSMContext):
             raise ValueError
         await state.update_data(impurity=impurity)
         await message.answer(
-            f"🌾 <b>Создание пула</b>\n\n"
-            f"<b>Шаг 8 из 10</b>\n\n"
             f"Сорная примесь: <b>{impurity}%</b>\n\n"
-            f"Введите максимальную зерновую примесь (%):",
             parse_mode="HTML",
         )
         await CreatePullStatesGroup.weed.set()
@@ -9006,10 +7495,7 @@ async def create_pull_weed(message: types.Message, state: FSMContext):
             raise ValueError
         await state.update_data(weed=weed)
         await message.answer(
-            f"🌾 <b>Создание пула</b>\n\n"
-            f"<b>Шаг 9 из 10</b>\n\n"
             f"Зерновая примесь: <b>{weed}%</b>\n\n"
-            f"Какие документы требуются? (например: Фитосертификат, качество, ветсертификат)",
             parse_mode="HTML",
         )
         await CreatePullStatesGroup.documents.set()
@@ -9034,10 +7520,7 @@ async def create_pull_documents(message: types.Message, state: FSMContext):
     )
 
     await message.answer(
-        f"🌾 <b>Создание пула</b>\n\n"
-        f"<b>Шаг 10 из 10</b>\n\n"
         f"Документы: <b>{documents}</b>\n\n"
-        f"Выберите тип поставки:",
         reply_markup=keyboard,
         parse_mode="HTML",
     )
@@ -9051,7 +7534,6 @@ async def create_pull_documents(message: types.Message, state: FSMContext):
     lambda c: c.data.startswith("doctype_"), state=CreatePullStatesGroup.doctype
 )
 async def create_pull_finish(callback: types.CallbackQuery, state: FSMContext):
-    global pull_counter
 
     logging.info(
         f"Received doctype callback: {callback.data}, state: {await state.get_state()}"
@@ -9069,19 +7551,13 @@ async def create_pull_finish(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     userid = callback.from_user.id
 
-    # ✅ СОЗДАНИЕ ПУЛА С ДВОЙНОЙ ПОДДЕРЖКОЙ ПОЛЕЙ
     pull_counter += 1
     pull = {
-        # ═══════════════════════════════════════════
-        # СТАРЫЕ ПОЛЯ (для совместимости с существующим кодом)
-        # ═══════════════════════════════════════════
         "id": pull_counter,
         "exporter_id": userid,
-        "exporter_name": users.get(userid, {}).get("name", ""),
         "culture": data["culture"],
         "target_volume": data["volume"],
         "current_volume": 0,
-        "price": data["price"],  # ⭐ СТАРОЕ ИМЯ
         "port": data["port"],
         "moisture": data.get("moisture", 0),
         "nature": data.get("nature", 0),
@@ -9089,28 +7565,14 @@ async def create_pull_finish(callback: types.CallbackQuery, state: FSMContext):
         "weed": data.get("weed", 0),
         "documents": data.get("documents", ""),
         "doc_type": doctype,
-        "status": "active",  # ⭐ СТАРЫЙ СТАТУС
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "participants": [],
-        # ═══════════════════════════════════════════
-        # НОВЫЕ ПОЛЯ (для функции show_deal_detail)
-        # ═══════════════════════════════════════════
-        "price_per_ton": float(data.get("price", 0)),  # ⭐ НОВОЕ ИМЯ (ЗЕРКАЛО price)
-        "creator_id": userid,  # ⭐ НОВОЕ НАЗВАНИЕ
-        "farmer_ids": [],  # ⭐ ДЛЯ ДЕТАЛЕЙ
-        "batches": [],  # ⭐ ДЛЯ ДЕТАЛЕЙ
-        "batch_ids": [],  # ⭐ ЗЕРКАЛО batches
         "logist_ids": [],
         "expeditor_ids": [],
     }
 
-    # ✅ ИСПРАВЛЕНИЕ: Сохраняем пул В правильную структуру
     pulls["pulls"][pull_counter] = pull
-    pulls["pullparticipants"][pull_counter] = []
 
-    save_pulls_to_pickle()
-
-    # Синхронизация с Google Sheets
     try:
         if gs and gs.spreadsheet:
             gs.sync_pull_to_sheets(pull)
@@ -9121,7 +7583,6 @@ async def create_pull_finish(callback: types.CallbackQuery, state: FSMContext):
 
     await state.finish()
 
-    # Формируем сообщение с результатом
     summary = (
         f"✅ <b>Пул #{pull_counter} успешно создан!</b>\n\n"
         f"🌾 Культура: <b>{pull['culture']}</b>\n"
@@ -9134,7 +7595,6 @@ async def create_pull_finish(callback: types.CallbackQuery, state: FSMContext):
         f"🌾 Зерновая примесь: <b>≤{pull['weed']}%</b>\n"
         f"📋 Документы: <b>{pull['documents']}</b>\n"
         f"📦 Тип поставки: <b>{doctype}</b>\n\n"
-        f"Фермеры смогут присоединяться к пулу со своими партиями."
     )
 
     keyboard = InlineKeyboardMarkup()
@@ -9154,8 +7614,6 @@ async def back_to_pools_list(callback: types.CallbackQuery, state: FSMContext):
     # ЛОГИКА: Поддерживаем ОБЕ версии статусов
     open_pulls = [
         pull
-        for pull in pulls.values()
-        if pull.get("status") in ["Открыт", "open", "active", "Active"]
     ]
 
     if not open_pulls:
@@ -9166,25 +7624,17 @@ async def back_to_pools_list(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer()
         return
 
-    if user_id in batches and batches[user_id]:
-        farmer_cultures = set(batch["culture"] for batch in batches[user_id])
-        relevant_pulls = [p for p in open_pulls if p["culture"] in farmer_cultures]
 
         if relevant_pulls:
             open_pulls = relevant_pulls
 
     keyboard = InlineKeyboardMarkup(row_width=1)
     for pull in open_pulls[:10]:
-        available = pull["target_volume"] - pull["current_volume"]
         progress = (
-            (pull["current_volume"] / pull["target_volume"] * 100)
-            if pull["target_volume"] > 0
             else 0
         )
 
-        button_text = f"🌾 {pull['culture']} | {available} т | ₽{pull['price']}/т ({progress:.0f}%)"
         keyboard.add(
-            InlineKeyboardButton(button_text, callback_data=f"view_pull:{pull['id']}")
         )
 
     await callback.message.edit_text(
@@ -9198,26 +7648,20 @@ async def back_to_pools_list(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.callback_query_handler(lambda c: c.data.startswith("view_pull_matches:"), state="*")
 async def view_pull_matches(callback: types.CallbackQuery):
-    """Просмотр совпадений для пула"""
     try:
         pull_id = parse_callback_id(callback.data)
-    except (IndexError, ValueError) as e:
         await callback.answer("❌ Ошибка обработки данных", show_alert=True)
         return
 
     user_id = callback.from_user.id
 
-    if pull_id not in pulls.get("pulls", {}):
         await callback.answer("❌ Пул не найден", show_alert=True)
         return
 
-    pull = pulls["pulls"][pull_id]
-    if pull["exporter_id"] != user_id:
         await callback.answer("❌ Нет доступа к этому пулу", show_alert=True)
         return
     pull_matches = []
     for match in matches.values():
-        if match["pull_id"] == pull_id and match["status"] == "active":
             pull_matches.append(match)
 
     if not pull_matches:
@@ -9225,25 +7669,11 @@ async def view_pull_matches(callback: types.CallbackQuery):
         return
 
     text = f"🎯 <b>Совпадения для пула #{pull_id}</b>\n\n"
-    text += f"🌾 {pull['culture']} • {pull['target_volume']} т • ₽{pull['price']}/т\n\n"
 
     for i, match in enumerate(pull_matches[:5], 1):
-        batch_id = match["batch_id"]
-        batch_info = None
-        for user_batches in batches.values():
-            for batch in user_batches:
-                if batch["id"] == batch_id:
-                    batch_info = batch
-                    break
-            if batch_info:
-                break
 
         if batch_info:
             text += f"{i}. <b>Партия #{batch_id}</b>\n"
-            text += f"   📦 Объём: {batch_info['volume']} т\n"
-            text += f"   💰 Цена: {batch_info['price']:,.0f} ₽/т\n"
-            text += f"   📍 Регион: {batch_info['region']}\n"
-            text += f"   👤 Фермер: {batch_info['farmer_name']}\n\n"
 
     if len(pull_matches) > 5:
         text += f"<i>... и ещё {len(pull_matches) - 5} совпадений</i>\n\n"
@@ -9262,7 +7692,6 @@ async def back_to_my_pulls(callback: types.CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
     logging.info(f"🔙 Возврат к пулам: user_id={user_id}")
 
-    if user_id not in users or users[user_id].get("role") != "exporter":
         await callback.answer(
             "❌ Эта функция доступна только экспортёрам", show_alert=True
         )
@@ -9272,7 +7701,6 @@ async def back_to_my_pulls(callback: types.CallbackQuery, state: FSMContext):
     my_pulls = {
         pid: pull
         for pid, pull in all_pulls.items()
-        if isinstance(pull, dict) and pull.get("exporter_id") == user_id
     }
 
     if not my_pulls:
@@ -9302,7 +7730,6 @@ async def back_to_my_pulls(callback: types.CallbackQuery, state: FSMContext):
     for pull_id, pull in my_pulls.items():
         culture = pull.get("culture", "").lower()
         culture_icon = culture_emoji.get(culture, "🌾")
-        status = pull.get("status", "active").lower()
         status_icon = status_map.get(status, "⚪").split()[0]
         current = pull.get("current_volume", 0)
         target = pull.get("target_volume", 1)
@@ -9334,7 +7761,6 @@ async def view_my_pulls(message: types.Message, state: FSMContext):
     userid = message.from_user.id
     logging.critical(f"🔔 ВЫЗВАНА ФУНКЦИЯ view_my_pulls: user_id={userid}")
 
-    if userid not in users or users[userid].get("role") != "exporter":
         await message.answer("❌ Эта функция доступна только экспортёрам")
         return
 
@@ -9342,7 +7768,6 @@ async def view_my_pulls(message: types.Message, state: FSMContext):
     my_pulls = {
         pid: pull
         for pid, pull in all_pulls.items()
-        if isinstance(pull, dict) and pull.get("exporter_id") == userid
     }
     if not my_pulls:
         await message.answer(
@@ -9367,7 +7792,6 @@ async def view_my_pulls(message: types.Message, state: FSMContext):
     for pull_id, pull in my_pulls.items():
         culture = pull.get("culture", "").lower()
         culture_icon = culture_emoji.get(culture, "🌾")
-        status = pull.get("status", "active").lower()
         status_icon = status_map.get(status, "⚪").split()[0]
         current = pull.get("current_volume", 0)
         target = pull.get("target_volume", 1)
@@ -9397,7 +7821,6 @@ async def view_pull_details(callback: types.CallbackQuery):
             return
 
         user_id = callback.from_user.id
-        user = users.get(user_id)
         role = user.get("role") if user else None
 
         logging.info(
@@ -9427,15 +7850,12 @@ async def view_pull_details(callback: types.CallbackQuery):
             active_matches = [
                 m
                 for m in matches.values()
-                if m.get("pull_id") == pull_id and m.get("status") == "active"
             ]
 
         exporter_id = pull.get("exporter_id")
         exporter_name = pull.get("exporter_name", "Неизвестен")
         exporter_phone = "Не указан"
         exporter_region = "Не указан"
-        if exporter_id and exporter_id in users:
-            exporter_data = users[exporter_id]
             exporter_phone = exporter_data.get("phone", "Не указан")
             exporter_region = exporter_data.get("region", "Не указан")
 
@@ -9468,7 +7888,6 @@ async def view_pull_details(callback: types.CallbackQuery):
         keyboard = InlineKeyboardMarkup(row_width=2)
 
         # Клавиатура для экспортера (только если экспортер и владелец)
-        if role == "exporter" and pull.get("exporter_id") == user_id:
             keyboard.add(
                 InlineKeyboardButton(
                     "✏️ Редактировать", callback_data=f"editpull_{pull_id}"
@@ -9495,17 +7914,13 @@ async def view_pull_details(callback: types.CallbackQuery):
                     "🚚 Логистика", callback_data=f"pull_logistics:{pull_id}"
                 ),
             )
-        # Клавиатура для фермера (или других ролей)
         elif role == "farmer":
-            # Можно добавить проверку, присоединялся ли уже, и не показывать кнопку повторно
-            keyboard.add(
-                InlineKeyboardButton(
-                    "✅ Присоединиться", callback_data=f"join_pull:{pull_id}"
+                keyboard.add(
+                    InlineKeyboardButton(
+                        "✅ Присоединиться", callback_data=f"join_pull:{pull_id}"
+                    )
                 )
-            )
-        # Клавиатуры для других ролей (логист, экспедитор) можно добавить по необходимости
 
-        keyboard.add(InlineKeyboardButton("◀️ Назад", callback_data="back_to_my_pulls"))
 
         await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
         await callback.answer()
@@ -9521,7 +7936,6 @@ async def search_batches_for_exporter(message: types.Message, state: FSMContext)
     await state.finish()
 
     user_id = message.from_user.id
-    if user_id not in users or users[user_id].get("role") != "exporter":
         await message.answer("❌ Эта функция доступна только экспортёрам")
         return
 
@@ -9567,14 +7981,12 @@ async def handle_search_criteria(callback: types.CallbackQuery, state: FSMContex
         try:
             await callback.message.edit_text(
                 "📍 <b>Поиск по региону</b>\n\n" "Выберите регион:",
-                reply_markup=region_keyboard(),
                 parse_mode="HTML",
             )
         except Exception as e:
             logging.error(f"Ошибка edit_text: {e}")
             await callback.message.answer(
                 "📍 <b>Поиск по региону</b>\n\n" "Выберите регион:",
-                reply_markup=region_keyboard(),
                 parse_mode="HTML",
             )
         await SearchBatchesStatesGroup.enter_region.set()
@@ -9588,36 +8000,12 @@ async def handle_search_criteria(callback: types.CallbackQuery, state: FSMContex
 
         available_batches = []
 
-        # Итерация по всем партиям
-        for user_id, user_batches in batches.items():
-            # ────────────────────────────────────────────────────────────────
-            # ЗАЩИТА 1: Проверяем, что user_batches — список
-            # ────────────────────────────────────────────────────────────────
-            if not isinstance(user_batches, list):
-                logging.error(
-                    f"❌ У пользователя {user_id} партии НЕ список: {type(user_batches)}, value={user_batches}"
-                )
-                continue
-
-            # Итерация по партиям пользователя
-            for batch in user_batches:
-                # ────────────────────────────────────────────────────────────────
-                # ЗАЩИТА 2: Проверяем, что batch — словарь
-                # ────────────────────────────────────────────────────────────────
-                if not isinstance(batch, dict):
-                    logging.error(
-                        f"❌ Партия НЕ словарь: user_id={user_id}, batch={batch}, type={type(batch)}"
-                    )
-                    continue
-
-                # Проверяем статус
-                if batch.get("status") in [
-                    "active",
-                    "Активна",
-                    "available",
-                    "доступна",
-                ]:
-                    available_batches.append(batch)
+            if batch.get("status") in [
+                "active",
+                "Активна",
+                "available",
+                "доступна",
+            ]:
 
         logging.info(f"✅ Найдено доступных партий: {len(available_batches)}")
 
@@ -9708,7 +8096,6 @@ async def view_batch_details(callback: types.CallbackQuery, state: FSMContext):
         return
 
     user_id = callback.from_user.id
-    user = users.get(user_id, {})
     user_role = user.get("role", "unknown").lower()
 
     logging.info(f"👤 user_id={user_id}, роль={user_role}")
@@ -9722,14 +8109,12 @@ async def view_batch_details(callback: types.CallbackQuery, state: FSMContext):
     for fid, batch_list in batches.items():
         if isinstance(batch_list, list):
             for batch in batch_list:
-                if isinstance(batch, dict) and batch.get("id") == batch_id:
                     found_batch = batch
                     farmer_id = fid
                     logging.info(f"✅ Партия {batch_id} найдена у фермера {fid}")
                     break
         elif isinstance(batch_list, dict):
             # На случай если одна партия (словарь)
-            if batch_list.get("id") == batch_id:
                 found_batch = batch_list
                 farmer_id = fid
                 logging.info(f"✅ Партия {batch_id} найдена у фермера {fid}")
@@ -9744,7 +8129,6 @@ async def view_batch_details(callback: types.CallbackQuery, state: FSMContext):
         return
 
     # Получаем владельца
-    is_owner = farmer_id == user_id
     logging.info(f"👥 farmer_id={farmer_id}, user_id={user_id}, is_owner={is_owner}")
 
     # ✅ Формируем сообщение
@@ -9759,7 +8143,6 @@ async def view_batch_details(callback: types.CallbackQuery, state: FSMContext):
     # Показатели качества
     if "quality" in found_batch:
         quality = found_batch["quality"]
-        text += f"\n<b>📊 Качество:</b>\n"
         text += f"💧 <b>Влажность:</b> {quality.get('moisture', '-')}%\n"
         text += f"🌾 <b>Натура:</b> {quality.get('nature', '-')} г/л\n"
         text += f"🌿 <b>Примесь:</b> {quality.get('impurity', '-')}%\n"
@@ -9808,13 +8191,11 @@ async def view_batch_details(callback: types.CallbackQuery, state: FSMContext):
 
         # Получаем контакты фермера
         if farmer_id:
-            farmer_info = users.get(farmer_id, {})
             farmer_name = farmer_info.get("name", "Неизвестно")
             farmer_phone = farmer_info.get("phone", "Не указан")
             farmer_email = farmer_info.get("email", "Не указан")
             farmer_company = farmer_info.get("company_name", farmer_name)
 
-            text += f"\n<b>📞 Контакты фермера:</b>\n"
             text += f"🏢 <b>Компания:</b> {farmer_company}\n"
             text += f"👤 <b>Имя:</b> {farmer_name}\n"
             text += f"📱 <b>Телефон:</b> <code>{farmer_phone}</code>\n"
@@ -9831,29 +8212,15 @@ async def view_batch_details(callback: types.CallbackQuery, state: FSMContext):
             InlineKeyboardButton("◀️ Назад к поиску", callback_data="back_to_search")
         )
 
-    elif user_role == "logistic":
         # ✅ CASE 3: Логист смотрит партию
         logging.info(f"✅ CASE 3: Логист {user_id} смотрит партию {batch_id}")
         keyboard.add(
             InlineKeyboardButton(
-                "📦 Предложить доставку", callback_data=f"offer_delivery:{batch_id}"
             )
         )
         keyboard.add(
             InlineKeyboardButton("◀️ Назад к поиску", callback_data="back_to_search")
         )
-
-    elif user_role == "farmer" and not is_owner:
-        # ✅ CASE 4: Фермер смотрит чужую партию
-        logging.warning(
-            f"⚠️ CASE 4: Фермер {user_id} пытался посмотреть чужую партию {batch_id}!"
-        )
-        keyboard.add(
-            InlineKeyboardButton(
-                "◀️ Назад к моим партиям", callback_data="back_to_my_batches"
-            )
-        )
-        text += "\n\n❌ <b>Вы можете просматривать только СВОИ партии!</b>"
 
     else:
         # ✅ CASE 5: Неизвестная роль
@@ -9890,8 +8257,6 @@ async def back_to_search_menu(callback: types.CallbackQuery, state: FSMContext):
 
 # Обработчик выбора региона
 @dp.callback_query_handler(
-    lambda c: c.data.startswith("region:") or c.data.startswith("searchregion:"),
-    state="*",
 )
 async def search_by_region_selected(callback: types.CallbackQuery, state: FSMContext):
     if ":" in callback.data:
@@ -9902,15 +8267,12 @@ async def search_by_region_selected(callback: types.CallbackQuery, state: FSMCon
 
     # Поиск партий по региону
     found_batches = []
-    for user_batches in batches.values():
-        for batch in user_batches:
-            if batch.get("region") == region and batch.get("status") in [
-                "active",
-                "Активна",
-                "available",
-                "доступна",
-            ]:
-                found_batches.append(batch)
+        if batch.get("region") == region and batch.get("status") in [
+            "active",
+            "Активна",
+            "available",
+            "доступна",
+        ]:
 
     await state.finish()
 
@@ -9952,7 +8314,6 @@ async def search_by_region_selected(callback: types.CallbackQuery, state: FSMCon
 @dp.callback_query_handler(lambda c: c.data.startswith("add_batch_to_pull:"), state="*")
 async def add_batch_to_pull_select(callback: types.CallbackQuery):
     """Выбор пулла для добавления партии"""
-    global batches
     try:
         batch_id = parse_callback_id(callback.data)
     except (IndexError, ValueError):
@@ -9961,19 +8322,13 @@ async def add_batch_to_pull_select(callback: types.CallbackQuery):
 
     user_id = callback.from_user.id
 
-    if batch_id not in batches:
         await callback.answer("❌ Партия не найдена", show_alert=True)
         return
 
-    batch = batches[batch_id]
-
     # Получаем активные пулы экспортёра с той же культурой
     user_pulls = []
-    for pid, p in pulls.items():
         if (
-            p.get("creator_id") == user_id
             and p.get("culture", "").lower() == batch.get("culture", "").lower()
-            and p.get("status", "active") in ["active", "открыт", "активен"]
         ):
             user_pulls.append((pid, p))
 
@@ -9989,14 +8344,8 @@ async def add_batch_to_pull_select(callback: types.CallbackQuery):
     keyboard = InlineKeyboardMarkup(row_width=1)
 
     for pull_id, pull in user_pulls:
-        # Считаем текущий объём
-        current_vol = 0
-        if "batches" in pull and pull["batches"]:
-            for b_id in pull["batches"]:
-                if b_id in batches:
-                    current_vol += batches[b_id].get("volume", 0)
+            current_vol = 0
 
-        target_vol = pull.get("target_volume", 0)
 
         keyboard.add(
             InlineKeyboardButton(
@@ -10008,11 +8357,9 @@ async def add_batch_to_pull_select(callback: types.CallbackQuery):
     keyboard.add(InlineKeyboardButton("❌ Отмена", callback_data="cancel_action"))
 
     await callback.message.edit_text(
-        f"📦 <b>Добавление партии в пулл</b>\n\n"
         f"🌾 Партия: {batch.get('culture', 'Неизвестно')} • {batch.get('volume', 0):.1f} т\n"
         f"📍 Регион: {batch.get('region', 'Не указан')}\n"
         f"💰 Цена: {batch.get('price', 0):,} ₽/т\n\n"
-        f"Выберите пулл для добавления:",
         parse_mode="HTML",
         reply_markup=keyboard,
     )
@@ -10025,8 +8372,6 @@ async def add_batch_to_pull_select(callback: types.CallbackQuery):
 @dp.callback_query_handler(lambda c: c.data.startswith("confirm_add_batch:"), state="*")
 async def confirm_add_batch_to_pull(callback: types.CallbackQuery):
     """✅ Подтверждение добавления партии в пулл - ПОЛНОСТЬЮ ИСПРАВЛЕННАЯ ВЕРСИЯ"""
-    global batches, pulls, users
-
     try:
         _, batch_id, pull_id = callback.data.split(":")
         batch_id = int(batch_id)
@@ -10043,19 +8388,6 @@ async def confirm_add_batch_to_pull(callback: types.CallbackQuery):
 
     try:
         # 1️⃣ ИЩЕМ ПАРТИЮ И ФЕРМЕРА
-        batch = None
-        farmer_id = None
-
-        for f_id, farmer_batches in batches.items():
-            if not isinstance(farmer_batches, list):
-                continue
-            for b in farmer_batches:
-                if isinstance(b, dict) and b.get("id") == batch_id:
-                    batch = b
-                    farmer_id = f_id
-                    break
-            if batch:
-                break
 
         if not batch or not farmer_id:
             logging.error(
@@ -10065,16 +8397,11 @@ async def confirm_add_batch_to_pull(callback: types.CallbackQuery):
             return
 
         # 2️⃣ ИЩЕМ ПУЛЛ
-        pulls_dict = pulls.get("pulls", {})
-        if pull_id not in pulls_dict:
             logging.error(f"❌ Пулл не найден: pull_id={pull_id}")
             await callback.answer("❌ Пулл не найден", show_alert=True)
             return
 
-        pull = pulls_dict[pull_id]
-
         # 3️⃣ ПРОВЕРЯЕМ ПРАВА
-        if pull.get("creator_id") != callback.from_user.id:
             await callback.answer("❌ Это не ваш пулл", show_alert=True)
             return
 
@@ -10087,29 +8414,20 @@ async def confirm_add_batch_to_pull(callback: types.CallbackQuery):
             pull["farmer_ids"] = []
 
         # ИНИЦИАЛИЗИРУЕМ pullparticipants
-        if "pullparticipants" not in pulls:
-            pulls["pullparticipants"] = {}
-        if pull_id not in pulls["pullparticipants"]:
-            pulls["pullparticipants"][pull_id] = []
 
         # 5️⃣ ПРОВЕРЯЕМ ЧТО ПАРТИЯ НЕ ДОБАВЛЕНА
-        if batch_id in pull["batch_ids"]:
             await callback.answer("⚠️ Партия уже в пуле", show_alert=True)
             return
 
         # 6️⃣ ДОБАВЛЯЕМ ПАРТИЮ В ПУЛ
-        pull["batches"].append(batch_id)
         pull["batch_ids"].append(batch_id)
-        batch["status"] = "in_pull"
         batch["pull_id"] = pull_id
 
         # 7️⃣ ДОБАВЛЯЕМ ФЕРМЕРА
-        if farmer_id not in pull["farmer_ids"]:
             pull["farmer_ids"].append(farmer_id)
             logging.info(f"✅ Фермер {farmer_id} добавлен в пулл {pull_id}")
 
         # 8️⃣ ДОБАВЛЯЕМ В pullparticipants
-        farmer_info = users.get(farmer_id, {})
         participant_record = {
             "batch_id": batch_id,
             "farmer_id": farmer_id,
@@ -10120,28 +8438,19 @@ async def confirm_add_batch_to_pull(callback: types.CallbackQuery):
             "price_per_ton": batch.get("price", 0),
         }
 
-        pulls["pullparticipants"][pull_id].append(participant_record)
-        logging.info(
-            f"✅ Участник добавлен: farmer_id={farmer_id}, batch_id={batch_id}"
-        )
+            logging.info(
+                f"✅ Участник добавлен: farmer_id={farmer_id}, batch_id={batch_id}"
+            )
 
         # 9️⃣ СЧИТАЕМ ОБЪЁМ
         current_volume = 0
         for b_id in pull["batch_ids"]:
-            for farmer_batches in batches.values():
-                if isinstance(farmer_batches, list):
-                    for b in farmer_batches:
-                        if isinstance(b, dict) and b.get("id") == b_id:
-                            current_volume += b.get("volume", 0)
-                            break
 
         target_volume = pull.get("target_volume", 0)
         pull["current_volume"] = current_volume
 
         # 🔟 ПРОВЕРЯЕМ ЗАПОЛНЕНИЕ
         status_msg = ""
-        if current_volume >= target_volume:
-            pull["status"] = "completed"
             status_msg = "🎉 Пулл собран!"
             logging.info(f"🎉 Пулл #{pull_id} СОБРАН!")
 
@@ -10166,7 +8475,6 @@ async def confirm_add_batch_to_pull(callback: types.CallbackQuery):
             try:
                 await bot.send_message(
                     farmer_id,
-                    f"✅ <b>Ваша партия добавлена в пулл!</b>\n\n"
                     f"🌾 {batch.get('culture', 'Культура')} • {batch.get('volume', 0):.1f} т\n"
                     f"📦 Пулл #{pull_id}\n"
                     f"👥 Участников в пуле: <b>{len(pull['farmer_ids'])}</b>\n"
@@ -10185,12 +8493,10 @@ async def confirm_add_batch_to_pull(callback: types.CallbackQuery):
         save_data()
 
         # ✅ ЛОГИРУЕМ РЕЗУЛЬТАТ
-        logging.info(f"✅ Данные сохранены:")
         logging.info(
             f"   pulls['pulls'][{pull_id}]['batch_ids'] = {pulls['pulls'][pull_id].get('batch_ids', [])}"
         )
         logging.info(
-            f"   pulls['pullparticipants'][{pull_id}] кол-во = {len(pulls['pullparticipants'].get(pull_id, []))}"
         )
 
         # 1️⃣3️⃣ ОТВЕТ ПОЛЬЗОВАТЕЛЮ
@@ -10199,7 +8505,6 @@ async def confirm_add_batch_to_pull(callback: types.CallbackQuery):
             f"📊 Текущий объём: {current_volume:.1f}/{target_volume:.1f} т\n"
             f"👥 Фермеров в пуле: <b>{len(pull['farmer_ids'])}</b>\n"
             f"📦 Партий: <b>{len(pull['batch_ids'])}</b>\n"
-            f"📋 Участников добавлено: <b>{len(pulls['pullparticipants'][pull_id])}</b>\n"
             f"{status_msg}",
             parse_mode="HTML",
         )
@@ -10213,87 +8518,35 @@ async def confirm_add_batch_to_pull(callback: types.CallbackQuery):
 # ═══════════════════════════════════════════════════════════════════════════
 # 🚚 ФЕРМЕР СОЗДАЕТ ЗАЯВКУ НА ДОСТАВКУ (копия логики экспортера)
 # ═══════════════════════════════════════════════════════════════════════════
-@dp.message_handler(lambda m: m.text == "🚚 Заявка на логистику", state="*")
-async def create_logistics_request_start(message: types.Message, state: FSMContext):
-    """Начало создания заявки на логистику — исправленный вариант"""
     await state.finish()
     user_id = message.from_user.id
 
-    if user_id not in users or users[user_id].get("role") != "exporter":
-        await message.answer("❌ Эта функция доступна только экспортёрам")
         return
 
-    # --- Универсально достать пулы
-    true_pulls = None
-    if (
-        isinstance(pulls, dict)
-        and "pulls" in pulls
-        and isinstance(pulls["pulls"], dict)
-    ):
-        true_pulls = pulls["pulls"]
-    elif isinstance(pulls, dict):
-        true_pulls = pulls
-    else:
-        true_pulls = {}
+    logging.info(
+    )
 
-    logging.info(f"\n{'='*50}")
-    logging.info(f"USER {user_id} requested logistics")
-    logging.info(f"ALL PULLS IN SYSTEM: {len(true_pulls)}")
-    for pid, p in true_pulls.items():
-        logging.info(
-            f"  Pull #{pid}: exporter_id={p.get('exporter_id')}, status={p.get('status')}, culture={p.get('culture')}"
-        )
-    logging.info(f"{'='*50}\n")
+    )
 
-    exporter_pulls = {}
-    for pid, p in true_pulls.items():
-        exp_id = p.get("exporter_id")
-        pull_status = str(p.get("status", "")).lower().strip()
-        logging.info(
-            f"Checking pull {pid}: exp_id={exp_id}, user_id={user_id}, match={exp_id == user_id}, status={pull_status}"
-        )
-        # Фильтруем пулы по статусу 'filled' и 'заполнен'
-        if exp_id == user_id and pull_status in [
-            "filled",
-            "заполнен",
-        ]:
-            exporter_pulls[pid] = p
-            logging.info(f"  ✅ ADDED to exporter_pulls")
 
-    logging.info(f"FOUND {len(exporter_pulls)} filled pulls for user {user_id}")
-
-    if not exporter_pulls:
         await message.answer(
-            "❌ У вас нет заполненных пулов.\n\n"
-            "Создайте пул и заполните его, чтобы заказать логистику.",
-            reply_markup=exporter_keyboard(),
         )
         return
 
     keyboard = InlineKeyboardMarkup(row_width=1)
-    for pull_id, pull in list(exporter_pulls.items())[:10]:
-        culture = pull.get("culture", "Неизвестно")
-        current_vol = pull.get("current_volume", 0) or 0
-        btn_text = f"#{pull_id} • {culture} • {current_vol:.0f} т"
         keyboard.add(
             InlineKeyboardButton(
-                btn_text, callback_data=f"create_logistic_req:{pull_id}"
             )
         )
 
     await message.answer(
-        "🚚 <b>Заявка на логистику</b>\n\n"
-        f"<b>Найдено заполненных пулов: {len(exporter_pulls)}</b>\n\n"
-        "Выберите пул для организации перевозки:",
         reply_markup=keyboard,
         parse_mode="HTML",
     )
 
 
 @dp.callback_query_handler(
-    lambda c: c.data.startswith("create_logistic_req:"), state="*"
 )
-async def select_pull_for_logistics(callback: types.CallbackQuery, state: FSMContext):
     """Выбор пула для заявки"""
     try:
         pull_id = parse_callback_id(callback.data)
@@ -10301,25 +8554,17 @@ async def select_pull_for_logistics(callback: types.CallbackQuery, state: FSMCon
         await callback.answer("❌ Ошибка", show_alert=True)
         return
 
-    if pull_id not in pulls.get("pulls", {}):
         await callback.answer("❌ Пул не найден", show_alert=True)
         return
 
-    pull = pulls["pulls"][pull_id]
-
     await state.update_data(
         pull_id=pull_id,
-        culture=pull["culture"],
         volume=pull.get("current_volume", 0),
         port=pull.get("port", ""),
     )
 
     await callback.message.edit_text(
-        f"🚚 <b>Заявка на логистику</b>\n\n"
-        f"<b>Шаг 1 из 4</b>\n\n"
-        f"Пул: #{pull_id} • {pull['culture']} • {pull.get('current_volume', 0):.0f} т\n"
         f"Порт: {pull.get('port', '')}\n\n"
-        f"Откуда (регион/город погрузки):",
         parse_mode="HTML",
     )
 
@@ -10327,18 +8572,14 @@ async def select_pull_for_logistics(callback: types.CallbackQuery, state: FSMCon
     await callback.answer()
 
 @dp.callback_query_handler(
-    lambda c: c.data.startswith("farmer_select_port:"), state="farmer_selecting_port"
 )
 async def farmer_select_port(callback: types.CallbackQuery, state: FSMContext):
-    """ШАГ 3: Фермер выбрал порт, выбирает транспорт"""
     try:
         port = callback.data.split(":")[-1]
     except (IndexError, ValueError):
         await callback.answer("❌ Ошибка", show_alert=True)
         return
 
-    async with state.proxy() as data:
-        data["port"] = port
 
     keyboard = InlineKeyboardMarkup(row_width=1)
     transports = [
@@ -10346,7 +8587,6 @@ async def farmer_select_port(callback: types.CallbackQuery, state: FSMContext):
         ("🚚 Зерновоз", "grain"),
         ("🚛 Фура", "truck"),
     ]
-
     for transport_name, transport_code in transports:
         keyboard.add(
             InlineKeyboardButton(
@@ -10354,34 +8594,26 @@ async def farmer_select_port(callback: types.CallbackQuery, state: FSMContext):
                 callback_data=f"farmer_select_transport:{transport_code}",
             )
         )
-
     keyboard.add(InlineKeyboardButton("❌ Отмена", callback_data="farmer_main_menu"))
 
     await callback.message.edit_text(
-        "🚚 <b>ВЫБЕРИТЕ ТИП ТРАНСПОРТА</b>", reply_markup=keyboard, parse_mode="HTML"
     )
 
-    await state.set_state("farmer_selecting_transport")
     await callback.answer()
 
 
 @dp.callback_query_handler(
     lambda c: c.data.startswith("farmer_select_transport:"),
-    state="farmer_selecting_transport",
 )
 async def farmer_select_transport(callback: types.CallbackQuery, state: FSMContext):
-    """ШАГ 4: Фермер выбрал транспорт, вводит цену"""
     try:
         transport = callback.data.split(":")[-1]
     except (IndexError, ValueError):
         await callback.answer("❌ Ошибка", show_alert=True)
         return
 
-    async with state.proxy() as data:
-        data["transport"] = transport
 
     await callback.message.edit_text(
-        "💰 <b>ОЖИДАЕМАЯ ЦЕНА ДОСТАВКИ</b>\n\n"
         "Введите цену в ₽/тонну\n\n"
         "Пример: <code>1500</code>",
         reply_markup=InlineKeyboardMarkup().add(
@@ -10390,13 +8622,10 @@ async def farmer_select_transport(callback: types.CallbackQuery, state: FSMConte
         parse_mode="HTML",
     )
 
-    await state.set_state("farmer_entering_price")
     await callback.answer()
 
 
-@dp.message_handler(state="farmer_entering_price")
 async def farmer_enter_price(message: types.Message, state: FSMContext):
-    """ШАГ 5: Подтверждение"""
     try:
         price = float(message.text.strip().replace(",", "."))
         if price <= 0:
@@ -10412,22 +8641,7 @@ async def farmer_enter_price(message: types.Message, state: FSMContext):
     port = data["port"]
     transport = data["transport"]
 
-    # Переводим коды в названия для отображения
     ports_dict = {
-        "ariyb": "⛴️ Ариб",
-        "volga_port": "⛴️ ПКФ «Волга-Порт»",
-        "yug_ter": "⛴️ ПКФ «Юг-Тер»",
-        "astr_port": "⛴️ ПАО «Астр.Порт»",
-        "univer_port": "⛴️ Универ.Порт",
-        "yuzh_port": "⛴️ Юж.Порт",
-        "agrofud": "⛴️ Агрофуд",
-        "mosport": "⛴️ Моспорт",
-        "cgp": "⛴️ ЦГП",
-        "fzt": "⛴️ ФЗТ",
-        "amp": "⛴️ АМП",
-        "armada": "⛴️ Армада",
-        "strelec": "⛴️ Стрелец",
-        "alfa": "⛴️ Альфа",
     }
 
     transports_dict = {
@@ -10440,17 +8654,12 @@ async def farmer_enter_price(message: types.Message, state: FSMContext):
     transport_name = transports_dict.get(transport, transport)
 
     text = (
-        f"✅ <b>ПОДТВЕРДИТЕ ЗАЯВКУ</b>\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🌾 <b>Культура:</b> {batch['culture']}\n"
         f"📦 <b>Объём:</b> {batch['volume']} т\n"
         f"💰 <b>Цена партии:</b> {batch['price']:,} ₽/т\n"
         f"💵 <b>Итого:</b> {batch['volume'] * batch['price']:,} ₽\n\n"
-        f"📍 <b>Откуда:</b> {batch.get('region', 'Не указан')}\n"
-        f"⛴️ <b>Куда:</b> {port_name}\n"
         f"🚚 <b>Транспорт:</b> {transport_name}\n"
         f"💳 <b>Ожидаемая цена доставки:</b> {price:,.0f} ₽/т\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━"
     )
 
     keyboard = InlineKeyboardMarkup()
@@ -10469,7 +8678,6 @@ async def farmer_enter_price(message: types.Message, state: FSMContext):
 async def farmer_confirm_logistics_request(
     callback: types.CallbackQuery, state: FSMContext
 ):
-    """ШАГ 6: СОЗДАНИЕ ЗАЯВКИ"""
     user_id = callback.from_user.id
     data = await state.get_data()
 
@@ -10491,7 +8699,6 @@ async def farmer_confirm_logistics_request(
         "agrofud": "Агрофуд",
         "mosport": "Моспорт",
         "cgp": "ЦГП",
-        "fzt": "ФЗТ",
         "amp": "АМП",
         "armada": "Армада",
         "strelec": "Стрелец",
@@ -10507,26 +8714,16 @@ async def farmer_confirm_logistics_request(
     port_name = ports_dict.get(port, port)
     transport_name = transports_dict.get(transport, transport)
 
-    # ✅ ИСПРАВЛЕНО: Берём регион из профиля фермера
-    farmer_region = users[user_id].get("region", "Не указан")
 
-    request_id = len(farmer_logistics_requests) + 1
 
     farmer_logistics_requests[request_id] = {
         "id": request_id,
         "farmer_id": user_id,
-        "farmer_name": users[user_id].get("name", "Неизвестно"),
-        "farmer_phone": users[user_id].get("phone", "Не указан"),
-        "farmer_email": users[user_id].get("email", "Не указана"),
-        "farmer_region": farmer_region,  # ✅ НОВОЕ
         "batch_id": data["batch_id"],
         "culture": batch["culture"],
         "volume": batch["volume"],
         "price_per_ton": batch["price"],
         "total_sum": batch["volume"] * batch["price"],
-        # ✅ ВСЕ МАРШРУТЫ ЗАПОЛНЕНЫ
-        "route_from": farmer_region,  # ✅ ОТ (из профиля)
-        "route_to": port_name,  # ✅ ДО (порт)
         "port_to": port_name,
         "port_code": port,
         "transport_type": transport_name,
@@ -10542,24 +8739,14 @@ async def farmer_confirm_logistics_request(
 
     logging.info(
         f"✅ Фермер {user_id} создал заявку #{request_id}: "
-        f"{batch['culture']} {batch['volume']}т, {port_name}, {transport_name}, {data['desired_price']}₽/т"
     )
 
-    # УВЕДОМЛЯЕМ ЛОГИСТОВ
     logists_count = 0
-    for logist_id in users:
-        if users[logist_id].get("role") in ["logistic", "logistics"]:
             try:
                 msg = (
-                    f"📬 <b>НОВАЯ ЗАЯВКА НА ДОСТАВКУ!</b>\n\n"
-                    f"🌾 {batch['culture']} • {batch['volume']}т\n"
-                    f"💰 Цена: {data['desired_price']:,} ₽/т\n"
+                    f"🌾 {batch['culture']} • {batch['volume']} т\n"
                     f"📍 От: {farmer_region}\n"
-                    f"⛴️ Порт: {port_name}\n"
                     f"🚚 Транспорт: {transport_name}\n"
-                    f"👤 Фермер: {users[user_id].get('name', '')}\n"
-                    f"☎️ {users[user_id].get('phone', '')}\n\n"
-                    f"Нажмите 'ОТКЛИКНУТЬСЯ' если готовы везти"
                 )
 
                 keyboard = InlineKeyboardMarkup()
@@ -10569,7 +8756,6 @@ async def farmer_confirm_logistics_request(
                         callback_data=f"logist_respond_farmer_request:{request_id}",
                     ),
                     InlineKeyboardButton(
-                        "📋 ДЕТАЛИ", callback_data=f"view_request:farmer:{request_id}"
                     ),
                 )
 
@@ -10578,21 +8764,14 @@ async def farmer_confirm_logistics_request(
                 )
                 logists_count += 1
             except Exception as e:
-                logging.error(f"Ошибка уведомления логиста {logist_id}: {e}")
 
     success_text = (
-        f"✅ <b>ЗАЯВКА НА ДОСТАВКУ СОЗДАНА!</b>\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🎯 <b>ID:</b> #{request_id}\n"
-        f"📊 <b>Статус:</b> Ожидание логистов\n\n"
         f"🌾 {batch['culture']} - {batch['volume']} т\n"
         f"💰 {batch['price']:,} ₽/т • Итого: {batch['volume'] * batch['price']:,} ₽\n\n"
         f"📍 От: {farmer_region}\n"
-        f"⛴️ Порт: {port_name}\n"
         f"🚚 Транспорт: {transport_name}\n"
-        f"💳 Цена доставки: {data['desired_price']:,} ₽/т\n\n"
         f"📢 Уведомлено логистов: {logists_count}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━"
     )
 
     keyboard = InlineKeyboardMarkup()
@@ -10618,9 +8797,6 @@ async def farmer_my_requests_menu(callback: types.CallbackQuery, state: FSMConte
         user_id = callback.from_user.id
 
         # Ищем заявки этого фермера
-        my_requests = [
-            r for r in farmer_logistics_requests.values() if r["farmer_id"] == user_id
-        ]
 
         if not my_requests:
             await callback.message.edit_text(
@@ -10636,10 +8812,7 @@ async def farmer_my_requests_menu(callback: types.CallbackQuery, state: FSMConte
             return
 
         # Группируем по статусам
-        active = [r for r in my_requests if r["status"] == "active"]
-        completed = [r for r in my_requests if r["status"] == "completed"]
 
-        text = f"📬 <b>МОИ ЗАЯВКИ</b>\n\n"
         text += f"🟢 <b>Активных:</b> {len(active)}\n"
         text += f"✅ <b>Завершённых:</b> {len(completed)}\n\n"
 
@@ -10648,20 +8821,16 @@ async def farmer_my_requests_menu(callback: types.CallbackQuery, state: FSMConte
         if active:
             text += "━━━━━━ АКТИВНЫЕ ━━━━━━\n"
             for r in active:
-                label = f"#{r['id']} • {r['culture']} • {r['volume']}т • {r['offers_count']} откликов"
                 keyboard.add(
                     InlineKeyboardButton(
-                        label, callback_data=f"farmer_request_view:{r['id']}"
                     )
                 )
 
         if completed:
             text += "━━━━━ ЗАВЕРШЁННЫЕ ━━━━━\n"
             for r in completed:
-                label = f"#{r['id']} • {r['culture']} • {r['volume']}т"
                 keyboard.add(
                     InlineKeyboardButton(
-                        label, callback_data=f"farmer_request_view:{r['id']}"
                     )
                 )
 
@@ -10676,8 +8845,6 @@ async def farmer_my_requests_menu(callback: types.CallbackQuery, state: FSMConte
         logging.error(f"❌ Ошибка в farmer_my_requests_menu: {e}")
         try:
             await callback.answer(f"⚠️ Ошибка: {str(e)[:50]}", show_alert=True)
-        except:
-            pass
 
 
 # ✅ ДОБАВИТЬ второй обработчик с той же логикой:
@@ -10687,9 +8854,6 @@ async def farmer_my_requests_text(message: types.Message, state: FSMContext):
     await state.finish()
     user_id = message.from_user.id
 
-    my_requests = [
-        r for r in farmer_logistics_requests.values() if r["farmer_id"] == user_id
-    ]
 
     if not my_requests:
         await message.answer(
@@ -10703,8 +8867,6 @@ async def farmer_my_requests_text(message: types.Message, state: FSMContext):
         )
         return
 
-    active = [r for r in my_requests if r["status"] == "active"]
-    completed = [r for r in my_requests if r["status"] == "completed"]
 
     text = f"📬 <b>МОИ ЗАЯВКИ</b>\n\n🟢 Активных: {len(active)}\n✅ Завершённых: {len(completed)}\n\n"
 
@@ -10713,20 +8875,16 @@ async def farmer_my_requests_text(message: types.Message, state: FSMContext):
     if active:
         text += "━━━━━━ АКТИВНЫЕ ━━━━━━\n"
         for r in active:
-            label = f"#{r['id']} • {r['culture']} • {r['volume']}т • {r['offers_count']} откликов"
             keyboard.add(
                 InlineKeyboardButton(
-                    label, callback_data=f"farmer_request_view:{r['id']}"
                 )
             )
 
     if completed:
         text += "━━━━━ ЗАВЕРШЁННЫЕ ━━━━━\n"
         for r in completed:
-            label = f"#{r['id']} • {r['culture']} • {r['volume']}т"
             keyboard.add(
                 InlineKeyboardButton(
-                    label, callback_data=f"farmer_request_view:{r['id']}"
                 )
             )
 
@@ -10745,23 +8903,9 @@ async def farmer_request_view(callback: types.CallbackQuery, state: FSMContext):
     await state.finish()
 
     try:
-        request_id = int(callback.data.split(":")[-1])
     except (IndexError, ValueError):
         await callback.answer("❌ Ошибка", show_alert=True)
         return
-
-    # Проверка существования заявки
-    if (
-        request_id not in farmer_logistics_requests
-        and str(request_id) not in farmer_logistics_requests
-    ):
-        await callback.answer("❌ Заявка не найдена", show_alert=True)
-        return
-
-    # Получаем заявку (проверяем оба варианта ключа)
-    request = farmer_logistics_requests.get(
-        request_id
-    ) or farmer_logistics_requests.get(str(request_id))
 
     if not request:
         await callback.answer("❌ Заявка не найдена", show_alert=True)
@@ -10769,45 +8913,25 @@ async def farmer_request_view(callback: types.CallbackQuery, state: FSMContext):
 
     user_id = callback.from_user.id
 
-    if request["farmer_id"] != user_id:
         await callback.answer("❌ Это не ваша заявка", show_alert=True)
         return
 
     text = (
-        f"📋 <b>ЗАЯВКА #{request['id']}</b>\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>СТАТУС:</b> {request['status']}\n\n"
-        f"🌾 <b>Культура:</b> {request['culture']}\n"
-        f"📦 <b>Объём:</b> {request['volume']} т\n"
-        f"💰 <b>Цена:</b> {request['price_per_ton']:,} ₽/т\n"
-        f"💵 <b>Итого:</b> {request['total_sum']:,} ₽\n\n"
-        f"📍 <b>От:</b> {request['farmer_region']}\n"
-        f"⛴️ <b>Куда:</b> {request['port_to']}\n"
-        f"🚚 <b>Транспорт:</b> {request['transport_type']}\n"
-        f"💳 <b>Цена доставки:</b> {request['desired_price']:,} ₽/т\n\n"
-        f"📞 <b>Откликов:</b> {request['offers_count']}\n"
-        f"📅 <b>Создана:</b> {request['created_at']}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━"
     )
 
     keyboard = InlineKeyboardMarkup(row_width=2)
 
     # Если есть отклики
-    if request["offers_count"] > 0:
         keyboard.add(
             InlineKeyboardButton(
-                f"📞 ОТКЛИКОВ: {request['offers_count']}",
-                callback_data=f"farmer_view_offers:{request['id']}",
+                )
             )
-        )
 
     # ✅ ДОБАВЛЯЕМ КНОПКИ УПРАВЛЕНИЯ ЗАЯВКОЙ
     keyboard.add(
         InlineKeyboardButton(
-            "✏️ Редактировать", callback_data=f"edit_request:{request['id']}"
         ),
         InlineKeyboardButton(
-            "🗑️ Удалить", callback_data=f"delete_request:{request['id']}"
         ),
     )
 
@@ -10860,12 +8984,7 @@ def get_choice_keyboard(field, request_id):
 
 @dp.callback_query_handler(lambda c: c.data.startswith("edit_request:"), state="*")
 async def edit_request_start(callback: types.CallbackQuery, state: FSMContext):
-    request_id = int(callback.data.split(":")[-1])
     user_id = callback.from_user.id
-    request = farmer_logistics_requests.get(
-        request_id
-    ) or farmer_logistics_requests.get(str(request_id))
-    if not request or request["farmer_id"] != user_id:
         await callback.answer("❌ Заявка не найдена, либо не ваша", show_alert=True)
         return
     await state.update_data(request_id=request_id)
@@ -10882,7 +9001,6 @@ async def edit_request_start(callback: types.CallbackQuery, state: FSMContext):
             "💰 Цена/т", callback_data=f"edit_req_field:price_per_ton:{request_id}"
         ),
         InlineKeyboardButton(
-            "⛴️ Порт", callback_data=f"edit_req_field:port_to:{request_id}"
         ),
         InlineKeyboardButton(
             "🚚 Транспорт", callback_data=f"edit_req_field:transport_type:{request_id}"
@@ -10898,7 +9016,6 @@ async def edit_request_start(callback: types.CallbackQuery, state: FSMContext):
 @dp.callback_query_handler(lambda c: c.data.startswith("edit_req_field:"), state="*")
 async def edit_req_field_handler(callback: types.CallbackQuery, state: FSMContext):
     _, field, request_id = callback.data.split(":")
-    await state.update_data(edit_field=field, request_id=int(request_id))
     if field in ["culture", "transport_type", "port_to"]:
         await callback.message.edit_text(
             f"📝 Выберите новое значение для <b>{field}</b>:",
@@ -10922,17 +9039,10 @@ async def edit_req_field_handler(callback: types.CallbackQuery, state: FSMContex
 async def edit_field_value_choice(callback: types.CallbackQuery, state: FSMContext):
     _, field, value, request_id = callback.data.split(":")
     await state.finish()
-    request_id = int(request_id)
     user_id = callback.from_user.id
-    request = farmer_logistics_requests.get(
-        request_id
-    ) or farmer_logistics_requests.get(str(request_id))
-    if not request or request["farmer_id"] != user_id:
         await callback.answer("❌ Доступ запрещён", show_alert=True)
         return
     request[field] = value
-    with open("data/farmer_logistics_requests.pkl", "wb") as f:
-        pickle.dump(farmer_logistics_requests, f)
     keyboard = InlineKeyboardMarkup().add(
         InlineKeyboardButton(
             "⬅️ Назад к заявке", callback_data=f"farmer_request_view:{request_id}"
@@ -10952,7 +9062,6 @@ async def edit_field_value_choice(callback: types.CallbackQuery, state: FSMConte
 )
 async def edit_field_custom_choice(callback: types.CallbackQuery, state: FSMContext):
     _, field, request_id = callback.data.split(":")
-    await state.update_data(edit_field=field, request_id=int(request_id))
     await callback.message.edit_text(
         f"📝 Введите своё значение для <b>{field}</b>:", parse_mode="HTML"
     )
@@ -10966,16 +9075,10 @@ async def process_custom_value(message: types.Message, state: FSMContext):
     field = user_data.get("edit_field")
     request_id = user_data.get("request_id")
     new_value = message.text.strip()
-    request = farmer_logistics_requests.get(
-        request_id
-    ) or farmer_logistics_requests.get(str(request_id))
-    if not request or request["farmer_id"] != message.from_user.id:
         await message.answer("❌ Доступ запрещён")
         await state.finish()
         return
     request[field] = new_value
-    with open("data/farmer_logistics_requests.pkl", "wb") as f:
-        pickle.dump(farmer_logistics_requests, f)
     keyboard = InlineKeyboardMarkup().add(
         InlineKeyboardButton(
             "⬅️ Назад к заявке", callback_data=f"farmer_request_view:{request_id}"
@@ -11002,10 +9105,6 @@ async def process_number_field(message: types.Message, state: FSMContext):
     except ValueError:
         await message.answer("❌ Введите корректное положительное число!")
         return
-    request = farmer_logistics_requests.get(
-        request_id
-    ) or farmer_logistics_requests.get(str(request_id))
-    if not request or request["farmer_id"] != message.from_user.id:
         await message.answer("❌ Доступ запрещён")
         await state.finish()
         return
@@ -11014,8 +9113,6 @@ async def process_number_field(message: types.Message, state: FSMContext):
         request["total_sum"] = value * float(request.get("price_per_ton", 0))
     if field == "price_per_ton":
         request["total_sum"] = float(request.get("volume", 0)) * value
-    with open("data/farmer_logistics_requests.pkl", "wb") as f:
-        pickle.dump(farmer_logistics_requests, f)
     keyboard = InlineKeyboardMarkup().add(
         InlineKeyboardButton(
             "⬅️ Назад к заявке", callback_data=f"farmer_request_view:{request_id}"
@@ -11030,9 +9127,7 @@ async def process_number_field(message: types.Message, state: FSMContext):
 
 
 @dp.callback_query_handler(
-    lambda c: c.data.startswith("farmer_request_view:"), state="*"
 )
-async def show_request_view(callback: types.CallbackQuery, state: FSMContext):
     await state.finish()
     await farmer_request_view(
         callback, state
@@ -11051,24 +9146,11 @@ async def confirm_delete_request(callback: types.CallbackQuery, state: FSMContex
     await state.finish()
 
     try:
-        request_id = int(callback.data.split(":", 1)[1])
     except (IndexError, ValueError):
         await callback.answer("❌ Ошибка", show_alert=True)
         return
 
-    # Проверка существования заявки (проверяем оба варианта ключа)
-    if (
-        request_id not in farmer_logistics_requests
-        and str(request_id) not in farmer_logistics_requests
-    ):
-        await callback.answer("❌ Заявка не найдена", show_alert=True)
-        return
-
     # Получаем заявку
-    request = farmer_logistics_requests.get(
-        request_id
-    ) or farmer_logistics_requests.get(str(request_id))
-
     if not request:
         await callback.answer("❌ Заявка не найдена", show_alert=True)
         return
@@ -11076,7 +9158,6 @@ async def confirm_delete_request(callback: types.CallbackQuery, state: FSMContex
     user_id = callback.from_user.id
 
     # Проверка владельца
-    if request.get("farmer_id") != user_id:
         await callback.answer("❌ Это не ваша заявка", show_alert=True)
         return
 
@@ -11090,13 +9171,10 @@ async def confirm_delete_request(callback: types.CallbackQuery, state: FSMContex
 🌾 {request.get('culture', 'Не указано')} - {request.get('volume', 0)} т
 📍 {request.get('farmer_region', 'Не указано')} → {request.get('port_to', 'Не указано')}
 💰 Цена доставки: {request.get('desired_price', 0):,} ₽/т
-📞 Откликов: {request.get('offers_count', 0)}
 
 ❗️ <b>Это действие нельзя отменить!</b>
 """
 
-    if request.get("offers_count", 0) > 0:
-        text += f"\n⚠️ У заявки есть {request['offers_count']} откликов от логистов!"
 
     keyboard = InlineKeyboardMarkup(row_width=2)
     keyboard.add(
@@ -11120,24 +9198,11 @@ async def delete_request_final(callback: types.CallbackQuery, state: FSMContext)
     await state.finish()
 
     try:
-        request_id = int(callback.data.split(":", 1)[1])
     except (IndexError, ValueError):
         await callback.answer("❌ Ошибка", show_alert=True)
         return
 
-    # Проверка существования заявки
-    if (
-        request_id not in farmer_logistics_requests
-        and str(request_id) not in farmer_logistics_requests
-    ):
-        await callback.answer("❌ Заявка не найдена", show_alert=True)
-        return
-
     # Получаем заявку
-    request = farmer_logistics_requests.get(
-        request_id
-    ) or farmer_logistics_requests.get(str(request_id))
-
     if not request:
         await callback.answer("❌ Заявка не найдена", show_alert=True)
         return
@@ -11145,23 +9210,14 @@ async def delete_request_final(callback: types.CallbackQuery, state: FSMContext)
     user_id = callback.from_user.id
 
     # Проверка владельца
-    if request.get("farmer_id") != user_id:
         await callback.answer("❌ Это не ваша заявка", show_alert=True)
         return
 
     # Сохраняем данные для уведомлений
     culture = request.get("culture", "Не указано")
     volume = request.get("volume", 0)
-    offers = request.get("offers", [])
 
-    # Получаем список логистов, которые откликнулись
-    logist_ids = [offer.get("logist_id") for offer in offers if offer.get("logist_id")]
 
-    # Удаляем заявку (проверяем оба варианта ключа)
-    if request_id in farmer_logistics_requests:
-        del farmer_logistics_requests[request_id]
-    elif str(request_id) in farmer_logistics_requests:
-        del farmer_logistics_requests[str(request_id)]
 
     # ✅ Сохраняем в файл
     try:
@@ -11175,9 +9231,7 @@ async def delete_request_final(callback: types.CallbackQuery, state: FSMContext)
         try:
             await bot.send_message(
                 logist_id,
-                f"ℹ️ <b>Заявка удалена</b>\n\n"
                 f"Заявка #{request_id} ({culture}, {volume}т) была удалена фермером.\n\n"
-                f"Приносим извинения за неудобства.",
                 parse_mode="HTML",
             )
         except Exception as e:
@@ -11186,9 +9240,6 @@ async def delete_request_final(callback: types.CallbackQuery, state: FSMContext)
     logging.info(f"🗑️ Заявка #{request_id} удалена пользователем {user_id}")
 
     # Показываем список оставшихся заявок
-    my_requests = [
-        r for r in farmer_logistics_requests.values() if r.get("farmer_id") == user_id
-    ]
 
     if not my_requests:
         text = "📬 <b>МОИ ЗАЯВКИ</b>\n\n✅ Заявка удалена!\n\n❌ У вас больше нет активных заявок"
@@ -11197,8 +9248,6 @@ async def delete_request_final(callback: types.CallbackQuery, state: FSMContext)
             InlineKeyboardButton("🏠 Главное меню", callback_data="farmer_main_menu")
         )
     else:
-        active = [r for r in my_requests if r.get("status") == "active"]
-        completed = [r for r in my_requests if r.get("status") == "completed"]
 
         text = f"📬 <b>МОИ ЗАЯВКИ</b>\n\n✅ <b>Заявка #{request_id} удалена!</b>\n\n"
         text += f"🟢 Активных: {len(active)}\n"
@@ -11209,7 +9258,6 @@ async def delete_request_final(callback: types.CallbackQuery, state: FSMContext)
         if active:
             text += "━━━━━━ АКТИВНЫЕ ━━━━━━\n"
             for r in active:
-                label = f"#{r['id']} • {r.get('culture', 'Не указано')} • {r.get('volume', 0)}т • {r.get('offers_count', 0)} откликов"
                 keyboard.add(
                     InlineKeyboardButton(
                         label, callback_data=f"farmer_request_view:{r['id']}"
@@ -11228,34 +9276,22 @@ async def delete_request_final(callback: types.CallbackQuery, state: FSMContext)
     lambda c: c.data.startswith("farmer_view_offers:"), state="*"
 )
 async def farmer_view_offers(callback: types.CallbackQuery, state: FSMContext):
-    """Просмотр откликов логистов"""
     await state.finish()
 
     try:
-        request_id = int(callback.data.split(":")[-1])
     except (IndexError, ValueError):
         await callback.answer("❌ Ошибка", show_alert=True)
         return
 
-    if request_id not in farmer_logistics_requests:
         await callback.answer("❌ Заявка не найдена", show_alert=True)
         return
 
-    request = farmer_logistics_requests[request_id]
     user_id = callback.from_user.id
-
-    if request["farmer_id"] != user_id:
         await callback.answer("❌ Это не ваша заявка", show_alert=True)
         return
 
-    if not request["offers"]:
-        await callback.message.edit_text(
-            "❌ Откликов нет",
-            reply_markup=InlineKeyboardMarkup().add(
-                InlineKeyboardButton(
-                    "📋 К ЗАЯВКЕ", callback_data=f"farmer_request_view:{request_id}"
-                )
-            ),
+            InlineKeyboardButton(
+        )
         )
         await callback.answer()
         return
@@ -11264,28 +9300,20 @@ async def farmer_view_offers(callback: types.CallbackQuery, state: FSMContext):
 
     keyboard = InlineKeyboardMarkup(row_width=1)
 
-    for i, offer in enumerate(request["offers"], 1):
         text += (
             f"━━━ ОТКЛИК {i} ━━━\n"
-            f"👤 {offer['logist_name']}\n"
-            f"☎️ <code>{offer['logist_phone']}</code>\n"
-            f"⏰ {offer['responded_at']}\n\n"
         )
 
         keyboard.add(
             InlineKeyboardButton(
-                f"📞 ЛОГИСТ {i}: {offer['logist_name']}",
-                callback_data=f"farmer_contact_logist:{request_id}:{offer['logist_id']}",
             )
         )
 
     keyboard.add(
         InlineKeyboardButton(
-            "📋 К ЗАЯВКЕ", callback_data=f"farmer_request_view:{request_id}"
         )
     )
     keyboard.add(
-        InlineKeyboardButton("📬 МОИ ЗАЯВКИ", callback_data="farmer_my_requests_menu")
     )
 
     await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
@@ -11296,45 +9324,21 @@ async def farmer_view_offers(callback: types.CallbackQuery, state: FSMContext):
     lambda c: c.data.startswith("farmer_contact_logist:"), state="*"
 )
 async def farmer_contact_logist(callback: types.CallbackQuery, state: FSMContext):
-    """Связаться с логистом"""
     await state.finish()
 
     try:
         parts = callback.data.split(":")
-        request_id = int(parts[1])
         logist_id = int(parts[2])
-
-        # ✅ ДОБАВЬ ЛОГИРОВАНИЕ
-        logging.info(f"✅ HANDLER TRIGGERED: source=farmer, req_id={request_id}")
-        logging.debug(f"Available requests: {list(farmer_logistics_requests.keys())}")
-
     except (IndexError, ValueError):
         await callback.answer("❌ Ошибка", show_alert=True)
         return
 
-    # ✅ ПРОВЕРКА И ДЛЯ INT И ДЛЯ STR
-    if (
-        request_id not in farmer_logistics_requests
-        and str(request_id) not in farmer_logistics_requests
-    ):
-        logging.error(f"❌ REQUEST NOT FOUND: {request_id}")
-        logging.error(f"Available keys: {farmer_logistics_requests.keys()}")
         await callback.answer("❌ Заявка не найдена", show_alert=True)
         return
 
-    # ✅ ПОЛУЧАЕМ ЗАЯВКУ (проверяем оба варианта)
-    request = farmer_logistics_requests.get(
-        request_id
-    ) or farmer_logistics_requests.get(str(request_id))
-
-    if not request:
-        await callback.answer("❌ Заявка не найдена", show_alert=True)
         return
 
-    # Ищем логиста в откликах
     offer = None
-    for o in request.get("offers", []):
-        if o.get("logist_id") == logist_id:
             offer = o
             break
 
@@ -11343,24 +9347,13 @@ async def farmer_contact_logist(callback: types.CallbackQuery, state: FSMContext
         return
 
     text = (
-        f"📞 <b>КОНТАКТЫ ЛОГИСТА</b>\n\n"
-        f"👤 {offer['logist_name']}\n"
-        f"☎️ <code>{offer['logist_phone']}</code>\n"
-        f"📧 Email: Свяжитесь напрямую по номеру телефона\n\n"
-        f"💬 Заявка #{request_id}: {request['culture']} {request['volume']}т\n"
-        f"⛴️ {request['port_to']}\n"
-        f"🚚 {request['transport_type']}\n"
-        f"💳 Цена: {request['desired_price']:,} ₽/т"
-    )
 
     keyboard = InlineKeyboardMarkup()
-    keyboard.add(
-        InlineKeyboardButton(
-            "📞 ОТКЛИКЫ", callback_data=f"farmer_view_offers:{request_id}"
+        keyboard.add(
+            InlineKeyboardButton(
+            )
         )
-    )
     keyboard.add(
-        InlineKeyboardButton("📬 МОИ ЗАЯВКИ", callback_data="farmer_my_requests_menu")
     )
 
     await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
@@ -11383,18 +9376,11 @@ async def farmer_confirm_request_button(
         return
 
     # Создаём заявку в farmer_logistics_requests
-    request_id = len(farmer_logistics_requests) + 1
 
     farmer_logistics_requests[request_id] = {
         "id": request_id,
         "user_id": user_id,
         "culture": data.get("culture"),
-        "volume": data.get("volume"),
-        "price": data.get("price"),
-        "departure": data.get("departure"),
-        "destination": data.get("destination"),
-        "transport": data.get("transport"),
-        "delivery_price": data.get("delivery_price"),
         "created_at": datetime.now().strftime("%d.%m.%Y %H:%M"),
         "status": "active",
     }
@@ -11403,7 +9389,6 @@ async def farmer_confirm_request_button(
 
     await callback.message.edit_text(
         f"✅ <b>Заявка #{request_id} успешно создана!</b>\n\n"
-        f"Статус: <b>активна</b>\n"
         f"Дата: {datetime.now().strftime('%d.%m.%Y %H:%M')}",
         parse_mode="HTML",
     )
@@ -11434,98 +9419,29 @@ async def farmer_cancel_request_button(
 async def farmer_main_menu(callback: types.CallbackQuery, state: FSMContext):
     """Главное меню фермера"""
     await state.finish()
-
-    # ✅ БЕЗ КНОПОК - просто текст:
-    await callback.message.edit_text(
-        "🏠 <b>ГЛАВНОЕ МЕНЮ ФЕРМЕРА</b>", parse_mode="HTML"
     )
     await callback.answer()
 
 
-# ЛОГИСТ ОТКЛИКАЕТСЯ НА ЗАЯВКУ ФЕРМЕРА
 @dp.callback_query_handler(
     lambda c: c.data.startswith("logist_respond_farmer_request:"), state="*"
 )
 async def logist_respond_farmer_request(
     callback: types.CallbackQuery, state: FSMContext
 ):
-    """Логист откликается на заявку фермера"""
-
     await state.finish()
     logist_id = callback.from_user.id
 
     try:
-        request_id = int(callback.data.split(":")[-1])
     except (IndexError, ValueError):
         await callback.answer("❌ Ошибка", show_alert=True)
         return
 
-    if request_id not in farmer_logistics_requests:
         await callback.answer("❌ Заявка не найдена", show_alert=True)
         return
 
-    request = farmer_logistics_requests[request_id]
-
-    # Проверяем не откликался ли уже
-    if any(o.get("logist_id") == logist_id for o in request.get("offers", [])):
-        await callback.answer("❌ Вы уже откликнулись на эту заявку", show_alert=True)
         return
 
-    # Добавляем отклик
-    request["offers"].append(
-        {
-            "logist_id": logist_id,
-            "logist_name": users[logist_id].get("name", "Неизвестно"),
-            "logist_phone": users[logist_id].get("phone", "Не указан"),
-            "responded_at": datetime.now().strftime("%d.%m.%Y %H:%M"),
-            "created_at": datetime.now().strftime("%d.%m.%Y %H:%M"),
-        }
-    )
-
-    request["offers_count"] = len(request["offers"])
-
-    logging.info(f"✅ Логист {logist_id} откликнулся на заявку фермера #{request_id}")
-
-    # Уведомляем фермера
-    farmer_id = request["farmer_id"]
-
-    try:
-        msg = (
-            f"📞 <b>ЛОГИСТ ОТКЛИКНУЛСЯ НА ВАШУ ЗАЯВКУ!</b>\n\n"
-            f"👤 <b>Логист:</b> {users[logist_id].get('name', 'Неизвестно')}\n"
-            f"☎️ <code>{users[logist_id].get('phone', 'Не указан')}</code>\n"
-            f"📧 <code>{users[logist_id].get('email', 'Не указан')}</code>\n\n"
-            f"📊 <b>Заявка #{request_id}:</b>\n"
-            f"🌾 {request['culture']} - {request['volume']} т\n"
-            f"💰 {request['price_per_ton']:,} ₽/т\n\n"
-            f"Всего откликов: {request['offers_count']}\n\n"
-            f"Свяжитесь с логистом для обсуждения деталей."
-        )
-
-        keyboard = InlineKeyboardMarkup()
-        keyboard.add(
-            InlineKeyboardButton(
-                "📋 ПРОСМОТРЕТЬ ЗАЯВКУ",
-                callback_data=f"farmer_request_details:{request_id}",
-            )
-        )
-
-        await bot.send_message(farmer_id, msg, reply_markup=keyboard, parse_mode="HTML")
-    except Exception as e:
-        logging.error(f"❌ Ошибка уведомления фермера: {e}")
-
-    # Подтверждение логисту
-    await callback.message.edit_text(
-        f"✅ <b>ВЫ ОТКЛИКНУЛИСЬ!</b>\n\n"
-        f"Фермер получил уведомление.\n"
-        f"Свяжитесь с ним для обсуждения условий доставки.",
-        reply_markup=InlineKeyboardMarkup().add(
-            InlineKeyboardButton("🏠 ГЛАВНОЕ МЕНЮ", callback_data="logist_main_menu")
-        ),
-        parse_mode="HTML",
-    )
-
-    await callback.answer("✅ Отклик отправлен!", show_alert=True)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -11537,56 +9453,37 @@ async def logist_respond_farmer_request(
     lambda c: c.data.startswith("select_logistics_for_pull:"), state="*"
 )
 async def show_logistics_for_pull(callback: types.CallbackQuery):
-    """Показать список логистов для выбора"""
     try:
         pull_id = parse_callback_id(callback.data)
     except (IndexError, ValueError):
         await callback.answer("❌ Ошибка данных", show_alert=True)
         return
 
-    if pull_id not in pulls.get("pulls", {}):
         await callback.answer("❌ Пулл не найден", show_alert=True)
         return
 
-    pull = pulls["pulls"][pull_id]
-
-    # Проверяем что пулл собран
-    if pull.get("status") not in ["completed", "собран", "закрыт"]:
         await callback.answer("⚠️ Пулл ещё не собран", show_alert=True)
         return
 
-    # Получаем список логистов
     available_logistics = []
 
     for user_id, user_data in users.items():
-        if user_data.get("role") == "logist":
-            # Проверяем есть ли карточка логиста
-            logistic_card = user_data.get("logistics_card", {})
-            if logistic_card:
-                available_logistics.append((user_id, logistic_card, user_data))
 
     if not available_logistics:
         await callback.answer(
-            "⚠️ Нет доступных логистов\nПопробуйте позже", show_alert=True
         )
         return
 
-    # Формируем сообщение со списком
     text = f"🚚 <b>Выбор логиста для пулла #{pull_id}</b>\n\n"
     text += (
         f"🌾 {pull.get('culture', 'Культура')} • {pull.get('target_volume', 0):.1f} т\n"
     )
-    text += f"🚢 Порт: {pull.get('port', 'Не указан')}\n\n"
     text += f"<b>Доступно логистов: {len(available_logistics)}</b>\n"
 
     keyboard = InlineKeyboardMarkup(row_width=1)
 
     for log_id, log_card, log_user in available_logistics:
-        # Формируем краткую карточку
-        company = log_card.get("company_name", "Компания")
-        price = log_card.get("price_per_ton", 0)
 
-        btn_text = f"🚚 {company} • {price:,} ₽/т"
 
         keyboard.add(
             InlineKeyboardButton(
@@ -11604,43 +9501,16 @@ async def show_logistics_for_pull(callback: types.CallbackQuery):
     lambda c: c.data.startswith("view_logistic_card:"), state="*"
 )
 async def view_logistic_card_for_selection(callback: types.CallbackQuery):
-    """Просмотр карточки логиста и выбор"""
     try:
-        _, pull_id, log_id = callback.data.split(":")
-        pull_id = int(pull_id)
-        log_id = int(log_id)
     except (ValueError, IndexError):
         await callback.answer("❌ Ошибка данных", show_alert=True)
         return
 
-    if log_id not in users:
-        await callback.answer("❌ Логист не найден", show_alert=True)
+        return
         return
 
-    log_user = users[log_id]
-    log_card = log_user.get("logistics_card", {})
 
-    if not log_card:
-        await callback.answer("❌ Карточка не найдена", show_alert=True)
-        return
 
-    # Формируем детальную карточку
-    text = "🚚 <b>Карточка логиста</b>\n\n"
-    text += f"🏢 <b>{log_card.get('company_name', 'Компания')}</b>\n"
-    text += f"📍 Маршрут: {log_card.get('route', 'Не указан')}\n"
-    text += f"💰 Тариф: {log_card.get('price_per_ton', 0):,} ₽/т\n"
-    text += f"🚛 Транспорт: {log_card.get('transport_type', 'Не указан')}\n"
-    text += f"⏱ Срок доставки: {log_card.get('delivery_days', 'Не указан')} дней\n"
-
-    if log_card.get("additional_info"):
-        text += f"\n📝 {log_card['additional_info']}\n"
-
-    # Контакты
-    text += "\n<b>Контакты:</b>\n"
-    if log_user.get("username"):
-        text += f"Telegram: @{log_user['username']}\n"
-    if log_user.get("phone"):
-        text += f"📞 {log_user['phone']}\n"
 
     keyboard = InlineKeyboardMarkup(row_width=1)
     keyboard.add(
@@ -11663,111 +9533,71 @@ async def view_logistic_card_for_selection(callback: types.CallbackQuery):
     lambda c: c.data.startswith("confirm_select_logistic:"), state="*"
 )
 async def confirm_select_logistic(callback: types.CallbackQuery):
-    """Подтверждение выбора логиста"""
     try:
-        _, pull_id, log_id = callback.data.split(":")
-        pull_id = int(pull_id)
-        log_id = int(log_id)
     except (ValueError, IndexError):
         await callback.answer("❌ Ошибка данных", show_alert=True)
         return
 
-    if pull_id not in pulls.get("pulls", {}):
         await callback.answer("❌ Пулл не найден", show_alert=True)
         return
 
-    pull = pulls["pulls"][pull_id]
 
-    # Назначаем логиста
     pull["selected_logistic"] = log_id
-
     save_data()
 
     # Уведомляем логиста
-    log_user = users.get(log_id, {})
     try:
         await bot.send_message(
             log_id,
-            f"🎉 <b>Вы выбраны для перевозки!</b>\n\n"
-            f"📦 Пулл #{pull_id}\n"
-            f"🌾 {pull.get('culture', 'Культура')} • {pull.get('target_volume', 0):.1f} т\n"
-            f"🚢 Порт: {pull.get('port', 'Не указан')}\n\n"
-            f"Экспортёр свяжется с вами для уточнения деталей.",
+                f"📦 Пулл #{pull_id}\n"
+                f"🌾 {pull.get('culture', 'Культура')} • {pull.get('target_volume', 0):.1f} т\n"
+                f"🚢 Порт: {pull.get('port', 'Не указан')}\n\n"
             parse_mode="HTML",
         )
     except Exception as e:
-        logging.error(f"Не удалось уведомить логиста {log_id}: {e}")
-
-    company_name = log_user.get("logistics_card", {}).get("company_name", "Логист")
 
     await callback.message.edit_text(
-        f"✅ <b>Логист выбран!</b>\n\n"
-        f"🚚 Компания: {company_name}\n"
-        f"📦 Для пулла #{pull_id}\n\n"
-        f"Логист получил уведомление.",
+            f"📦 Для пулла #{pull_id}\n\n"
         parse_mode="HTML",
     )
-    await callback.answer("✅ Логист назначен!")
 
 
 # ──────────────────────────────────────────────────────────────────────────
 # 3. ПРОСМОТР И ВЫБОР ЭКСПЕДИТОРА
 # ──────────────────────────────────────────────────────────────────────────
-
-
 @dp.callback_query_handler(
     lambda c: c.data.startswith("select_expeditor_for_pull:"), state="*"
 )
 async def show_expeditors_for_pull(callback: types.CallbackQuery):
-    """Показать список экспедиторов для выбора"""
     try:
         pull_id = parse_callback_id(callback.data)
     except (IndexError, ValueError):
         await callback.answer("❌ Ошибка данных", show_alert=True)
         return
 
-    if pull_id not in pulls.get("pulls", {}):
         await callback.answer("❌ Пулл не найден", show_alert=True)
         return
 
-    pull = pulls["pulls"][pull_id]
-
-    # Проверяем что пулл собран
-    if pull.get("status") not in ["completed", "собран", "закрыт"]:
         await callback.answer("⚠️ Пулл ещё не собран", show_alert=True)
         return
 
-    # Получаем список экспедиторов
     available_expeditors = []
 
-    for user_id, user_data in users.items():
-        if user_data.get("role") == "expeditor":
-            # Проверяем есть ли карточка
-            expeditor_card = user_data.get("expeditor_card", {})
-            if expeditor_card:
-                available_expeditors.append((user_id, expeditor_card, user_data))
 
     if not available_expeditors:
         await callback.answer(
-            "⚠️ Нет доступных экспедиторов\nПопробуйте позже", show_alert=True
         )
         return
 
-    # Формируем сообщение
     text = f"📄 <b>Выбор экспедитора для пулла #{pull_id}</b>\n\n"
     text += (
         f"🌾 {pull.get('culture', 'Культура')} • {pull.get('target_volume', 0):.1f} т\n"
     )
-    text += f"🚢 Порт: {pull.get('port', 'Не указан')}\n\n"
     text += f"<b>Доступно экспедиторов: {len(available_expeditors)}</b>\n"
 
     keyboard = InlineKeyboardMarkup(row_width=1)
 
     for exp_id, exp_card, exp_user in available_expeditors:
-        company = exp_card.get("company_name", "Экспедитор")
-        price = exp_card.get("customs_fee", 0)
-
-        btn_text = f"📄 {company} • {price:,} ₽"
 
         keyboard.add(
             InlineKeyboardButton(
@@ -11785,56 +9615,25 @@ async def show_expeditors_for_pull(callback: types.CallbackQuery):
     lambda c: c.data.startswith("view_expeditor_card:"), state="*"
 )
 async def view_expeditor_card_for_selection(callback: types.CallbackQuery):
-    """Просмотр карточки экспедитора и выбор"""
     try:
-        _, pull_id, exp_id = callback.data.split(":")
-        pull_id = int(pull_id)
-        exp_id = int(exp_id)
     except (ValueError, IndexError):
         await callback.answer("❌ Ошибка данных", show_alert=True)
         return
 
-    # ИСПРАВЛЕНО: Берём из expeditor_cards, а не из users
     if exp_id not in expeditor_cards:
-        await callback.answer("❌ Карточка не найдена", show_alert=True)
         return
 
     card = expeditor_cards[exp_id]
-    exp_user = users.get(exp_id, {})
 
-    # Извлекаем данные
-    transport = card.get("transport_type", "Не указан")
-    capacity = card.get("capacity", 0)
-    regions = card.get("regions", [])
-    price = card.get("price_per_km", 0)
-    description = card.get("description", "Не указано")
 
-    # Форматируем регионы
-    if isinstance(regions, list):
-        regions_text = ", ".join(regions) if regions else "Регион не указан"
-    else:
-        regions_text = str(regions)
 
-    # Эмодзи транспорта
-    transport_emoji = TRANSPORT_TYPES.get(transport, "🚛")
 
-    # Формируем карточку
     text = (
-        f"💳 <b>Карточка экспедитора</b>\n\n"
-        f"{transport_emoji} <b>Тип транспорта:</b> {transport}\n"
-        f"📦 <b>Грузоподъёмность:</b> {capacity} т\n"
-        f"📍 <b>Регионы работы:</b> {regions_text}\n"
-        f"💰 <b>Цена за км:</b> {price:.2f} ₽/км\n"
         f"📝 <b>Описание:</b>\n{description}\n\n"
     )
 
     # Контакты
     text += "<b>👤 Контакты:</b>\n"
-    text += f"Имя: {card.get('user_name', exp_user.get('full_name', 'N/A'))}\n"
-    text += f"Компания: {card.get('company', exp_user.get('company_name', 'N/A'))}\n"
-
-    if exp_user.get("username"):
-        text += f"Telegram: @{exp_user['username']}\n"
     if card.get("phone") or exp_user.get("phone"):
         phone = card.get("phone") or exp_user.get("phone")
         text += f"📞 {phone}\n"
@@ -11843,13 +9642,10 @@ async def view_expeditor_card_for_selection(callback: types.CallbackQuery):
         text += f"✉️ {email}\n"
 
     text += f"\n📅 Создана: {card.get('created_at', 'Н/Д')}\n"
-    text += f"👁 Просмотров: {card.get('views', 0)}"
 
     keyboard = InlineKeyboardMarkup(row_width=1)
     keyboard.add(
         InlineKeyboardButton(
-            "✅ Выбрать этого экспедитора",
-            callback_data=f"confirm_select_expeditor:{pull_id}:{exp_id}",
         )
     )
     keyboard.add(
@@ -11863,131 +9659,30 @@ async def view_expeditor_card_for_selection(callback: types.CallbackQuery):
 
 
 @dp.callback_query_handler(
-    lambda c: c.data.startswith("confirm_select_expeditor:"), state="*"
 )
-async def confirm_select_expeditor(callback: types.CallbackQuery):
-    """Подтверждение выбора экспедитора"""
     try:
-        _, pull_id, exp_id = callback.data.split(":")
-        pull_id = int(pull_id)
-        exp_id = int(exp_id)
     except (ValueError, IndexError):
         await callback.answer("❌ Ошибка данных", show_alert=True)
         return
 
-    if pull_id not in pulls.get("pulls", {}):
         await callback.answer("❌ Пулл не найден", show_alert=True)
         return
 
-    pull = pulls["pulls"][pull_id]
 
-    # Назначаем экспедитора
-    pull["selected_expeditor"] = exp_id
 
     save_data()
 
-    # Уведомляем экспедитора
-    exp_user = users.get(exp_id, {})
     try:
         await bot.send_message(
-            exp_id,
-            f"🎉 <b>Вы выбраны для оформления ДТ!</b>\n\n"
-            f"📦 Пулл #{pull_id}\n"
-            f"🌾 {pull.get('culture', 'Культура')} • {pull.get('target_volume', 0):.1f} т\n"
-            f"🚢 Порт: {pull.get('port', 'Не указан')}\n\n"
-            f"Экспортёр свяжется с вами для уточнения деталей.",
+            f"🌾 {pull.get('culture','Культура')} • {pull.get('target_volume',0):.1f} т\n"
+            f"🚢 Порт: {pull.get('port','Не указан')}\n\n"
             parse_mode="HTML",
         )
     except Exception as e:
-        logging.error(f"Не удалось уведомить экспедитора {exp_id}: {e}")
-
-    company_name = exp_user.get("expeditor_card", {}).get("company_name", "Экспедитор")
 
     await callback.message.edit_text(
-        f"✅ <b>Экспедитор выбран!</b>\n\n"
-        f"📄 Компания: {company_name}\n"
-        f"📦 Для пулла #{pull_id}\n\n"
-        f"Экспедитор получил уведомление.",
         parse_mode="HTML",
     )
-    await callback.answer("✅ Экспедитор назначен!")
-
-
-async def select_search_criteria(callback: types.CallbackQuery, state: FSMContext):
-    """Обработка выбора критериев поиска"""
-    search_type = callback.data.split(":", 1)[1]
-
-    await state.update_data(search_type=search_type)
-
-    if search_type == "culture":
-        await callback.message.edit_text(
-            "🔍 <b>Поиск по культуре</b>\n\n" "Выберите культуру:",
-            reply_markup=culture_keyboard(),
-        )
-        await SearchByCulture.waiting_culture.set()
-
-    elif search_type == "region":
-        await callback.message.edit_text(
-            "🔍 <b>Поиск по региону</b>\n\n" "Выберите регион:",
-            reply_markup=region_keyboard(),
-        )
-        await SearchBatchesStatesGroup.enter_region.set()
-
-    elif search_type == "volume":
-        await callback.message.edit_text(
-            "🔍 <b>Поиск по объёму</b>\n\n" "Введите минимальный объём (в тоннах):"
-        )
-        await SearchBatchesStatesGroup.enter_min_volume.set()
-
-    elif search_type == "price":
-        await callback.message.edit_text(
-            "🔍 <b>Поиск по цене</b>\n\n" "Введите минимальную цену (₽/тонна):"
-        )
-        await SearchBatchesStatesGroup.enter_min_price.set()
-
-    elif search_type == "quality":
-        await callback.message.edit_text(
-            "🔍 <b>Поиск по классу качества</b>\n\n" "Выберите класс качества:",
-            reply_markup=quality_class_keyboard(),
-        )
-        await SearchBatchesStatesGroup.enter_quality_class.set()
-
-    elif search_type == "storage":
-        await callback.message.edit_text(
-            "🔍 <b>Поиск по типу хранения</b>\n\n" "Выберите тип хранения:",
-            reply_markup=storage_type_keyboard(),
-        )
-        await SearchBatchesStatesGroup.enter_storage_type.set()
-
-    elif search_type == "all":
-        await callback.message.edit_text(
-            "🔍 <b>Комплексный поиск</b>\n\n" "Выберите культуру:",
-            reply_markup=culture_keyboard(),
-        )
-        await SearchByCulture.waiting_culture.set()
-
-    elif search_type == "active":
-        await perform_search(callback.message, {"status": "Активна"})
-
-    await callback.answer()
-
-    """Обработка выбора региона при поиске"""
-    region = callback.data.split(":", 1)[1]
-
-    data = await state.get_data()
-    search_type = data.get("search_type")
-
-    if search_type == "region":
-        await perform_search(callback.message, {"region": region})
-        await state.finish()
-    else:
-        await state.update_data(region=region)
-        await callback.message.edit_text(
-            "🔍 <b>Комплексный поиск</b>\n\n" "Введите минимальный объём (в тоннах):"
-        )
-        await SearchBatchesStatesGroup.enter_min_volume.set()
-
-    await callback.answer()
 
 
 @dp.message_handler(state=SearchBatchesStatesGroup.enter_min_volume)
@@ -12111,10 +9806,7 @@ async def search_by_storage(callback: types.CallbackQuery, state: FSMContext):
 async def perform_search(message, search_params):
     """Выполнение поиска по заданным параметрам"""
     found_batches = []
-    for user_batches in batches.values():
-        for batch in user_batches:
-            if matches_search_criteria(batch, search_params):
-                found_batches.append(batch)
+        if matches_search_criteria(batch, search_params):
 
     if not found_batches:
         await message.answer(
@@ -12147,7 +9839,6 @@ async def perform_search(message, search_params):
 
 def matches_search_criteria(batch, search_params):
     """Проверка соответствия партии критериям поиска"""
-    if batch.get("status") != "Активна":
         return False
     if search_params.get("culture") and batch["culture"] != search_params["culture"]:
         return False
@@ -12215,19 +9906,6 @@ async def attach_files_upload(message: types.Message, state: FSMContext):
     """Обработка загрузки файлов"""
     data = await state.get_data()
     batch_id = data.get("attach_batch_id")
-    user_id = message.from_user.id
-    batch = None
-    farmer_id = None
-
-    # ✅ ИСПРАВЛЕНИЕ: Ищем партию у ВСЕХ пользователей
-    for uid, user_batches in batches.items():
-        for b in user_batches:
-            if b["id"] == batch_id:
-                batch = b
-                farmer_id = uid
-                break
-        if batch:
-            break
 
     if not batch:
         await message.answer("❌ Партия не найдена")
@@ -12272,28 +9950,14 @@ async def attach_files_done(message: types.Message, state: FSMContext):
     batch_id = data.get("attach_batch_id")
     user_id = message.from_user.id
 
-    batch = None
-    farmer_id = None
-
-    # ✅ ИСПРАВЛЕНИЕ: Ищем партию у ВСЕХ пользователей
-    for uid, user_batches in batches.items():
-        for b in user_batches:
-            if b["id"] == batch_id:
-                batch = b
-                farmer_id = uid
-                break
-        if batch:
-            break
 
     await state.finish()
 
     files_count = len(batch.get("files", [])) if batch else 0
 
-    role = users[user_id].get("role")
     keyboard = get_role_keyboard(role)
 
     await message.answer(
-        f"✅ <b>Файлы прикреплены!</b>\n\n"
         f"Партия #{batch_id}\n"
         f"Всего файлов: {files_count}",
         reply_markup=keyboard,
@@ -12307,18 +9971,6 @@ async def view_batch_files(callback: types.CallbackQuery):
     """Просмотр файлов партии"""
     batch_id = parse_callback_id(callback.data)
     user_id = callback.from_user.id
-    batch = None
-    farmer_id = None
-
-    # ✅ ИСПРАВЛЕНИЕ: Ищем партию у ВСЕХ пользователей
-    for uid, user_batches in batches.items():
-        for b in user_batches:
-            if b["id"] == batch_id:
-                batch = b
-                farmer_id = uid
-                break
-        if batch:
-            break
 
     if not batch or not batch.get("files"):
         await callback.answer("📎 Файлов нет", show_alert=True)
@@ -12362,12 +10014,10 @@ async def back_to_pulls(callback: types.CallbackQuery):
 
     try:
         # ✅ Проверяем есть ли пользователь в базе
-        if user_id not in users:
             logging.warning(f"⚠️ Пользователь {user_id} не найден в базе")
             await callback.answer("❌ Пользователь не зарегистрирован", show_alert=True)
             return
 
-        user_role = users[user_id].get("role", "unknown")
         logging.info(
             f"📋 Возврат к спискам. Пользователь {user_id} с ролью: {user_role}"
         )
@@ -12378,7 +10028,6 @@ async def back_to_pulls(callback: types.CallbackQuery):
             my_pulls = {
                 pid: pull
                 for pid, pull in all_pulls.items()
-                if isinstance(pull, dict) and pull.get("exporter_id") == user_id
             }
 
             if not my_pulls:
@@ -12409,7 +10058,6 @@ async def back_to_pulls(callback: types.CallbackQuery):
             for pull_id, pull in my_pulls.items():
                 culture = pull.get("culture", "").lower()
                 culture_icon = culture_emoji.get(culture, "🌾")
-                status = pull.get("status", "active").lower()
                 status_icon = status_map.get(status, "⚪").split()[0]
                 current = pull.get("current_volume", 0)
                 target = pull.get("target_volume", 1)
@@ -12444,7 +10092,6 @@ async def back_to_pulls(callback: types.CallbackQuery):
                 (k, v)
                 for k, v in all_pulls.items()
                 if isinstance(v, dict)
-                and v.get("status") in ["active", "open", "Открыт"]
             ]
 
             if not open_pulls:
@@ -12525,7 +10172,6 @@ async def cmd_help(message: types.Message, state: FSMContext):
     await state.finish()
 
     user_id = message.from_user.id
-    if user_id not in users:
         await message.answer(
             "ℹ️ <b>Справка по Exportum</b>\n\n"
             "Exportum - платформа для торговли зерном\n\n"
@@ -12543,7 +10189,6 @@ async def cmd_help(message: types.Message, state: FSMContext):
         )
         return
 
-    user = users[user_id]
     role = user.get("role")
 
     text = f"ℹ️ <b>Справка для {ROLES.get(role, role)}</b>\n\n"
@@ -12588,7 +10233,6 @@ async def cmd_help(message: types.Message, state: FSMContext):
             "• Своевременно обновляйте пулы"
         )
 
-    elif role == "logistic":
         text += (
             "🚚 <b>Ваши услуги:</b>\n"
             "• Создание карточки логиста\n"
@@ -12608,7 +10252,6 @@ async def cmd_help(message: types.Message, state: FSMContext):
             "• Поддерживайте актуальность информации"
         )
 
-    elif role == "expeditor":
         text += (
             "🚛 <b>Ваши услуги:</b>\n"
             "• Создание карточки экспедитора\n"
@@ -12637,19 +10280,7 @@ async def cmd_help(message: types.Message, state: FSMContext):
 async def start_edit_batch(callback: types.CallbackQuery, state: FSMContext):
     """Начало редактирования расширенной партии"""
     batch_id = parse_callback_id(callback.data)
-    user_id = callback.from_user.id
-    batch = None
-    farmer_id = None
 
-    # ✅ ИСПРАВЛЕНИЕ: Ищем партию у ВСЕХ пользователей
-    for uid, user_batches in batches.items():
-        for b in user_batches:
-            if b["id"] == batch_id:
-                batch = b
-                farmer_id = uid
-                break
-        if batch:
-            break
 
     if not batch:
         await callback.answer("❌ Партия не найдена", show_alert=True)
@@ -12738,18 +10369,6 @@ async def edit_batch_status_selected(callback: types.CallbackQuery, state: FSMCo
         await callback.answer("❌ Ошибка: партия не найдена", show_alert=True)
         await state.finish()
         return
-    batch = None
-    farmer_id = None
-
-    # ✅ ИСПРАВЛЕНИЕ: Ищем партию у ВСЕХ пользователей
-    for uid, user_batches in batches.items():
-        for b in user_batches:
-            if b["id"] == batch_id:
-                batch = b
-                farmer_id = uid
-                break
-        if batch:
-            break
 
     if not batch:
         await callback.answer("❌ Партия не найдена", show_alert=True)
@@ -12763,7 +10382,6 @@ async def edit_batch_status_selected(callback: types.CallbackQuery, state: FSMCo
 
     await state.finish()
     await callback.message.edit_text(
-        f"✅ <b>Статус обновлён!</b>\n\n"
         f"Партия #{batch_id}\n"
         f"Старое значение: {old_value}\n"
         f"Новое значение: {new_status}"
@@ -12788,18 +10406,6 @@ async def edit_batch_quality_selected(callback: types.CallbackQuery, state: FSMC
         await callback.answer("❌ Ошибка: партия не найдена", show_alert=True)
         await state.finish()
         return
-    batch = None
-    farmer_id = None
-
-    # ✅ ИСПРАВЛЕНИЕ: Ищем партию у ВСЕХ пользователей
-    for uid, user_batches in batches.items():
-        for b in user_batches:
-            if b["id"] == batch_id:
-                batch = b
-                farmer_id = uid
-                break
-        if batch:
-            break
 
     if not batch:
         await callback.answer("❌ Партия не найдена", show_alert=True)
@@ -12814,7 +10420,6 @@ async def edit_batch_quality_selected(callback: types.CallbackQuery, state: FSMC
     await state.finish()
 
     await callback.message.edit_text(
-        f"✅ <b>Класс качества обновлён!</b>\n\n"
         f"Партия #{batch_id}\n"
         f"Старое значение: {old_value}\n"
         f"Новое значение: {new_quality}"
@@ -12839,18 +10444,6 @@ async def edit_batch_storage_selected(callback: types.CallbackQuery, state: FSMC
         await callback.answer("❌ Ошибка: партия не найдена", show_alert=True)
         await state.finish()
         return
-    batch = None
-    farmer_id = None
-
-    # ✅ ИСПРАВЛЕНИЕ: Ищем партию у ВСЕХ пользователей
-    for uid, user_batches in batches.items():
-        for b in user_batches:
-            if b["id"] == batch_id:
-                batch = b
-                farmer_id = uid
-                break
-        if batch:
-            break
 
     if not batch:
         await callback.answer("❌ Партия не найдена", show_alert=True)
@@ -12865,7 +10458,6 @@ async def edit_batch_storage_selected(callback: types.CallbackQuery, state: FSMC
     await state.finish()
 
     await callback.message.edit_text(
-        f"✅ <b>Тип хранения обновлён!</b>\n\n"
         f"Партия #{batch_id}\n"
         f"Старое значение: {old_value}\n"
         f"Новое значение: {new_storage}"
@@ -12887,18 +10479,6 @@ async def edit_batch_new_value(message: types.Message, state: FSMContext):
         await message.answer("❌ Ошибка: данные не найдены")
         await state.finish()
         return
-    batch = None
-    farmer_id = None
-
-    # ✅ ИСПРАВЛЕНИЕ: Ищем партию у ВСЕХ пользователей
-    for uid, user_batches in batches.items():
-        for b in user_batches:
-            if b["id"] == batch_id:
-                batch = b
-                farmer_id = uid
-                break
-        if batch:
-            break
 
     if not batch:
         await message.answer("❌ Партия не найдена")
@@ -12962,7 +10542,6 @@ async def edit_batch_new_value(message: types.Message, state: FSMContext):
             "readiness_date": "Дата готовности",
         }
 
-        role = users[user_id].get("role")
         keyboard = get_role_keyboard(role)
 
         await message.answer(
@@ -13014,9 +10593,7 @@ async def delete_batch_start(callback: types.CallbackQuery, state: FSMContext):
     )
 
     await callback.message.edit_text(
-        f"⚠️ <b>Подтверждение удаления</b>\n\n"
         f"Вы уверены, что хотите удалить партию #{batch_id}?\n\n"
-        f"<b>Это действие нельзя отменить!</b>",
         reply_markup=keyboard,
         parse_mode="HTML",
     )
@@ -13028,7 +10605,6 @@ async def delete_batch_start(callback: types.CallbackQuery, state: FSMContext):
 )
 async def delete_batch_confirmed(callback: types.CallbackQuery, state: FSMContext):
     """Подтверждение удаления партии - улучшенная версия"""
-    global batches, pulls, pullparticipants
     await state.finish()
 
     try:
@@ -13043,7 +10619,6 @@ async def delete_batch_confirmed(callback: types.CallbackQuery, state: FSMContex
     batch = None
     if user_id in batches:
         for b in batches[user_id]:
-            if b["id"] == batch_id:
                 batch = b
                 break
 
@@ -13053,7 +10628,6 @@ async def delete_batch_confirmed(callback: types.CallbackQuery, state: FSMContex
 
     # Удаляем партию из batches
     if user_id in batches:
-        batches[user_id] = [b for b in batches[user_id] if b["id"] != batch_id]
         save_batches_to_pickle()
         logging.info(f"✅ Партия #{batch_id} удалена из batches")
 
@@ -13065,17 +10639,13 @@ async def delete_batch_confirmed(callback: types.CallbackQuery, state: FSMContex
         if not isinstance(pull, dict):
             continue
 
-        if "batch_ids" in pull and batch_id in pull["batch_ids"]:
-            pull["batch_ids"].remove(batch_id)
             logging.info(f"🗑️ Удален batch_id={batch_id} из pull #{pull_id}")
 
             # Удаляем из pull['batches']
             initial_len = len(pull.get("batches", []))
             pull["batches"] = [
-                b for b in pull.get("batches", []) if b.get("id") != batch_id
             ]
             if len(pull["batches"]) < initial_len:
-                logging.info(f"🗑️ Удален batch из pull['batches']")
 
             # Пересчитываем current_volume
             new_volume = sum(b.get("volume", 0) for b in pull.get("batches", []))
@@ -13083,7 +10653,6 @@ async def delete_batch_confirmed(callback: types.CallbackQuery, state: FSMContex
             logging.info(f"📉 Обновлен current_volume: {pull.get('current_volume')}")
 
             # Восстанавливаем статус, если пул больше не заполнен
-            if pull.get("status") == "filled" and pull["current_volume"] < pull.get(
                 "target_volume", 0
             ):
                 pull["status"] = "open"
@@ -13092,31 +10661,19 @@ async def delete_batch_confirmed(callback: types.CallbackQuery, state: FSMContex
             # Удаляем farmer_id, если у него больше нет партий
             if "farmer_ids" in pull:
                 farmer_batches = [
-                    b for b in pull.get("batches", []) if b.get("farmer_id") == user_id
                 ]
-                if not farmer_batches and user_id in pull["farmer_ids"]:
-                    pull["farmer_ids"].remove(user_id)
                     logging.info(f"🗑️ Удален farmer_id={user_id} из пулла")
 
             removed_from_pulls.append(pull_id)
 
-    # Удаляем участника в pullparticipants для указанных пулов
-    pull_participants = pulls.get("pullparticipants", {})
     for pull_id in removed_from_pulls:
-        if pull_id in pull_participants:
-            old_len = len(pull_participants[pull_id])
-            pull_participants[pull_id] = [
-                p for p in pull_participants[pull_id] if p.get("batch_id") != batch_id
-            ]
-            if len(pull_participants[pull_id]) < old_len:
-                logging.info(
-                    f"🗑️ Удален участник с batch_id={batch_id} из pullparticipants {pull_id}"
-                )
+                ]
+                    logging.info(
+                    )
 
     # Сохраняем данные, если пулы были изменены
     if removed_from_pulls:
         save_pulls_to_pickle()
-        logging.info(f"✅ Пулы сохранены")
 
     # Удаляем из Google Sheets, если интегрировано
     if gs and hasattr(gs, "spreadsheet") and gs.spreadsheet:
@@ -13153,14 +10710,12 @@ async def edit_crop_field(callback: types.CallbackQuery, state: FSMContext):
     farmer_id = None
     for f_id, user_batches in batches.items():
         for b in user_batches:
-            if isinstance(b, dict) and b.get("id") == batch_id:
                 batch = b
                 farmer_id = f_id
                 break
         if batch:
             break
 
-    if not batch or farmer_id != user_id:
         await callback.answer("❌ Партия не найдена", show_alert=True)
         return
 
@@ -13180,7 +10735,6 @@ async def edit_crop_field(callback: types.CallbackQuery, state: FSMContext):
 
     await callback.message.edit_text(
         f"✏️ <b>Редактирование партии #{batch_id}</b>\n\n"
-        f"Выберите новую <b>культуру</b>:",
         reply_markup=keyboard,
         parse_mode="HTML",
     )
@@ -13208,10 +10762,8 @@ async def set_crop_value(callback: types.CallbackQuery, state: FSMContext):
     old_crop = "Неизвестно"
 
     for farmer_id, user_batches in batches.items():
-        if farmer_id != user_id:
             continue
         for batch in user_batches:
-            if isinstance(batch, dict) and batch.get("id") == batch_id:
                 old_crop = batch.get("culture", "Неизвестно")
                 batch["culture"] = new_crop
                 updated = True
@@ -13224,7 +10776,6 @@ async def set_crop_value(callback: types.CallbackQuery, state: FSMContext):
         return
 
     await callback.message.edit_text(
-        f"✅ <b>Культура обновлена!</b>\n\n"
         f"Партия #{batch_id}\n"
         f"Было: {old_crop}\n"
         f"Стало: {new_crop}",
@@ -13240,26 +10791,15 @@ async def start_edit_pull(callback: types.CallbackQuery, state: FSMContext):
     try:
         # ✅ ИСПРАВЛЕНО: парсим через подчеркивание
         pull_id = parse_callback_id(callback.data)
-    except (IndexError, ValueError) as e:
         await callback.answer("❌ Ошибка обработки данных", show_alert=True)
         return
-
-    user_id = callback.from_user.id
-
-    # ✅ ИСПРАВЛЕНО: Получаем пулы из правильного места
-    all_pulls = pulls.get("pulls", {})
-
-    if pull_id not in all_pulls:
-        await callback.answer("❌ Пул не найден", show_alert=True)
         return
 
-    pull = all_pulls.get(pull_id) or all_pulls.get(str(pull_id))
 
     if not pull:
         await callback.answer("❌ Пул не найден", show_alert=True)
         return
 
-    if pull.get("exporter_id") != user_id:
         await callback.answer(
             "❌ Нет доступа к редактированию этого пула", show_alert=True
         )
@@ -13345,15 +10885,10 @@ async def edit_pull_culture(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     pull_id = data.get("editing_pull_id")
 
-    # ✅ ИСПРАВЛЕНО: Получаем пулы из правильного места
-    all_pulls = pulls.get("pulls", {})
-
-    if not pull_id or pull_id not in all_pulls:
         await callback.answer("❌ Ошибка: пул не найден", show_alert=True)
         await state.finish()
         return
 
-    pull = all_pulls.get(pull_id) or all_pulls.get(str(pull_id))
 
     if not pull:
         await callback.answer("❌ Пул не найден", show_alert=True)
@@ -13371,7 +10906,6 @@ async def edit_pull_culture(callback: types.CallbackQuery, state: FSMContext):
     await state.finish()
 
     await callback.message.edit_text(
-        f"✅ <b>Культура обновлена!</b>\n\n"
         f"Пул #{pull_id}\n"
         f"Старое значение: {old_value}\n"
         f"Новое значение: {new_culture}",
@@ -13399,7 +10933,6 @@ async def edit_pull_port(callback: types.CallbackQuery, state: FSMContext):
         "Агрофуд",
         "Моспорт",
         "ЦГП",
-        "ФЗТ",
         "АМП",
         "Армада",
         "Стрелец",
@@ -13411,15 +10944,10 @@ async def edit_pull_port(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     pull_id = data.get("editing_pull_id")
 
-    # ✅ ИСПРАВЛЕНО: Получаем пулы из правильного места
-    all_pulls = pulls.get("pulls", {})
-
-    if not pull_id or pull_id not in all_pulls:
         await callback.answer("❌ Ошибка: пул не найден", show_alert=True)
         await state.finish()
         return
 
-    pull = all_pulls.get(pull_id) or all_pulls.get(str(pull_id))
 
     if not pull:
         await callback.answer("❌ Пул не найден", show_alert=True)
@@ -13437,7 +10965,6 @@ async def edit_pull_port(callback: types.CallbackQuery, state: FSMContext):
     await state.finish()
 
     await callback.message.edit_text(
-        f"✅ <b>Порт обновлён!</b>\n\n"
         f"Пул #{pull_id}\n"
         f"Старое значение: {old_value}\n"
         f"Новое значение: {new_port}",
@@ -13506,15 +11033,10 @@ async def edit_pull_numeric_field(
         data = await state.get_data()
         pull_id = data.get("editing_pull_id")
 
-        # ✅ ИСПРАВЛЕНО: Получаем пулы из правильного места
-        all_pulls = pulls.get("pulls", {})
-
-        if not pull_id or pull_id not in all_pulls:
             await message.answer("❌ Пул не найден")
             await state.finish()
             return
 
-        pull = all_pulls.get(pull_id) or all_pulls.get(str(pull_id))
 
         if not pull:
             await message.answer("❌ Пул не найден")
@@ -13559,7 +11081,6 @@ async def debug_pull_deletion(pullid: int):
 
     # Проверка наличия в pickle
     try:
-        with open(PULLSFILE, "rb") as f:
             saved_pulls = pickle.load(f)
             in_pickle = pullid in saved_pulls.get("pulls", {})
             logging.info(f"В pickle файле: {in_pickle}")
@@ -13592,25 +11113,16 @@ async def debug_pull_deletion(pullid: int):
 async def notify_logistic_pull_closed(pullid: int):
     """Уведомить логистов о закрытии пула"""
     try:
-        # Получаем всех логистов
-        logistics = [
-            uid for uid, user in users.items() if user.get("role") == "logistic"
-        ]
-
-        if pullid not in pulls:
             logging.error(f"Пул {pullid} не найден для уведомления логистов")
             return
 
-        pull = pulls[pullid]
 
         # Формируем сообщение
         message = (
             f"🔔 <b>Пул #{pullid} закрыт и готов к логистике</b>\n\n"
             f"🌾 <b>Культура:</b> {pull.get('culture', 'Н/Д')}\n"
-            f"📦 <b>Объём:</b> {pull.get('targetvolume', 0)} тонн\n"
             f"💰 <b>Цена FOB:</b> ₽{pull.get('price', 0):,.0f}/тонна\n"
             f"🚢 <b>Порт:</b> {pull.get('port', 'Н/Д')}\n\n"
-            f"📋 Вы можете подать заявку на логистику этого пула."
         )
 
         # Отправляем уведомления всем логистам
@@ -13637,26 +11149,15 @@ async def deletepullstart_callback(callback: types.CallbackQuery, state: FSMCont
     """Запрос подтверждения удаления пула"""
     try:
         pullid = parse_callback_id(callback.data)
-    except (IndexError, ValueError) as e:
         await callback.answer("❌ Ошибка: некорректный ID пула", show_alert=True)
         return
-
-    userid = callback.from_user.id
-
-    # ✅ ИСПРАВЛЕНО: Получаем пулы из правильного места
-    all_pulls = pulls.get("pulls", {})
-
-    if pullid not in all_pulls:
-        await callback.answer("❌ Пул не найден", show_alert=True)
         return
 
-    pull = all_pulls.get(pullid) or all_pulls.get(str(pullid))
 
     if not pull:
         await callback.answer("❌ Пул не найден", show_alert=True)
         return
 
-    if pull.get("exporter_id") != userid:
         await callback.answer(
             "❌ Только создатель пула может его удалить", show_alert=True
         )
@@ -13671,12 +11172,10 @@ async def deletepullstart_callback(callback: types.CallbackQuery, state: FSMCont
     )
 
     await callback.message.edit_text(
-        f"<b>⚠️ Подтверждение удаления</b>\n\n"
         f"❓ Вы уверены, что хотите удалить пул №{pullid}?\n\n"
         f"🌾 <b>Культура:</b> {pull.get('culture', 'Н/Д')}\n"
         f"📦 <b>Объём:</b> {pull.get('target_volume', 0)} тонн\n"
         f"💰 <b>Цена FOB:</b> ₽{pull.get('price', 0):,.0f}/тонна\n\n"
-        f"<b>⚠️ Это действие нельзя отменить!</b>",
         reply_markup=keyboard,
         parse_mode="HTML",
     )
@@ -13698,23 +11197,13 @@ async def deletepullconfirmed_callback(
         await callback.answer("❌ Ошибка: некорректный ID пула", show_alert=True)
         logging.error(f"Ошибка парсинга при подтверждении: {e}, data: {callback.data}")
         return
-
-    userid = callback.from_user.id
-
-    # ✅ ИСПРАВЛЕНО: Получаем пулы из правильного места
-    all_pulls = pulls.get("pulls", {})
-
-    if pullid not in all_pulls:
-        await callback.answer("❌ Пул не найден", show_alert=True)
         return
 
-    pull = all_pulls.get(pullid) or all_pulls.get(str(pullid))
 
     if not pull:
         await callback.answer("❌ Пул не найден", show_alert=True)
         return
 
-    if pull.get("exporter_id") != userid:
         await callback.answer(
             "❌ У вас нет прав на удаление этого пула", show_alert=True
         )
@@ -13731,16 +11220,9 @@ async def deletepullconfirmed_callback(
     matches_to_delete = [
         mid
         for mid, m in matches.items()
-        if m.get("pull_id") == pullid or m.get("pullid") == pullid
     ]
     for mid in matches_to_delete:
         del matches[mid]
-
-    # 2. ✅ ИСПРАВЛЕНО: Получаем и удаляем участников из pulls['pullparticipants']
-    pullparticipants = pulls.get("pullparticipants", {})
-    participants = pullparticipants.get(pullid, []) or pullparticipants.get(
-        str(pullid), []
-    )
 
     if pullid in pullparticipants:
         del pullparticipants[pullid]
@@ -13787,11 +11269,9 @@ async def deletepullconfirmed_callback(
             await bot.send_message(
                 farmer_id,
                 f"<b>🗑 Пул №{pullid} был удалён</b>\n\n"
-                f"Экспортёр отменил пул:\n"
                 f"🌾 {pull_culture}\n"
                 f"📦 {pull_volume:.1f} т\n"
                 f"💰 ₽{pull_price:,.0f}/т\n\n"
-                f'Ваша партия возвращена в статус "Активна"',
                 parse_mode="HTML",
             )
         except Exception as e:
@@ -13802,10 +11282,7 @@ async def deletepullconfirmed_callback(
         InlineKeyboardButton("⬅️ Назад", callback_data="back_to_pulls")
     )
 
-    # Уведомляем логистов
     await callback.message.edit_text(
-        f"✅ <b>Пул удалён</b>\n\n"
-        f"🗑️ <b>Удалено:</b>\n"
         f"🌾 Культура: {pull_culture}\n"
         f"📦 Объём: {pull_volume:.1f} т\n"
         f"💰 Цена: ₽{pull_price:,.0f}/т\n"
@@ -13816,7 +11293,6 @@ async def deletepullconfirmed_callback(
         parse_mode="HTML",
     )
     logging.info(
-        f"✅ Пул {pullid} удалён пользователем {userid}. Участников: {len(participants)}, матчей: {len(matches_to_delete)}"
     )
 
     await callback.answer("✅ Пул удалён")
@@ -13837,7 +11313,6 @@ async def canceldeletepull_callback(callback: types.CallbackQuery, state: FSMCon
     # ✅ Если pull_id есть - возвращаемся к деталям пула
     if pull_id:
         all_pulls = pulls.get("pulls", {})
-        pull = all_pulls.get(pull_id)
 
         if pull:
             # Показываем детали пула
@@ -13875,97 +11350,22 @@ async def canceldeletepull_callback(callback: types.CallbackQuery, state: FSMCon
     await callback.answer()
 
 
-@dp.callback_query_handler(lambda c: c.data.startswith("confirmclosepull_"), state="*")
-async def confirm_close_pull_callback(callback_query: types.CallbackQuery):
-    """Подтвердить закрытие пулла и уведомить всех участников и логистов"""
     try:
-        pull_id = int(callback_query.data.split("_")[3])
-    except (IndexError, ValueError) as e:
-        await callback_query.answer("❌ Ошибка: неверный ID пулла", show_alert=True)
         return
 
-    user_id = callback_query.from_user.id
-
-    if pull_id not in pulls.get("pulls", {}):
-        await callback_query.answer("❌ Пулл не найден", show_alert=True)
         return
-
-    pull = pulls["pulls"][pull_id]
 
     # Проверяем право на закрытие
-    if pull.get("exporter_id") != user_id:
-        await callback_query.answer(
-            "⚠️ Только владелец может закрыть пулл", show_alert=True
-        )
         return
 
-    # Изменяем статус на 'closed'
-    pull["status"] = "closed"
-    pull["closedat"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    save_pulls_to_pickle()
 
-    # Google Sheets
-    if gs and gs.spreadsheet:
-        try:
-            gs.updatepullinsheets(pull)
-        except Exception as e:
-            logging.error(f"Ошибка обновления пулла в Google Sheets: {e}")
 
-    # Составляем уведомление
-    close_text = (
-        f"🔒 <b>Пулл #{pull_id} закрыт</b>\n\n"
-        f"🌾 {pull.get('culture', 'N/A')}\n"
-        f"📦 {pull.get('targetvolume', 0)} т\n"
-        f"💰 {pull.get('price', 0)} ₽/т\n\n"
-        f"Спасибо за участие!"
     )
 
-    # Все логисты платформы
-    logist_ids = [uid for uid, u in users.items() if u.get("role") == "logistic"]
-    # Все фермеры - участники пула
-    participant_list = pullparticipants.get(pull_id, [])
-    farmer_ids = [p.get("farmer_id") for p in participant_list if p.get("farmer_id")]
 
-    # Для логирования!
-    all_notify_ids = set(farmer_ids) | set(logist_ids)
-    logging.info(
-        f"[CONFIRM CLOSE DEBUG] pull_id={pull_id} logist_ids={logist_ids} "
-        f"farmer_ids={farmer_ids} all_notify_ids={list(all_notify_ids)}"
-    )
 
-    sent_count = 0
-    failed_ids = []
-    for notify_id in all_notify_ids:
-        try:
-            await bot.send_message(notify_id, close_text, parse_mode="HTML")
-            logging.info(
-                f"[CONFIRM CLOSE DEBUG] Отправлено уведомление user_id={notify_id}"
-            )
-            sent_count += 1
-        except Exception as e:
-            logging.error(
-                f"[CONFIRM CLOSE ERROR] Ошибка рассылки user_id={notify_id}: {e}"
-            )
-            failed_ids.append(notify_id)
+    try:
 
-    # Весь итог по рассылке:
-    logging.info(
-        f"[CONFIRM CLOSE RESULT] Итог: {sent_count} уведомлений отправлено, "
-        f"{len(failed_ids)} не отправлено: {failed_ids}"
-    )
-
-    await callback_query.message.edit_text(
-        f"✅ <b>Пулл #{pull_id} успешно закрыт!</b>\n\n"
-        f"🌾 {pull.get('culture', 'N/A')}\n"
-        f"📦 {pull.get('targetvolume', 0)} т\n"
-        f"💰 {pull.get('price', 0)} ₽/т\n\n"
-        f"Отправлено уведомлений: {sent_count} (логисты: {len(logist_ids)}, фермеры: {len(farmer_ids)})",
-        parse_mode="HTML",
-    )
-    await callback_query.answer("✅ Пулл закрыт!")
-    logging.info(
-        f"Пулл {pull_id} закрыт пользователем {user_id}, уведомлений отправлено {sent_count}"
-    )
 
 
 @dp.callback_query_handler(lambda c: c.data == "cancel_delete_pull", state="*")
@@ -13986,10 +11386,8 @@ async def get_partner_contacts_handler(callback: types.CallbackQuery):
 
     # Ищем сделку, где пользователь участвует
     for deal_id, deal in deals.items():
-        if deal.get("logistic_id") == user_id:
             # Логист - получаем контакты экспортёра
             exporter_id = deal.get("exporter_id")
-            exporter = users.get(exporter_id)
             if exporter:
                 partner_info = "📦 <b>Контакты экспортёра:</b>\n\n"
                 partner_info += f"📝 {exporter.get('name', 'Неизвестно')}\n"
@@ -13998,10 +11396,8 @@ async def get_partner_contacts_handler(callback: types.CallbackQuery):
                 partner_info += f"📍 {exporter.get('region', 'Не указан')}\n"
                 break
 
-        elif deal.get("expeditor_id") == user_id:
             # Экспедитор - получаем контакты экспортёра
             exporter_id = deal.get("exporter_id")
-            exporter = users.get(exporter_id)
             if exporter:
                 partner_info = "📦 <b>Контакты экспортёра:</b>\n\n"
                 partner_info += f"📝 {exporter.get('name', 'Неизвестно')}\n"
@@ -14023,15 +11419,10 @@ async def complete_deal(callback: types.CallbackQuery):
     """Завершение сделки"""
     deal_id = parse_callback_id(callback.data)
 
-    if deal_id not in deals:
         await callback.answer("❌ Сделка не найдена", show_alert=True)
         return
-
-    deal = deals[deal_id]
     user_id = callback.from_user.id
-    if userid != deal.get("exporterid") and userid not in deal.get("farmerids", []):
         await callback.answer(
-            "⚠️ Только участники сделки могут её завершить", showalert=True
         )
         return
 
@@ -14044,13 +11435,7 @@ async def complete_deal(callback: types.CallbackQuery):
     )
 
     await callback.message.edit_text(
-        f"✅ <b>Подтверждение завершения</b>\n\n"
         f"Вы уверены, что хотите завершить сделку #{deal_id}?\n\n"
-        f"После завершения:\n"
-        f"• Сделка переместится в архив\n"
-        f"• Все участники получат уведомление\n"
-        f"• Статистика будет обновлена\n\n"
-        f"<b>Это действие нельзя отменить!</b>",
         reply_markup=keyboard,
         parse_mode="HTML",
     )
@@ -14064,21 +11449,16 @@ async def confirm_complete_deal(callback: types.CallbackQuery):
     """Подтверждение завершения сделки"""
     deal_id = parse_callback_id(callback.data)
 
-    if deal_id not in deals:
         await callback.answer("❌ Сделка не найдена", show_alert=True)
         return
 
-    deal = deals[deal_id]
     deal["status"] = "completed"
     deal["completed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    save_pulls_to_pickle()
     await notify_deal_participants(deal_id, "✅ Сделка завершена!")
 
     await callback.message.edit_text(
         f"🎉 <b>Сделка #{deal_id} завершена!</b>\n\n"
-        f"Все участники уведомлены о завершении сделки.\n"
-        f"Спасибо за использование платформы Exportum!",
         parse_mode="HTML",
     )
     await callback.answer("✅ Сделка завершена")
@@ -14089,13 +11469,9 @@ async def cancel_deal(callback: types.CallbackQuery):
     """Отмена сделки"""
     deal_id = parse_callback_id(callback.data)
 
-    if deal_id not in deals:
         await callback.answer("❌ Сделка не найдена", show_alert=True)
         return
-
-    deal = deals[deal_id]
     user_id = callback.from_user.id
-    if deal.get("exporter_id") != user_id:
         await callback.answer(
             "❌ Только экспортёр может отменить сделку", show_alert=True
         )
@@ -14110,13 +11486,7 @@ async def cancel_deal(callback: types.CallbackQuery):
     )
 
     await callback.message.edit_text(
-        f"❌ <b>Подтверждение отмены</b>\n\n"
         f"Вы уверены, что хотите отменить сделку #{deal_id}?\n\n"
-        f"После отмены:\n"
-        f"• Сделка будет помечена как отменённая\n"
-        f"• Все участники получат уведомление\n"
-        f"• Статистика будет обновлена\n\n"
-        f"<b>Это действие нельзя отменить!</b>",
         reply_markup=keyboard,
         parse_mode="HTML",
     )
@@ -14130,20 +11500,15 @@ async def confirm_cancel_deal(callback: types.CallbackQuery):
     """Подтверждение отмены сделки"""
     deal_id = parse_callback_id(callback.data)
 
-    if deal_id not in deals:
         await callback.answer("❌ Сделка не найдена", show_alert=True)
         return
 
-    deal = deals[deal_id]
     deal["status"] = "cancelled"
-    deal["completed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    save_pulls_to_pickle()
     await notify_deal_participants(deal_id, "❌ Сделка отменена")
 
     await callback.message.edit_text(
         f"❌ <b>Сделка #{deal_id} отменена!</b>\n\n"
-        f"Все участники уведомлены об отмене сделки.",
         parse_mode="HTML",
     )
     await callback.answer("✅ Сделка отменена")
@@ -14160,7 +11525,6 @@ async def cancel_deal_action(callback: types.CallbackQuery):
 
 async def notify_deal_participants(deal_id: int, message: str):
     """Уведомление всех участников сделки"""
-    deal = deals.get(deal_id)
     if not deal:
         return
 
@@ -14190,16 +11554,12 @@ async def deal_logistics(callback: types.CallbackQuery):
     """Управление логистикой для сделки"""
     deal_id = parse_callback_id(callback.data)
 
-    if deal_id not in deals:
         await callback.answer("❌ Сделка не найдена", show_alert=True)
         return
-
-    deal = deals[deal_id]
 
     text = f"🚚 <b>Логистика сделки #{deal_id}</b>\n\n"
 
     if deal.get("logistic_id"):
-        logistic = users.get(deal["logistic_id"])
         if logistic:
             text += "✅ <b>Логист назначен:</b>\n"
             text += f"👤 {logistic.get('name', 'Неизвестно')}\n"
@@ -14215,7 +11575,6 @@ async def deal_logistics(callback: types.CallbackQuery):
         text += "Для назначения логиста создайте заявку на логистику.\n"
 
     if deal.get("expeditor_id"):
-        expeditor = users.get(deal["expeditor_id"])
         if expeditor:
             text += "\n✅ <b>Экспедитор назначен:</b>\n"
             text += f"👤 {expeditor.get('name', 'Неизвестно')}\n"
@@ -14241,22 +11600,15 @@ async def deal_logistics(callback: types.CallbackQuery):
 
 @dp.callback_query_handler(lambda c: c.data.startswith("pullparticipants:"), state="*")
 async def show_pullparticipants(callback: types.CallbackQuery):
-    """Показать участников пула"""
     try:
         pull_id = parse_callback_id(callback.data)
     except (IndexError, ValueError) as e:
         await callback.answer("❌ Ошибка обработки данных", show_alert=True)
         return
 
-    if pull_id not in pulls.get("pulls", {}):
         await callback.answer("❌ Пул не найден", show_alert=True)
         return
 
-    pull = pulls["pulls"][pull_id]
-    participants = pullparticipants.get(pull_id, [])
-
-    text = f"👥 <b>Участники пула #{pull_id}</b>\n\n"
-    text += f"🌾 {pull['culture']} • {pull['target_volume']} т\n\n"
 
     if not participants:
         text += "🤷‍♂️ У пула пока нет участников"
@@ -14264,23 +11616,14 @@ async def show_pullparticipants(callback: types.CallbackQuery):
         total_participant_volume = 0
         for i, participant in enumerate(participants, 1):
             farmer_id = participant.get("farmer_id")
-            farmer = users.get(farmer_id)
             batch_id = participant.get("batch_id")
             volume = participant.get("volume", 0)
             total_participant_volume += volume
 
-            farmer_name = farmer.get("name", "Неизвестно") if farmer else "Неизвестно"
 
-            text += f"{i}. 👤 {farmer_name}\n"
-            text += f"   📦 Партия #{batch_id}: {volume} т\n"
-            text += f"   📍 {farmer.get('region', 'Не указан') if farmer else 'Не указан'}\n\n"
 
         fill_percentage = (
-            (total_participant_volume / pull["target_volume"] * 100)
-            if pull["target_volume"] > 0
-            else 0
         )
-        text += f"📊 <b>Итого:</b> {total_participant_volume:.0f}/{pull['target_volume']:.0f} т ({fill_percentage:.1f}%)"
 
     keyboard = InlineKeyboardMarkup()
     keyboard.add(
@@ -14296,24 +11639,18 @@ async def pull_logistics_menu(callback: types.CallbackQuery):
     """Меню логистики для пула"""
     try:
         pull_id = parse_callback_id(callback.data)
-    except (IndexError, ValueError) as e:
         await callback.answer("❌ Ошибка обработки данных", show_alert=True)
         return
 
-    if pull_id not in pulls.get("pulls", {}):
         await callback.answer("❌ Пул не найден", show_alert=True)
         return
 
-    pull = pulls["pulls"][pull_id]
 
     text = f"🚚 <b>Логистика пула #{pull_id}</b>\n\n"
-    text += f"🌾 {pull['culture']} • {pull['target_volume']} т • {pull['port']}\n\n"
 
     keyboard = InlineKeyboardMarkup(row_width=1)
-    keyboard.add(
-        InlineKeyboardButton(
-            "📋 Создать заявку на логистику", callback_data=f"create_shipping:{pull_id}"
-        ),
+        keyboard.add(
+            InlineKeyboardButton(
         InlineKeyboardButton(
             "👀 Активные заявки", callback_data=f"view_shipping_requests:{pull_id}"
         ),
@@ -14338,16 +11675,13 @@ async def create_shipping_from_pull(callback: types.CallbackQuery, state: FSMCon
         await callback.answer("❌ Ошибка обработки данных", show_alert=True)
         return
 
-    if pull_id not in pulls.get("pulls", {}):
         await callback.answer("❌ Пул не найден", show_alert=True)
         return
 
-    pull = pulls["pulls"][pull_id]
     await state.update_data(pull_id=pull_id)
 
     await callback.message.edit_text(
         f"🚚 <b>Заявка на логистику для пула #{pull_id}</b>\n\n"
-        f"🌾 {pull.get('culture', '')} • {pull.get('target_volume', 0):.0f} т • {pull.get('port', '')}\n\n"
         "<b>Шаг 1 из 5</b>\n\n"
         "Введите пункт отправки (город/регион):",
         parse_mode="HTML",
@@ -14361,9 +11695,6 @@ async def create_shipping_from_pull(callback: types.CallbackQuery, state: FSMCon
 async def view_logistics_contacts(callback: types.CallbackQuery):
     """Показать контакты логистов с реквизитами"""
 
-    logistics_users = [
-        user for user in users.values() if user.get("role") == "logistic"
-    ]
 
     if not logistics_users:
         await callback.answer("🤷‍♂️ В системе пока нет логистов", show_alert=True)
@@ -14411,22 +11742,17 @@ async def show_logistics_card(message: types.Message):
     """Показать карточку логиста/экспедитора"""
     user_id = message.from_user.id
 
-    if user_id not in users:
         await message.answer(
             "❌ Пользователь не найден. Пройдите регистрацию командой /start"
         )
         return
 
-    user = users[user_id]
     role = user.get("role")
 
-    if role not in ["logistic", "expeditor"]:
         await message.answer("❌ Эта функция доступна только логистам и экспедиторам")
         return
 
     # Формируем карточку
-    role_emoji = "🚚" if role == "logistic" else "🚛"
-    role_name = "Логист" if role == "logistic" else "Экспедитор"
 
     text = f"{role_emoji} <b>Моя карточка ({role_name})</b>\n\n"
     text += f"👤 Имя: {user.get('name', 'Не указано')}\n"
@@ -14441,22 +11767,14 @@ async def show_logistics_card(message: types.Message):
         text += f"📋 О компании:\n{user['company_details'][:300]}\n\n"
 
     # Статистика
-    if role == "logistic":
-        # Считаем заявки логиста
-        logistics_requests = [
-            req for req in shipping_requests.values() if req.get("logist_id") == user_id
-        ]
+            ]
         active_requests = [
-            req for req in logistics_requests if req.get("status") == "active"
         ]
         text += "📊 <b>Статистика:</b>\n"
-        text += f"  • Всего заявок: {len(logistics_requests)}\n"
         text += f"   • Активных: {len(active_requests)}\n"
     else:  # expeditor
         # Статистика экспедитора
         text += "📊 <b>Статистика:</b>\n"
-        text += "   • Оформленных сделок: 0\n"
-        text += "   • В процессе: 0\n"
 
     keyboard = InlineKeyboardMarkup()
     keyboard.add(
@@ -14468,1049 +11786,258 @@ async def show_logistics_card(message: types.Message):
 
 @dp.message_handler(lambda m: m.text == "🚚 Активные заявки", state="*")
 async def show_active_requests(message: types.Message, state: FSMContext):
-    """Показать активные заявки на доставку - ОБЪЕДИНЁННО для логиста"""
     await state.finish()
     user_id = message.from_user.id
 
-    if user_id not in users:
         await message.answer(
             "❌ Пользователь не найден. Пройдите регистрацию командой /start"
         )
         return
 
-    user = users[user_id]
     role = user.get("role")
 
-    # Фильтруем заявки в зависимости от роли
-    if role == "logistic":
-        # ✅ ЛОГИСТ - НОВАЯ КРАСИВАЯ ВЕРСИЯ С ФОРМАТИРОВАНИЕМ
         all_requests = []
 
-        # 📊 ЛОГИРОВАНИЕ
-        logging.info(f"🔍 DEBUG: shipping_requests ({len(shipping_requests)} всего)")
         for req_id, req in shipping_requests.items():
-            status = req.get("status")
-            logging.info(f"   - ID {req_id}: status='{status}'")
-            if status == "active":
-                all_requests.append(
-                    {
-                        "id": req_id,
-                        "source": "exporter",
-                        "culture": req.get("culture", "—"),
-                        "volume": req.get("volume", 0),
-                    }
-                )
+            all_requests.append(
+                {
+                    "source": "exporter",
+                    "culture": req.get("culture", "—"),
+                }
+            )
 
-        logging.info(
-            f"🔍 DEBUG: farmer_logistics_requests ({len(farmer_logistics_requests)} всего)"
-        )
         for req_id, req in farmer_logistics_requests.items():
-            status = req.get("status")
-            logging.info(f"   - ID {req_id}: status='{status}'")
-            if status == "active":
-                all_requests.append(
-                    {
-                        "id": req_id,
-                        "source": "farmer",
-                        "culture": req.get("culture", "—"),
-                        "volume": req.get("volume", 0),
-                    }
-                )
+            all_requests.append(
+                {
+                    "source": "farmer",
+                    "culture": req.get("culture", "—"),
+                }
+            )
 
-        logging.info(f"✅ ИТОГО активных заявок: {len(all_requests)}")
+
+
+        text = (
+        )
         for req in all_requests:
-            logging.info(
-                f"   - {req['source'].upper()}: #{req['id']} ({req['culture']})"
-            )
-
-        # 📊 ФОРМИРУЕМ КРАСИВЫЙ ТЕКСТ
-        text = f"""🚚 <b>Активные заявки</b>
-
-
-
-📋 Всего заявок: {len(all_requests)}
-🚛 От экспортёров | 🌾 От фермеров
-
-
-
-Выберите заявку для просмотра деталей и создания предложения:
-"""
-
-        # 🎯 КНОПКИ С ЗАЯВКАМИ
-        keyboard = InlineKeyboardMarkup(row_width=1)
-
-        if not all_requests:
-            text = (
-                "🚚 <b>Активные заявки</b>\n\n❌ На данный момент нет активных заявок."
-            )
-        else:
-            for req in all_requests:
-                if req["source"] == "exporter":
-                    emoji = "🚛"
-                else:
-                    emoji = "🌾"
-
-                label = f"{emoji} {req['culture']} • {req['volume']:.0f}т"
+                emoji = "🚛"
+            else:
                 keyboard.add(
                     InlineKeyboardButton(
-                        label, callback_data=f"view_request:{req['source']}:{req['id']}"
                     )
                 )
         await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
 
-    elif role == "exporter":
-        # Экспортёр видит СВОИ заявки
-        user_requests = [
-            {"req": req, "source": "exporter"}
-            for req in shipping_requests.values()
-            if req.get("exporter_id") == user_id
-        ]
         title = "📋 <b>Мои заявки на доставку</b>"
-        show_buttons = False
 
-    elif role == "expeditor":
-        # Экспедитор видит заявки, которые ему назначены
         user_requests = []
-        title = "🚛 <b>Мои заявки на оформление</b>"
-        show_buttons = False
     else:
         await message.answer("❌ Эта функция недоступна для вашей роли")
         return
 
-    # ОСТАЛЬНОЕ ДЛЯ ЭКСПОРТЁРА И ЭКСПЕДИТОРА (не меняем)
-    if role != "logistic":
-        if not user_requests:
-            msg_text = f"{title}\n\n"
-            if role == "logistic":
-                msg_text += "📋 Активных заявок нет\n\n"
-                msg_text += (
-                    "Как только экспортёры или фермеры создадут заявки на доставку, "
-                )
-                msg_text += "они появятся здесь. Вы получите уведомление."
-            else:
-                msg_text += "❌ У вас нет заявок"
+    if not user_requests:
+        return
 
-            await message.answer(
-                msg_text,
-                reply_markup=logistic_keyboard() if role == "logistic" else None,
-                parse_mode="HTML",
-            )
-            return
+    if show_buttons:
+        keyboard = InlineKeyboardMarkup(row_width=1)
+        for item in user_requests[:20]:
+            req = item["req"]
+            source = item["source"]
 
-        if show_buttons:
-            keyboard = InlineKeyboardMarkup(row_width=1)
+            culture = req.get("culture", "N/A")
+            volume = req.get("volume", 0) or 0
 
-            for item in user_requests[:20]:
-                req = item["req"]
-                source = item["source"]
 
-                req_id = req.get("id", "N/A")
-                culture = req.get("culture", "N/A")
-                volume = req.get("volume", 0) or 0
-                route_from = req.get("route_from", "—")
-                route_to = req.get("route_to", "—")
-
-                emoji = "🚛" if source == "exporter" else "🌾"
-                source_label = "Э" if source == "exporter" else "Ф"
-
-                btn_text = f"{emoji} [{source_label}] #{req_id} | {culture} | {volume:.0f}т | {route_from}→{route_to}"
                 keyboard.add(
                     InlineKeyboardButton(
                         btn_text, callback_data=f"view_request:{source}:{req_id}"
                     )
                 )
 
-            await message.answer(
-                f"{title}\n\n"
-                f"📋 Всего заявок: <b>{len(user_requests)}</b>\n"
-                f"🚛 От экспортёров | 🌾 От фермеров\n\n"
-                f"Выберите заявку для просмотра деталей и создания предложения:",
-                reply_markup=keyboard,
-                parse_mode="HTML",
-            )
-        else:
-            text = f"{title}\n\n"
-
-            for idx, item in enumerate(user_requests[:10], 1):
-                req = item["req"]
-                req_id = req.get("id", "N/A")
-                volume = req.get("volume", 0) or 0
-                route_from = req.get("route_from", "Не указано")
-                route_to = req.get("route_to", "Не указано")
-                culture = req.get("culture", "N/A")
-                status = req.get("status", "unknown")
-
-                text += f"{idx}. 📦 Заявка #{req_id}\n"
-                text += f"   • Культура: {culture}\n"
-                text += f"   • Объём: {volume:.0f} т\n"
-                text += f"   • Маршрут: {route_from} → {route_to}\n"
-                text += f"   • Статус: {status}\n\n"
-
-            if len(user_requests) > 10:
-                text += f"<i>... и ещё {len(user_requests) - 10} заявок</i>\n\n"
-
-            await message.answer(text, parse_mode="HTML")
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# ЭКСПЕДИТОР: МОЯ КАРТОЧКА
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-@dp.message_handler(lambda m: m.text == "💳 Моя карточка", state="*")
-async def show_expeditor_card(message: types.Message, state: FSMContext):
-    """Экспедитор смотрит/редактирует свою карточку"""
-    await state.finish()
-
-    user_id = message.from_user.id
-
-    if user_id not in users or users[user_id].get("role") != "expeditor":
-        await message.answer("❌ Эта функция доступна только экспедиторам")
-        return
-
-    # Получаем карточку экспедитора
-    card = expeditor_cards.get(user_id)
-
-    if not card:
-        # Карточки нет - предлагаем создать
         await message.answer(
-            "💳 <b>Моя карточка экспедитора</b>\n\n"
-            "У вас ещё нет карточки.\n"
-            "Создайте карточку чтобы логисты могли найти вас и поручать доставки!\n\n"
-            "📋 <b>В карточке указывается:</b>\n"
-            "• Тип транспорта\n"
-            "• Грузоподъёмность\n"
-            "• Регионы работы\n"
-            "• Стоимость услуг\n"
-            "• Описание",
-            reply_markup=InlineKeyboardMarkup(row_width=1).add(
-                InlineKeyboardButton(
-                    "➕ Создать карточку", callback_data="create_expeditor_card"
-                )
-            ),
-            parse_mode="HTML",
-        )
-        return
-
-    transport = card.get("transport_type", "Не указан")
-    emoji = get_vehicle_emoji(transport)
-    # Показываем карточку
-    text = (
-        f"💳 <b>Моя карточка экспедитора</b>\n\n"
-        f"{emoji} <b>Тип транспорта:</b> {transport}\n"
-        f"📦 <b>Грузоподъёмность:</b> {card.get('capacity', 0)} т\n"
-        f"📍 <b>Регионы работы:</b> {card.get('regions', 'Не указаны')}\n"
-        f"💰 <b>Цена за км:</b> {card.get('price_per_km', 0):.2f} ₽/км\n"
-        f"📝 <b>Описание:</b>\n{card.get('description', 'Не указано')}\n\n"
-        f"📅 <b>Создана:</b> {card.get('created_at', 'Н/Д')}\n"
-        f"👁 <b>Просмотров:</b> {card.get('views', 0)}"
-    )
-
-    keyboard = InlineKeyboardMarkup(row_width=1)
-    keyboard.add(
-        InlineKeyboardButton("✏️ Редактировать", callback_data="edit_expeditor_card"),
-        InlineKeyboardButton(
-            "🗑 Удалить карточку", callback_data="delete_expeditor_card"
-        ),
-    )
-
-    await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# СОЗДАНИЕ КАРТОЧКИ - ШАГ 1: ТИП ТРАНСПОРТА
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-@dp.callback_query_handler(lambda c: c.data == "create_expeditor_card", state="*")
-async def create_expeditor_card_start(callback: types.CallbackQuery, state: FSMContext):
-    """Начало создания карточки экспедитора"""
-    await state.finish()
-
-    keyboard = InlineKeyboardMarkup(row_width=2)
-    keyboard.add(
-        InlineKeyboardButton("🚛 Фура", callback_data="etype_Фура"),
-        InlineKeyboardButton("🚚 Грузовик", callback_data="etype_Грузовик"),
-        InlineKeyboardButton("🚐 Газель", callback_data="etype_Газель"),
-        InlineKeyboardButton("🚂 Ж/д вагон", callback_data="etype_Ж/д вагон"),
-        InlineKeyboardButton("🚢 Баржа", callback_data="etype_Баржа"),
-        InlineKeyboardButton("✏️ Свой вариант", callback_data="etype_custom"),
-    )
-    keyboard.add(
-        InlineKeyboardButton(
-            "❌ Отмена", callback_data="cancel_expeditor_card_creation"
-        )
-    )
-
-    await callback.message.edit_text(
-        "💳 <b>Создание карточки экспедитора</b>\n\n"
-        "Шаг 1 из 5\n\n"
-        "🚛 Выберите тип транспорта:",
-        reply_markup=keyboard,
-        parse_mode="HTML",
-    )
-    await callback.answer()
-
-
-@dp.callback_query_handler(lambda c: c.data.startswith("etype_"), state="*")
-async def create_expeditor_card_vehicle_type(
-    callback: types.CallbackQuery, state: FSMContext
-):
-    """Обработка выбора типа транспорта"""
-    vehicle_type = callback.data.split("_")[1]
-
-    if vehicle_type == "custom":
-        await callback.message.edit_text(
-            "💳 <b>Создание карточки экспедитора</b>\n\n"
-            "Шаг 1 из 5\n\n"
-            "🚛 Введите тип транспорта:\n"
-            "(например: Рефрижератор, Контейнеровоз)",
-            parse_mode="HTML",
-        )
-        await ExpeditorCardStates.vehicle_type.set()
-    else:
-        await state.update_data(vehicle_type=vehicle_type)
-        await callback.message.edit_text(
-            "💳 <b>Создание карточки экспедитора</b>\n\n"
-            "Шаг 2 из 5\n\n"
-            f"✅ Тип транспорта: {vehicle_type}\n\n"  # ← ИСПРАВЛЕНО!
-            "📦 Введите грузоподъёмность (в тоннах):\n"
-            "(например: 20)",
-            parse_mode="HTML",
-        )
-        await ExpeditorCardStates.capacity.set()
-
-    await callback.answer()
-
-
-@dp.message_handler(state=ExpeditorCardStates.vehicle_type)
-async def expeditor_card_vehicle_custom(message: types.Message, state: FSMContext):
-    """Ввод своего варианта транспорта"""
-    vehicle_type = message.text.strip()
-
-    await state.update_data(vehicle_type=vehicle_type)
-    await message.answer(
-        "💳 <b>Создание карточки экспедитора</b>\n\n"
-        "Шаг 2 из 5\n\n"
-        f"✅ Тип транспорта: {transport}\n\n"
-        "📦 Введите грузоподъёмность (в тоннах):\n"
-        "(например: 20)",
-        parse_mode="HTML",
-    )
-    await ExpeditorCardStates.capacity.set()
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# ШАГ 2: ГРУЗОПОДЪЁМНОСТЬ
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-@dp.message_handler(state=ExpeditorCardStates.capacity)
-async def expeditor_card_capacity(message: types.Message, state: FSMContext):
-    """Ввод грузоподъёмности"""
-    try:
-        capacity = float(message.text.replace(",", "."))
-        if capacity <= 0:
-            raise ValueError
-    except ValueError:
-        await message.answer("❌ Неверный формат!\n" "Введите число (например: 20)")
-        return
-
-    await state.update_data(capacity=capacity)
-
-    data = await state.get_data()
-
-    await message.answer(
-        "💳 <b>Создание карточки экспедитора</b>\n\n"
-        "Шаг 3 из 5\n\n"
-        f"✅ Тип: {data['vehicle_type']}\n"
-        f"✅ Грузоподъёмность: {capacity} т\n\n"
-        "📍 Введите регионы работы:\n"
-        "(например: Краснодарский край, Ростовская область)",
-        parse_mode="HTML",
-    )
-    await ExpeditorCardStates.regions.set()
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# ШАГ 3: РЕГИОНЫ
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-@dp.message_handler(state=ExpeditorCardStates.regions)
-async def expeditor_card_regions(message: types.Message, state: FSMContext):
-    """Ввод регионов работы"""
-    regions = message.text.strip()
-
-    await state.update_data(regions=regions)
-
-    data = await state.get_data()
-
-    await message.answer(
-        "💳 <b>Создание карточки экспедитора</b>\n\n"
-        "Шаг 4 из 5\n\n"
-        f"✅ Тип: {data['vehicle_type']}\n"
-        f"✅ Грузоподъёмность: {data['capacity']} т\n"
-        f"✅ Регионы: {regions}\n\n"
-        "💰 Введите стоимость за км (₽/км):\n"
-        "(например: 25.50)",
-        parse_mode="HTML",
-    )
-    await ExpeditorCardStates.price_per_km.set()
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# ШАГ 4: ЦЕНА
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-@dp.message_handler(state=ExpeditorCardStates.price_per_km)
-async def expeditor_card_price(message: types.Message, state: FSMContext):
-    """Ввод цены за км"""
-    try:
-        price = float(message.text.replace(",", "."))
-        if price <= 0:
-            raise ValueError
-    except ValueError:
-        await message.answer("❌ Неверный формат!\n" "Введите число (например: 25.50)")
-        return
-
-    await state.update_data(price_per_km=price)
-
-    data = await state.get_data()
-
-    await message.answer(
-        "💳 <b>Создание карточки экспедитора</b>\n\n"
-        "Шаг 5 из 5\n\n"
-        f"✅ Тип: {data['vehicle_type']}\n"
-        f"✅ Грузоподъёмность: {data['capacity']} т\n"
-        f"✅ Регионы: {data['regions']}\n"
-        f"✅ Цена: {price:.2f} ₽/км\n\n"
-        "📝 Введите описание (опыт работы, особенности):\n"
-        "или /skip чтобы пропустить",
-        parse_mode="HTML",
-    )
-    await ExpeditorCardStates.description.set()
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# ШАГ 5: ОПИСАНИЕ (ФИНАЛ) - СОХРАНЕНИЕ КАРТОЧКИ
-# ═══════════════════════════════════════════════════════════════════════════
-@dp.message_handler(lambda m: m.text == "/skip", state=ExpeditorCardStates.description)
-@dp.message_handler(state=ExpeditorCardStates.description)
-async def expeditor_card_description(message: types.Message, state: FSMContext):
-    """Ввод описания и сохранение карточки"""
-
-    try:
-        if message.text != "/skip":
-            description = message.text.strip()
-        else:
-            description = "Не указано"
-
-        await state.update_data(description=description)
-        data = await state.get_data()
-        user_id = message.from_user.id
-
-        logging.info(f"📝 Создание карточки для user_id={user_id}")
-
-        # ════════════════════════════════════════════════════════════════
-        # СОЗДАЁМ КАРТОЧКУ
-        # ════════════════════════════════════════════════════════════════
-
-        expeditor_cards[user_id] = {
-            "user_id": user_id,
-            "vehicle_type": data["vehicle_type"],
-            "capacity": data["capacity"],
-            "regions": data["regions"],
-            "price_per_km": data["price_per_km"],
-            "description": description,
-            "status": "active",
-            "created_at": datetime.now().strftime("%d.%m.%Y %H:%M"),
-            "views": 0,
-            "user_name": users.get(user_id, {}).get("name", "Не указано"),
-            "company": users.get(user_id, {}).get("company_details", "Не указана"),
-            "phone": users.get(user_id, {}).get("phone", "Не указан"),
-            "email": users.get(user_id, {}).get("email", "Не указан"),
-            "inn": users.get(user_id, {}).get("inn", "Не указан"),  # ✅
-            "ogrn": users.get(user_id, {}).get("ogrn", "Не указан"),  # ✅
-        }
-
-        # ════════════════════════════════════════════════════════════════
-        # СОХРАНЯЕМ
-        # ════════════════════════════════════════════════════════════════
-
-        save_data()
-
-        logging.info(f"✅ Экспедитор {user_id} создал карточку")
-
-        # ════════════════════════════════════════════════════════════════
-        # ПОКАЗЫВАЕМ РЕЗУЛЬТАТ
-        # ════════════════════════════════════════════════════════════════
-
-        card = expeditor_cards[user_id]
-        transport = data.get("vehicle_type", "Не указан")
-        emoji = get_vehicle_emoji(transport)
-
-        text = (
-            "✅ <b>Карточка создана!</b>\n\n"
-            f"{emoji} <b>Тип:</b> {transport}\n"
-            f"📦 <b>Грузоподъёмность:</b> {data['capacity']} т\n"
-            f"📍 <b>Регионы:</b> {data['regions']}\n"
-            f"💰 <b>Цена:</b> {data['price_per_km']:.2f} ₽/км\n"
-            f"📝 <b>Описание:</b> {description}\n\n"
-            "✨ Теперь логисты смогут найти вашу карточку!"
-        )
-
-        keyboard = expeditor_keyboard()
-
-        await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
-        await state.finish()
-
-    except Exception as e:
-        logging.error(f"❌ ОШИБКА в expeditor_card_description: {e}", exc_info=True)
-        await message.answer("❌ Произошла ошибка. Попробуйте снова /start")
-        await state.finish()
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# РЕДАКТИРОВАНИЕ КАРТОЧКИ
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-@dp.callback_query_handler(lambda c: c.data == "edit_expeditor_card", state="*")
-async def edit_expeditor_card_callback(
-    callback: types.CallbackQuery, state: FSMContext
-):
-    """Редактирование карточки экспедитора"""
-    await state.finish()
-
-    user_id = callback.from_user.id
-    offer_id = None
-    offer = None
-
-    for oid, off in expeditor_offers.items():
-        if off.get("expeditor_id") == user_id:
-            offer_id = oid
-            offer = off
-            break
-
-    if not offer_id and "expeditor_cards" in globals():
-        for cid, card in expeditor_cards.items():
-            if card.get("user_id") == user_id or card.get("expeditor_id") == user_id:
-                offer_id = cid
-                offer = card
-                break
-
-    if not offer_id or not offer:
-        await callback.answer("❌ У вас нет карточки", show_alert=True)
-        return
-
-    status = offer.get("status", "active")
-    if status != "active":
-        await callback.answer(
-            "❌ Можно редактировать только активные карточки", show_alert=True
-        )
-        return
-
-    text = "✏️ <b>Редактирование карточки</b>\n"
-    text += "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-
-    service_type = offer.get(
-        "service_type",
-        offer.get("vehicle_type", offer.get("transport_type", "Не указан")),
-    )
-    price = offer.get("price", offer.get("price_per_km", 0))
-    capacity = offer.get("capacity", offer.get("cargo_capacity", "Не указана"))
-    regions = offer.get("ports", offer.get("regions", "Не указаны"))
-    description = offer.get("description", offer.get("notes", ""))
-
-    emoji = get_vehicle_emoji(service_type)
-    text += f"{emoji} <b>Тип транспорта</b>\n   <code>{service_type}</code>\n\n"
-    text += f"💰 <b>Цена за км</b>\n   <code>{price:,.2f} ₽/км</code>\n\n"
-    text += f"📦 <b>Грузоподъёмность</b>\n   <code>{capacity} т</code>\n\n"
-    text += f"🗺 <b>Регионы работы</b>\n   <code>{regions}</code>\n\n"
-
-    text += f"📝 <b>Описание</b>\n"
-    if description and description != "Не указано":
-        desc_preview = (
-            description[:50] + "..." if len(description) > 50 else description
-        )
-        text += f"   <code>{desc_preview}</code>\n"  # ← ИСПРАВЛЕНО!
-    else:
-        text += f"   <i>Не указано</i>\n"
-
-    text += "\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-    text += "<i>👇 Выберите параметр для изменения</i>"
-
-    keyboard = InlineKeyboardMarkup(row_width=2)
-    keyboard.add(
-        InlineKeyboardButton(
-            "🚛 Транспорт", callback_data=f"edit_exp_field_service_type_{offer_id}"
-        ),
-        InlineKeyboardButton(
-            "💰 Цена", callback_data=f"edit_exp_field_price_{offer_id}"
-        ),
-    )
-    keyboard.add(
-        InlineKeyboardButton(
-            "📦 Грузоподъёмность", callback_data=f"edit_exp_field_capacity_{offer_id}"
-        ),
-        InlineKeyboardButton(
-            "🗺 Регионы", callback_data=f"edit_exp_field_ports_{offer_id}"
-        ),
-    )
-    keyboard.add(
-        InlineKeyboardButton(
-            "📝 Описание", callback_data=f"edit_exp_field_description_{offer_id}"
-        )
-    )
-    keyboard.add(
-        InlineKeyboardButton("◀️ К карточке", callback_data="expeditor_my_card")
-    )
-
-    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
-    await callback.answer()
-
-
-@dp.callback_query_handler(lambda c: c.data.startswith("edit_exp_field_"), state="*")
-async def edit_expeditor_field_handler(
-    callback: types.CallbackQuery, state: FSMContext
-):
-    """Обработка выбора поля для редактирования"""
-    await state.finish()
-
-    try:
-        # edit_exp_field_service_type_1481790360
-        # ['edit', 'exp', 'field', 'service', 'type', '1481790360']
-
-        parts = callback.data.split("_")
-
-        # Последний элемент - всегда ID
-        offer_id = int(parts[-1])
-
-        # Поле - всё между 'field' и ID
-        # Например: service_type, price, capacity, ports, description
-        field_parts = parts[3:-1]  # ['service', 'type'] или ['price']
-        field = "_".join(field_parts)  # 'service_type' или 'price'
-
-    except (IndexError, ValueError) as e:
-        logging.error(f"❌ Ошибка парсинга callback_data: {callback.data} | {e}")
-        await callback.answer("❌ Ошибка обработки данных", show_alert=True)
-        return
-
-    user_id = callback.from_user.id
-
-    # Находим карточку
-    if (
-        offer_id in expeditor_cards
-        and expeditor_cards[offer_id].get("user_id") == user_id
-    ):
-        offer = expeditor_cards[offer_id]
-    elif (
-        offer_id in expeditor_offers
-        and expeditor_offers[offer_id].get("expeditor_id") == user_id
-    ):
-        offer = expeditor_offers[offer_id]
-    else:
-        await callback.answer("❌ Карточка не найдена", show_alert=True)
-        return
-
-    # ════════════════════════════════════════════════════════════════
-    # РЕДАКТИРОВАНИЕ ТИП ТРАНСПОРТА
-    # ════════════════════════════════════════════════════════════════
-
-    if field == "service_type":  # ← ИСПРАВЛЕНО!
-        keyboard = InlineKeyboardMarkup(row_width=2)
-        keyboard.add(
-            InlineKeyboardButton(
-                "🚛 Фура", callback_data=f"exp_update_type_Фура_{offer_id}"
-            ),
-            InlineKeyboardButton(
-                "🚚 Грузовик", callback_data=f"exp_update_type_Грузовик_{offer_id}"
-            ),
-            InlineKeyboardButton(
-                "🚐 Газель", callback_data=f"exp_update_type_Газель_{offer_id}"
-            ),
-            InlineKeyboardButton(
-                "🚂 Ж/д вагон", callback_data=f"exp_update_type_Ж/д вагон_{offer_id}"
-            ),
-            InlineKeyboardButton(
-                "🚢 Баржа", callback_data=f"exp_update_type_Баржа_{offer_id}"
-            ),
-        )
-        keyboard.add(
-            InlineKeyboardButton("◀️ Назад", callback_data="edit_expeditor_card")
-        )
-
-        await callback.message.edit_text(
-            "🚛 <b>Выберите новый тип транспорта:</b>",
+            f"{title}\n\n"
+            f"📋 Всего заявок: <b>{len(user_requests)}</b>\n"
             reply_markup=keyboard,
             parse_mode="HTML",
         )
+    else:
+        text = f"{title}\n\n"
+        for idx, item in enumerate(user_requests[:10], 1):
+            req = item["req"]
+            volume = req.get("volume", 0) or 0
+            route_from = req.get("route_from", "Не указано")
+            route_to = req.get("route_to", "Не указано")
+            culture = req.get("culture", "N/A")
+            status = req.get("status", "unknown")
 
-    # ════════════════════════════════════════════════════════════════
-    # РЕДАКТИРОВАНИЕ ЦЕНА
-    # ════════════════════════════════════════════════════════════════
+            text += f"{idx}. 📦 Заявка #{req_id}\n"
+            text += f"   • Культура: {culture}\n"
+            text += f"   • Объём: {volume:.0f} т\n"
+            text += f"   • Маршрут: {route_from} → {route_to}\n"
+            text += f"   • Статус: {status}\n\n"
 
-    elif field == "price":
-        await state.update_data(edit_offer_id=offer_id, edit_field="price")
-        await callback.message.edit_text(
-            "💰 <b>Редактирование цены</b>\n\n"
-            f"Текущая цена: {offer.get('price', offer.get('price_per_km', 0)):.2f} ₽/км\n\n"
-            "Введите новую цену за км:",
+        if len(user_requests) > 10:
+            text += f"<i>... и ещё {len(user_requests) - 10} заявок</i>\n\n"
+
+        await message.answer(text, parse_mode="HTML")
+
+
+    await state.finish()
+
+        return
+
+        )
+        return
+
+    text = (
+    )
+
+
+
+        await state.finish()
+
+
+    await message.answer(
+    )
+
+
+
+    try:
+            raise ValueError
+    except ValueError:
+        return
+
+    data = await state.get_data()
+
+        await message.answer(
+                    parse_mode="HTML",
+                )
+        await message.answer(
             parse_mode="HTML",
         )
-        await ExpeditorEditStates.price.set()
 
-    # ════════════════════════════════════════════════════════════════
-    # РЕДАКТИРОВАНИЕ ГРУЗОПОДЪЁМНОСТЬ
-    # ════════════════════════════════════════════════════════════════
 
-    elif field == "capacity":
-        await state.update_data(edit_offer_id=offer_id, edit_field="capacity")
-        await callback.message.edit_text(
-            "📦 <b>Редактирование грузоподъёмности</b>\n\n"
-            f"Текущая грузоподъёмность: {offer.get('capacity', offer.get('cargo_capacity', 0))} т\n\n"
-            "Введите новую грузоподъёмность (в тоннах):",
-            parse_mode="HTML",
+
+
+    try:
+            raise ValueError
+        return
+
+    else:
+        return
+        await callback.answer(
         )
-        await ExpeditorEditStates.capacity.set()
+        return
 
-    # ════════════════════════════════════════════════════════════════
-    # РЕДАКТИРОВАНИЕ РЕГИОНЫ
-    # ════════════════════════════════════════════════════════════════
+            else:
 
-    elif field == "ports":
-        await state.update_data(edit_offer_id=offer_id, edit_field="regions")
-        await callback.message.edit_text(
-            "🗺 <b>Редактирование регионов</b>\n\n"
-            f"Текущие регионы: {offer.get('ports', offer.get('regions', 'Не указаны'))}\n\n"
-            "Введите новые регионы работы:",
-            parse_mode="HTML",
+
+    )
+            InlineKeyboardButton(
+            )
+        InlineKeyboardButton(
+                )
         )
-        await ExpeditorEditStates.regions.set()
-
-    # ════════════════════════════════════════════════════════════════
-    # РЕДАКТИРОВАНИЕ ОПИСАНИЕ
-    # ════════════════════════════════════════════════════════════════
-
-    elif field == "description":
-        await state.update_data(edit_offer_id=offer_id, edit_field="description")
-        await callback.message.edit_text(
-            "📝 <b>Редактирование описания</b>\n\n"
-            f"Текущее описание: {offer.get('description', offer.get('notes', 'Не указано'))}\n\n"
-            "Введите новое описание:",
-            parse_mode="HTML",
-        )
-        await ExpeditorEditStates.description.set()
+    )
 
     await callback.answer()
 
 
-@dp.callback_query_handler(lambda c: c.data.startswith("exp_update_type_"), state="*")
-async def update_expeditor_type(callback: types.CallbackQuery, state: FSMContext):
-    """Обновление типа транспорта"""
+    try:
+
+        return
+
+    user_id = callback.from_user.id
+    else:
+        return
+
+
+            InlineKeyboardButton(
+        InlineKeyboardButton(
+        InlineKeyboardButton(
+                )
+        )
+    )
+
+    await callback.answer()
+
+
     await state.finish()
 
     try:
-        # exp_update_type_Фура_1481790360
-        parts = callback.data.split("_")
-
-        # Последний элемент - ID
-        offer_id = int(parts[-1])
-
-        # Всё между 'type' и ID - название транспорта
-        # Может содержать пробелы, например: "Ж/д вагон"
-        new_type = "_".join(parts[3:-1])
-
-    except (IndexError, ValueError) as e:
-        logging.error(f"❌ Ошибка парсинга: {callback.data} | {e}")
-        await callback.answer("❌ Ошибка", show_alert=True)
         return
 
     user_id = callback.from_user.id
 
-    logging.info(
-        f"🔄 Обновление типа транспорта: offer_id={offer_id}, new_type='{new_type}'"
-    )
-
-    # ════════════════════════════════════════════════════════════════
-    # ОБНОВЛЯЕМ ДАННЫЕ
-    # ════════════════════════════════════════════════════════════════
-
-    updated = False
-
-    if (
-        offer_id in expeditor_cards
-        and expeditor_cards[offer_id].get("user_id") == user_id
     ):
-        expeditor_cards[offer_id]["transport_type"] = new_type
-        updated = True
-        logging.info(f"✅ Обновлено в expeditor_cards")
-    elif (
-        offer_id in expeditor_offers
-        and expeditor_offers[offer_id].get("expeditor_id") == user_id
-    ):
-        expeditor_offers[offer_id]["service_type"] = new_type
-        updated = True
-        logging.info(f"✅ Обновлено в expeditor_offers")
-
-    if not updated:
-        await callback.answer("❌ Ошибка доступа", show_alert=True)
         return
 
-    # ════════════════════════════════════════════════════════════════
-    # СОХРАНЯЕМ
-    # ════════════════════════════════════════════════════════════════
 
-    save_data()
+            )
 
-    await callback.answer(f"✅ Тип транспорта изменён на: {new_type}")
 
-    # ════════════════════════════════════════════════════════════════
-    # ВОЗВРАЩАЕМСЯ К МЕНЮ РЕДАКТИРОВАНИЯ
-    # ════════════════════════════════════════════════════════════════
-
-    # Получаем обновлённые данные
-    if offer_id in expeditor_cards:
-        offer = expeditor_cards[offer_id]
-    else:
-        offer = expeditor_offers[offer_id]
-
-    # Формируем меню редактирования с новыми данными
-    text = "✏️ <b>Редактирование карточки</b>\n"
-    text += "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-
-    service_type = offer.get(
-        "service_type",
-        offer.get("vehicle_type", offer.get("transport_type", "Не указан")),
     )
-    price = offer.get("price", offer.get("price_per_km", 0))
-    capacity = offer.get("capacity", offer.get("cargo_capacity", "Не указана"))
-    regions = offer.get("ports", offer.get("regions", "Не указаны"))
-    description = offer.get("description", offer.get("notes", ""))
 
-    emoji = get_vehicle_emoji(service_type)
-    text += f"{emoji} <b>Тип транспорта</b>\n   <code>{service_type}</code>\n\n"
-    text += f"💰 <b>Цена за км</b>\n   <code>{price:,.2f} ₽/км</code>\n\n"
-    text += f"📦 <b>Грузоподъёмность</b>\n   <code>{capacity} т</code>\n\n"
-    text += f"🗺 <b>Регионы работы</b>\n   <code>{regions}</code>\n\n"
 
-    text += f"📝 <b>Описание</b>\n"
-    if description and description != "Не указано":
-        desc_preview = (
-            description[:50] + "..." if len(description) > 50 else description
+        keyboard.add(
+            InlineKeyboardButton(
         )
-        text += f"   <code>{desc_preview}</code>\n"
-    else:
-        text += f"   <i>Не указано</i>\n"
-
-    text += "\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-    text += "<i>👇 Выберите параметр для изменения</i>"
-
-    keyboard = InlineKeyboardMarkup(row_width=2)
-    keyboard.add(
-        InlineKeyboardButton(
-            "🚛 Транспорт", callback_data=f"edit_exp_field_service_type_{offer_id}"
-        ),
-        InlineKeyboardButton(
-            "💰 Цена", callback_data=f"edit_exp_field_price_{offer_id}"
-        ),
-    )
-    keyboard.add(
-        InlineKeyboardButton(
-            "📦 Грузоподъёмность", callback_data=f"edit_exp_field_capacity_{offer_id}"
-        ),
-        InlineKeyboardButton(
-            "🗺 Регионы", callback_data=f"edit_exp_field_ports_{offer_id}"
-        ),
-    )
-    keyboard.add(
-        InlineKeyboardButton(
-            "📝 Описание", callback_data=f"edit_exp_field_description_{offer_id}"
+        keyboard.add(
+            InlineKeyboardButton(
+            )
+        keyboard.add(
+            InlineKeyboardButton(
+            )
         )
-    )
-    keyboard.add(
-        InlineKeyboardButton("◀️ К карточке", callback_data="expeditor_my_card")
-    )
 
     await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# ОБРАБОТЧИКИ ВВОДА НОВЫХ ЗНАЧЕНИЙ
-# ═══════════════════════════════════════════════════════════════════════════
 
 
-@dp.message_handler(state=ExpeditorEditStates.price)
-async def update_expeditor_price(message: types.Message, state: FSMContext):
-    """Обновление цены"""
     try:
-        new_price = float(message.text.replace(",", "."))
-        if new_price <= 0:
+        return
+
+    user_id = message.from_user.id
+        await state.finish()
+
+    try:
             raise ValueError
     except ValueError:
-        await message.answer("❌ Неверный формат! Введите число (например: 25.50)")
         return
 
     data = await state.get_data()
-    offer_id = data.get("edit_offer_id")
-    user_id = message.from_user.id
 
-    if (
-        offer_id in expeditor_cards
-        and expeditor_cards[offer_id].get("user_id") == user_id
-    ):
-        expeditor_cards[offer_id]["price_per_km"] = new_price
-    elif (
-        offer_id in expeditor_offers
-        and expeditor_offers[offer_id].get("expeditor_id") == user_id
-    ):
-        expeditor_offers[offer_id]["price"] = new_price
+        await state.finish()
+        await state.finish()
 
-    save_data()
-
-    await message.answer(
-        f"✅ Цена обновлена: {new_price:.2f} ₽/км", reply_markup=expeditor_keyboard()
-    )
-    await state.finish()
+        await state.finish()
 
 
-@dp.message_handler(state=ExpeditorEditStates.capacity)
-async def update_expeditor_capacity(message: types.Message, state: FSMContext):
-    """Обновление грузоподъёмности"""
-    try:
-        new_capacity = float(message.text.replace(",", "."))
-        if new_capacity <= 0:
-            raise ValueError
-    except ValueError:
-        await message.answer("❌ Неверный формат! Введите число (например: 20)")
-        return
-
-    data = await state.get_data()
-    offer_id = data.get("edit_offer_id")
-    user_id = message.from_user.id
-
-    if (
-        offer_id in expeditor_cards
-        and expeditor_cards[offer_id].get("user_id") == user_id
-    ):
-        expeditor_cards[offer_id]["capacity"] = new_capacity
-    elif (
-        offer_id in expeditor_offers
-        and expeditor_offers[offer_id].get("expeditor_id") == user_id
-    ):
-        expeditor_offers[offer_id]["capacity"] = new_capacity
-
-    save_data()
-
-    await message.answer(
-        f"✅ Грузоподъёмность обновлена: {new_capacity} т",
-        reply_markup=expeditor_keyboard(),
-    )
-    await state.finish()
-
-
-@dp.message_handler(state=ExpeditorEditStates.regions)
-async def update_expeditor_regions(message: types.Message, state: FSMContext):
-    """Обновление регионов"""
-    new_regions = message.text.strip()
-
-    data = await state.get_data()
-    offer_id = data.get("edit_offer_id")
-    user_id = message.from_user.id
-
-    if (
-        offer_id in expeditor_cards
-        and expeditor_cards[offer_id].get("user_id") == user_id
-    ):
-        expeditor_cards[offer_id]["regions"] = new_regions
-    elif (
-        offer_id in expeditor_offers
-        and expeditor_offers[offer_id].get("expeditor_id") == user_id
-    ):
-        expeditor_offers[offer_id]["ports"] = new_regions
-
-    save_data()
-
-    await message.answer(
-        f"✅ Регионы обновлены: {new_regions}", reply_markup=expeditor_keyboard()
-    )
-    await state.finish()
-
-
-@dp.message_handler(state=ExpeditorEditStates.description)
-async def update_expeditor_description(message: types.Message, state: FSMContext):
-    """Обновление описания"""
-    new_description = message.text.strip()
-
-    data = await state.get_data()
-    offer_id = data.get("edit_offer_id")
-    user_id = message.from_user.id
-
-    if (
-        offer_id in expeditor_cards
-        and expeditor_cards[offer_id].get("user_id") == user_id
-    ):
-        expeditor_cards[offer_id]["description"] = new_description
-    elif (
-        offer_id in expeditor_offers
-        and expeditor_offers[offer_id].get("expeditor_id") == user_id
-    ):
-        expeditor_offers[offer_id]["description"] = new_description
-
-    save_data()
-
-    await message.answer(f"✅ Описание обновлено", reply_markup=expeditor_keyboard())
-    await state.finish()
-
-
-@dp.callback_query_handler(lambda c: c.data == "expeditor_my_card", state="*")
-async def expeditor_my_card_callback(callback: types.CallbackQuery, state: FSMContext):
-    """Возврат к просмотру карточки экспедитора"""
     await state.finish()
 
     user_id = callback.from_user.id
 
-    # Получаем карточку
     card = expeditor_cards.get(user_id)
 
     if not card:
-        await callback.answer("❌ Карточка не найдена", show_alert=True)
         return
 
-    # Показываем карточку
-    transport = card.get("transport_type", "Не указан")
-    emoji = get_vehicle_emoji(transport)
 
     text = (
-        f"💳 <b>Моя карточка экспедитора</b>\n\n"
-        f"{emoji} <b>Тип транспорта:</b> {transport}\n"
-        f"📦 <b>Грузоподъёмность:</b> {card.get('capacity', 0)} т\n"
-        f"📍 <b>Регионы работы:</b> {card.get('regions', 'Не указаны')}\n"
-        f"💰 <b>Цена за км:</b> {card.get('price_per_km', 0):.2f} ₽/км\n"
-        f"📝 <b>Описание:</b>\n{card.get('description', 'Не указано')}\n\n"
-        f"📅 <b>Создана:</b> {card.get('created_at', 'Н/Д')}\n"
-        f"👁 <b>Просмотров:</b> {card.get('views', 0)}"
     )
 
     keyboard = InlineKeyboardMarkup(row_width=1)
     keyboard.add(
-        InlineKeyboardButton("✏️ Редактировать", callback_data="edit_expeditor_card"),
         InlineKeyboardButton(
             "🗑 Удалить карточку", callback_data="delete_expeditor_card"
         ),
     )
 
-    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
-    await callback.answer()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # УДАЛЕНИЕ КАРТОЧКИ
 # ═══════════════════════════════════════════════════════════════════════════
-
-
 @dp.callback_query_handler(lambda c: c.data == "delete_expeditor_card", state="*")
 async def delete_expeditor_card(callback: types.CallbackQuery):
     """Удаление карточки экспедитора"""
@@ -15529,35 +12056,15 @@ async def delete_expeditor_card(callback: types.CallbackQuery):
         await callback.answer("❌ Карточка не найдена", show_alert=True)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# ОТМЕНА СОЗДАНИЯ
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-@dp.callback_query_handler(
-    lambda c: c.data == "cancel_expeditor_card_creation", state="*"
-)
-async def cancel_expeditor_card_creation(
-    callback: types.CallbackQuery, state: FSMContext
-):
-    """Отмена создания карточки"""
     await state.finish()
-    await callback.answer("❌ Создание отменено")
-    await callback.message.edit_text(
-        "❌ Создание карточки отменено.\n" "Вы можете вернуться к этому позже.",
-        parse_mode="HTML",
-    )
+        await callback.message.edit_text(
+            parse_mode="HTML",
+        )
 
 
 @dp.callback_query_handler(lambda c: c.data.startswith("view_request:"), state="*")
 async def view_request_details(callback: types.CallbackQuery, state: FSMContext):
-    """Просмотр деталей заявки - УНИВЕРСАЛЬНЫЙ для экспортёров и фермеров"""
     await state.finish()
-
-    try:
-        await callback.answer()
-    except Exception as e:
-        logging.warning(f"Callback answer error: {e}")
 
     parts = callback.data.split(":")
 
@@ -15576,16 +12083,9 @@ async def view_request_details(callback: types.CallbackQuery, state: FSMContext)
     else:
         return
 
-    # ============ ЗАЯВКА ОТ ЭКСПОРТЕРА ============
     if source == "exporter":
-        if request_id not in shipping_requests:
             return
-
-        request = shipping_requests[request_id]
         pull_id = request.get("pull_id")
-        pull = pulls.get(pull_id, {})
-        user_id = request.get("exporter_id")
-        user = users.get(user_id, {})
 
         price_fob = pull.get("price", 0)
         price_rub = int(price_fob * 95) if price_fob else 0
@@ -15595,7 +12095,6 @@ async def view_request_details(callback: types.CallbackQuery, state: FSMContext)
 
 
 <b>Информация о грузе:</b>
-🌾 Культура: {request.get('culture', '—')}
 📦 Объём: {request.get('volume', 0):.0f} т
 💰 Цена FOB: {price_rub:,} ₽/т
 🚢 Порт: {pull.get('port', '—')}
@@ -15603,14 +12102,10 @@ async def view_request_details(callback: types.CallbackQuery, state: FSMContext)
 
 
 <b>Маршрут:</b>
-📍 Откуда: {request.get('route_from', '—')}
-📍 Куда: {request.get('route_to', '—')}
-📅 Желаемая дата: {request.get('desired_date', '—')}
 
 
 
 <b>👤 Заказчик (экспортёр):</b>
-🏢 Компания: {user.get('company_name', 'N/A')}
 👤 Имя: {user.get('name', 'Не указано')}
 📞 Телефон: <code>{user.get('phone', 'Не указан')}</code>
 📧 Email: {user.get('email', 'Не указан')}
@@ -15619,18 +12114,13 @@ async def view_request_details(callback: types.CallbackQuery, state: FSMContext)
 
 
 
-<b>Статус:</b> {request.get('status', 'active').upper()}
 📅 Создана: {request.get('created_at', '—')}
 """
 
     # ============ ЗАЯВКА ОТ ФЕРМЕРА ============
     else:
-        if request_id not in farmer_logistics_requests:
             return
 
-        request = farmer_logistics_requests[request_id]
-        user_id = request.get("farmer_id")
-        user = users.get(user_id, {})
 
         text = f"""🌾 <b>Логистическая заявка фермера #{request_id}</b>
 
@@ -15645,10 +12135,7 @@ async def view_request_details(callback: types.CallbackQuery, state: FSMContext)
 
 
 <b>Маршрут:</b>
-📍 От: {request.get('route_from', '—')}
-⛴️ До (Порт): {request.get('route_to', '—')}
 🚚 Транспорт: {request.get('transport_type', '—')}
-📅 Дата: {request.get('desired_date', '—')}
 
 
 
@@ -15658,7 +12145,6 @@ async def view_request_details(callback: types.CallbackQuery, state: FSMContext)
 
 
 <b>👤 Заказчик (фермер):</b>
-🏢 Компания: {user.get('company_name', 'N/A')}
 👤 Имя: {user.get('name', 'Не указано')}
 📞 Телефон: <code>{user.get('phone', 'Не указан')}</code>
 📧 Email: {user.get('email', 'Не указан')}
@@ -15667,46 +12153,26 @@ async def view_request_details(callback: types.CallbackQuery, state: FSMContext)
 
 
 
-<b>Статус:</b> {request.get('status', 'active').upper()}
 📅 Создана: {request.get('created_at', '—')}
-📬 Предложений: {len(request.get('offers', []))}
 """
 
-    # ============ КНОПКИ ДЛЯ ОБОИХ ТИПОВ ============
     keyboard = InlineKeyboardMarkup(row_width=1)
 
-    keyboard.add(
-        InlineKeyboardButton("📞 Связаться с заказчиком", url=f"tg://user?id={user_id}")
-    )
+        keyboard.add(
+        )
 
     logist_id = callback.from_user.id
-    existing_offers = [
-        offer
-        for offer in logistic_offers.values()
-        if offer.get("request_id") == request_id
-        and offer.get("logist_id") == logist_id
-        and offer.get("status") not in ["cancelled", "rejected"]
-    ]
+            offer
+            for offer in logistic_offers.values()
+        ]
 
-    if existing_offers:
-        offer = existing_offers[0]
-        text += f"\n\n✅ <b>Вы уже сделали предложение:</b>\n"
-        text += f"🚛 Транспорт: {offer.get('vehicle_type', '—')}\n"
-        text += f"💰 Цена: {offer.get('price', 0):,} ₽\n"
-        text += f"📅 Дата доставки: {offer.get('delivery_date', '—')}\n"
-        text += f"📊 Статус: {get_offer_status_display(offer.get('status', 'pending'))}"  # ✅ ИСПРАВЛЕНО
 
-        keyboard.add(
-            InlineKeyboardButton("◀️ К списку заявок", callback_data="back_to_requests")
-        )
-    else:
-        keyboard.add(
-            InlineKeyboardButton(
-                "💰 Сделать предложение",
-                callback_data=f"make_offer:{source}:{request_id}",
-            ),
-            InlineKeyboardButton("◀️ К списку заявок", callback_data="back_to_requests"),
-        )
+            )
+            keyboard.add(
+                InlineKeyboardButton(
+                    "💰 Сделать предложение",
+                    callback_data=f"make_offer:{source}:{request_id}",
+            )
 
     try:
         await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
@@ -15723,8 +12189,6 @@ async def view_request_details(callback: types.CallbackQuery, state: FSMContext)
 # ═══════════════════════════════════════════════════════════════════════════
 # ЛОГИСТ: БАЗА ЭКСПЕДИТОРОВ
 # ═══════════════════════════════════════════════════════════════════════════
-
-
 @dp.message_handler(lambda m: m.text == "🚛 База экспедиторов", state="*")
 async def logist_view_expeditors(message: types.Message, state: FSMContext):
     """Логист просматривает базу экспедиторов"""
@@ -15732,7 +12196,6 @@ async def logist_view_expeditors(message: types.Message, state: FSMContext):
 
     user_id = message.from_user.id
 
-    if user_id not in users or users[user_id].get("role") != "logistic":
         await message.answer("❌ Эта функция доступна только логистам")
         return
 
@@ -15794,14 +12257,9 @@ async def expeditor_view_available_requests(message: types.Message, state: FSMCo
 
     user_id = message.from_user.id
 
-    if user_id not in users or users[user_id].get("role") != "expeditor":
         await message.answer("❌ Эта функция доступна только экспедиторам")
         return
 
-    # Получаем активные заявки на доставку
-    available_requests = [
-        req for req in shipping_requests.values() if req.get("status") == "active"
-    ]
 
     if not available_requests:
         await message.answer(
@@ -15821,19 +12279,14 @@ async def expeditor_view_available_requests(message: types.Message, state: FSMCo
         "Выберите заявку для просмотра деталей:"
     )
 
-    for req in available_requests[:15]:  # Максимум 15
-        req_id = req.get("id", "N/A")
         culture = req.get("culture", "N/A")
         volume = req.get("volume", 0) or 0
-        route_from = req.get("route_from", "—")
-        route_to = req.get("route_to", "—")
 
         btn_text = (
-            f"🚛 #{req_id} | {culture} | {volume:.0f} т | {route_from}→{route_to}"
-        )
-        keyboard.add(
-            InlineKeyboardButton(btn_text, callback_data=f"exp_view_req:{req_id}")
-        )
+                )
+            keyboard.add(
+                InlineKeyboardButton(btn_text, callback_data=f"exp_view_req:{req_id}")
+            )
 
     await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
 
@@ -15846,24 +12299,16 @@ async def expeditor_view_request_details(
     await state.finish()
 
     try:
-        request_id = int(callback.data.split(":")[1])
     except (IndexError, ValueError):
         await callback.answer("❌ Ошибка", show_alert=True)
         return
 
-    if request_id not in shipping_requests:
         await callback.answer("❌ Заявка не найдена", show_alert=True)
         return
 
-    request = shipping_requests[request_id]
     pull_id = request.get("pull_id")
-    pull = pulls.get(pull_id, {})
     exporter_id = request.get("exporter_id")
-    exporter = users.get(exporter_id, {})
 
-    # Получаем логиста (если заявка от логиста)
-    logist_id = request.get("logist_id")  # Нужно добавить это поле!
-    logist = users.get(logist_id, {}) if logist_id else {}
 
     # Конвертируем цену
     price_fob = pull.get("price", 0)
@@ -15872,16 +12317,10 @@ async def expeditor_view_request_details(
     # Формируем детали заявки
     text = (
         f"🚚 <b>Заявка на доставку #{request_id}</b>\n\n"
-        f"<b>Информация о грузе:</b>\n"
         f"🌾 Культура: {request.get('culture', '—')}\n"
         f"📦 Объём: {request.get('volume', 0):.0f} т\n"
         f"💰 Цена FOB: {price_rub:,} ₽/т\n"
         f"🚢 Порт: {pull.get('port', '—')}\n\n"
-        f"<b>Маршрут:</b>\n"
-        f"📍 Откуда: {request.get('route_from', '—')}\n"
-        f"📍 Куда: {request.get('route_to', '—')}\n"
-        f"📅 Желаемая дата: {request.get('desired_date', '—')}\n\n"
-        f"<b>👤 Заказчик (экспортёр):</b>\n"
         f"Компания: {exporter.get('company_name', 'N/A')}\n"
         f"Телефон: <code>{exporter.get('phone', 'Не указан')}</code>\n"
         f"Email: {exporter.get('email', 'Не указан')}\n\n"
@@ -15889,7 +12328,6 @@ async def expeditor_view_request_details(
 
     if logist_id:
         text += (
-            f"<b>👤 Логист:</b>\n"
             f"Имя: {logist.get('name', 'N/A')}\n"
             f"Телефон: <code>{logist.get('phone', 'Не указан')}</code>\n"
             f"Email: {logist.get('email', 'Не указан')}\n\n"
@@ -15900,11 +12338,11 @@ async def expeditor_view_request_details(
     keyboard = InlineKeyboardMarkup(row_width=1)
 
     # Кнопки связи
-    keyboard.add(
-        InlineKeyboardButton(
-            "📞 Связаться с экспортёром", url=f"tg://user?id={exporter_id}"
+        keyboard.add(
+            InlineKeyboardButton(
+                "📞 Связаться с экспортёром", url=f"tg://user?id={exporter_id}"
+            )
         )
-    )
 
     if logist_id:
         keyboard.add(
@@ -15913,12 +12351,10 @@ async def expeditor_view_request_details(
             )
         )
 
-    # Кнопка принять заявку
-    keyboard.add(
-        InlineKeyboardButton(
-            "✅ Принять заявку", callback_data=f"exp_accept:{request_id}"
+        keyboard.add(
+            InlineKeyboardButton(
+            )
         )
-    )
     keyboard.add(
         InlineKeyboardButton("◀️ К списку заявок", callback_data="back_to_exp_requests")
     )
@@ -15931,35 +12367,27 @@ async def expeditor_view_request_details(
 async def expeditor_accept_request(callback: types.CallbackQuery, state: FSMContext):
     """Экспедитор принимает заявку"""
     try:
-        request_id = int(callback.data.split(":")[1])
     except (IndexError, ValueError):
         await callback.answer("❌ Ошибка", show_alert=True)
         return
 
-    if request_id not in shipping_requests:
         await callback.answer("❌ Заявка не найдена", show_alert=True)
         return
-
-    request = shipping_requests[request_id]
     expeditor_id = callback.from_user.id
 
     # Обновляем статус заявки
     request["status"] = "in_progress"
     request["expeditor_id"] = expeditor_id
-    request["accepted_at"] = datetime.now().strftime("%d.%m.%Y %H:%M")
 
     # Уведомляем экспедитора
     await callback.message.edit_text(
         f"✅ <b>Заявка #{request_id} принята!</b>\n\n"
-        f'Заявка перемещена в раздел <b>"🚛 Мои доставки"</b>.\n\n'
-        f"Свяжитесь с заказчиком для уточнения деталей.",
         parse_mode="HTML",
     )
 
     # Уведомляем экспортёра
     exporter_id = request.get("exporter_id")
     if exporter_id:
-        expeditor = users.get(expeditor_id, {})
         try:
             await bot.send_message(
                 exporter_id,
@@ -15967,25 +12395,18 @@ async def expeditor_accept_request(callback: types.CallbackQuery, state: FSMCont
                 f"🚛 Экспедитор: {expeditor.get('name', 'N/A')}\n"
                 f"📞 Телефон: <code>{expeditor.get('phone', 'Не указан')}</code>\n"
                 f"📧 Email: {expeditor.get('email', 'Не указан')}\n\n"
-                f"Экспедитор скоро свяжется с вами.",
                 parse_mode="HTML",
             )
-        except:
-            pass
 
     # Уведомляем логиста (если есть)
-    logist_id = request.get("logist_id")
     if logist_id:
         try:
             await bot.send_message(
                 logist_id,
                 f"✅ <b>Заявка #{request_id} принята экспедитором!</b>\n\n"
                 f"🚛 Экспедитор: {expeditor.get('name', 'N/A')}\n"
-                f"Доставка начата.",
                 parse_mode="HTML",
             )
-        except:
-            pass
 
     await callback.answer("✅ Заявка принята!", show_alert=True)
     logging.info(f"✅ Экспедитор {expeditor_id} принял заявку {request_id}")
@@ -15996,9 +12417,6 @@ async def back_to_exp_requests(callback: types.CallbackQuery, state: FSMContext)
     """Возврат к списку доступных заявок"""
     await state.finish()
 
-    available_requests = [
-        req for req in shipping_requests.values() if req.get("status") == "active"
-    ]
 
     if not available_requests:
         await callback.message.edit_text(
@@ -16016,19 +12434,14 @@ async def back_to_exp_requests(callback: types.CallbackQuery, state: FSMContext)
         "Выберите заявку для просмотра деталей:"
     )
 
-    for req in available_requests[:15]:
-        req_id = req.get("id", "N/A")
         culture = req.get("culture", "N/A")
         volume = req.get("volume", 0) or 0
-        route_from = req.get("route_from", "—")
-        route_to = req.get("route_to", "—")
 
         btn_text = (
-            f"🚛 #{req_id} | {culture} | {volume:.0f} т | {route_from}→{route_to}"
         )
-        keyboard.add(
-            InlineKeyboardButton(btn_text, callback_data=f"exp_view_req:{req_id}")
-        )
+            keyboard.add(
+                InlineKeyboardButton(btn_text, callback_data=f"exp_view_req:{req_id}")
+            )
 
     await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
     await callback.answer()
@@ -16036,44 +12449,21 @@ async def back_to_exp_requests(callback: types.CallbackQuery, state: FSMContext)
 
 @dp.message_handler(
     lambda m: m.text == "🚛 Мои доставки"
-    and users.get(m.from_user.id, {}).get("role") in ["logistic", "expeditor"],
     state="*",
 )
 async def my_deliveries_handler(message: types.Message, state: FSMContext):
-    """Логист/Экспедитор просматривает свои доставки"""
     await state.finish()
 
     user_id = message.from_user.id
 
-    if user_id not in users:
         await message.answer("❌ Пользователь не найден. Используйте /start")
         return
 
-    role = users[user_id].get("role")
 
     # ═══════════════════════════════════════════════════════════════
-    # ЛОГИСТ
     # ═══════════════════════════════════════════════════════════════
 
-    if role == "logistic":
-        # Получаем предложения логиста
-        my_offers = [
-            (offer_id, offer)
-            for offer_id, offer in logistic_offers.items()
-            if offer.get("logist_id") == user_id
-        ]
 
-        in_progress = [
-            (oid, o)
-            for oid, o in my_offers
-            if o.get("status") in ["accepted", "in_progress"]
-        ]
-
-        completed = [(oid, o) for oid, o in my_offers if o.get("status") == "completed"]
-
-        total_earnings = sum(o.get("price", 0) for _, o in completed)
-
-        if not my_offers:
             await message.answer(
                 "🚛 <b>Мои доставки</b>\n\n"
                 "У вас пока нет доставок.\n"
@@ -16086,34 +12476,16 @@ async def my_deliveries_handler(message: types.Message, state: FSMContext):
             )
             return
 
-        keyboard = InlineKeyboardMarkup(row_width=1)
 
-        text = f"🚛 <b>Мои доставки</b>\n\n"
-        text += f"📊 <b>Статистика:</b>\n"
         text += f"• В процессе: {len(in_progress)}\n"
         text += f"• Завершено: {len(completed)}\n"
-        text += f"• Заработано: {total_earnings:,} ₽\n\n"
 
         if in_progress:
             text += f"<b>🟢 В процессе ({len(in_progress)}):</b>\n\n"
 
-            for offer_id, offer in in_progress[:5]:
-                request_id = offer.get("request_id")
-                request = shipping_requests.get(request_id, {})
-
-                culture = request.get("culture", "Н/Д")
-                volume = request.get("volume", 0)
-                route_from = request.get("route_from", "?")
-                route_to = request.get("route_to", "?")
-                price = offer.get("price", 0)
-
-                text += f"🚛 <b>#{offer_id}</b> | {culture} {volume:.0f}т | "
-                text += f"{route_from}→{route_to} | {price:,}₽\n"
 
                 keyboard.add(
                     InlineKeyboardButton(
-                        f"📦 Доставка #{offer_id}",
-                        callback_data=f"view_delivery:{offer_id}",
                     )
                 )
 
@@ -16122,29 +12494,16 @@ async def my_deliveries_handler(message: types.Message, state: FSMContext):
 
         if completed:
             text += f"\n<b>✅ Завершённые ({len(completed)}):</b>\n"
-            for oid, offer in completed[:3]:
-                req_id = offer.get("request_id")
-                req = shipping_requests.get(req_id, {})
-                text += f"✔️ #{oid} | {req.get('culture', 'Н/Д')} | {offer.get('price', 0):,}₽\n"
 
-        if not keyboard.inline_keyboard:
-            keyboard.add(
-                InlineKeyboardButton("🔄 Обновить", callback_data="refresh_deliveries")
-            )
+        keyboard.add(
+            InlineKeyboardButton("🔄 Обновить", callback_data="refresh_deliveries")
+        )
 
         await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
 
     # ═══════════════════════════════════════════════════════════════
-    # ЭКСПЕДИТОР
     # ═══════════════════════════════════════════════════════════════
 
-    elif role == "expeditor":
-        # Получаем доставки экспедитора
-        my_deliveries = [
-            req
-            for req in shipping_requests.values()
-            if req.get("expeditor_id") == user_id and req.get("status") == "in_progress"
-        ]
 
         if not my_deliveries:
             await message.answer(
@@ -16163,15 +12522,8 @@ async def my_deliveries_handler(message: types.Message, state: FSMContext):
             "Выберите доставку:"
         )
 
-        for req in my_deliveries:
-            req_id = req.get("id", "N/A")
-            culture = req.get("culture", "N/A")
-            volume = req.get("volume", 0) or 0
-            route_to = req.get("route_to", "—")
 
-            btn_text = f"🚚 #{req_id} | {culture} | {volume:.0f} т → {route_to}"
             keyboard.add(
-                InlineKeyboardButton(btn_text, callback_data=f"exp_delivery:{req_id}")
             )
 
         await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
@@ -16184,45 +12536,24 @@ async def my_deliveries_handler(message: types.Message, state: FSMContext):
 
 @dp.callback_query_handler(lambda c: c.data.startswith("exp_delivery:"), state="*")
 async def expeditor_delivery_details(callback: types.CallbackQuery, state: FSMContext):
-    """Детали активной доставки"""
     try:
-        request_id = int(callback.data.split(":")[1])
     except (IndexError, ValueError):
         await callback.answer("❌ Ошибка", show_alert=True)
         return
 
-    if request_id not in shipping_requests:
         await callback.answer("❌ Доставка не найдена", show_alert=True)
         return
 
-    request = shipping_requests[request_id]
-    exporter_id = request.get("exporter_id")
-    exporter = users.get(exporter_id, {})
 
     text = (
-        f"🚛 <b>Доставка #{request_id}</b>\n\n"
-        f"🌾 Культура: {request.get('culture', '—')}\n"
-        f"📦 Объём: {request.get('volume', 0):.0f} т\n"
-        f"📍 Маршрут: {request.get('route_from', '—')} → {request.get('route_to', '—')}\n"
-        f"📅 Дата: {request.get('desired_date', '—')}\n\n"
-        f"<b>👤 Контакты заказчика:</b>\n"
-        f"Компания: {exporter.get('company_name', 'N/A')}\n"
-        f"Телефон: <code>{exporter.get('phone', 'Не указан')}</code>\n"
-        f"Email: {exporter.get('email', 'Не указан')}\n\n"
-        f"📅 Принята: {request.get('accepted_at', '—')}"
     )
 
     keyboard = InlineKeyboardMarkup(row_width=1)
-    keyboard.add(
-        InlineKeyboardButton(
-            "📞 Связаться с заказчиком", url=f"tg://user?id={exporter_id}"
-        ),
-        InlineKeyboardButton(
-            "✅ Завершить доставку", callback_data=f"exp_complete:{request_id}"
-        ),
+        keyboard.add(
+            InlineKeyboardButton(
+            InlineKeyboardButton(
         InlineKeyboardButton(
             "◀️ К списку доставок", callback_data="back_to_exp_deliveries"
-        ),
     )
 
     await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
@@ -16231,41 +12562,20 @@ async def expeditor_delivery_details(callback: types.CallbackQuery, state: FSMCo
 
 @dp.callback_query_handler(lambda c: c.data.startswith("exp_complete:"), state="*")
 async def expeditor_complete_delivery(callback: types.CallbackQuery, state: FSMContext):
-    """✅ Завершение доставки и сохранение в Google Sheets"""
     try:
-        request_id = int(callback.data.split(":")[1])
-    except (IndexError, ValueError):
-        await callback.answer("❌ Ошибка", show_alert=True)
         return
 
-    if request_id not in shipping_requests:
-        await callback.answer("❌ Доставка не найдена", show_alert=True)
-        return
+            await callback.answer("❌ Доставка не найдена", show_alert=True)
+            return
 
-    request = shipping_requests[request_id]
-    request["status"] = "completed"
-    request["completed_at"] = datetime.now().strftime("%d.%m.%Y %H:%M")
+        request["status"] = "completed"
 
-    # ✅ ПОЛУЧАЕМ PULL_ID
-    pull_id = request.get("pull_id")
-    offer_id = callback.data.split(":")[1]  # Получаем offer_id
 
-    # ✅ СОХРАНЯЕМ В GOOGLE SHEETS
-    success = await save_completed_deal_to_sheets(pull_id, request_id, int(offer_id))
 
     if success:
-        await callback.message.edit_text(
-            f"✅ <b>Доставка завершена!</b>\n\n"
-            f"📊 Данные сохранены в Google Sheets\n"
-            f"📋 Вкладка: 'Завершенные сделки'",
-            parse_mode="HTML",
-        )
-        logging.info(f"✅ Сделка {pull_id} сохранена в Google Sheets")
-    else:
-        await callback.message.edit_text(
-            f"✅ Доставка завершена\n\n" f"⚠️ Ошибка при сохранении в Google Sheets"
-        )
-        logging.warning(f"⚠️ Не удалось сохранить в Google Sheets")
+                parse_mode="HTML",
+            )
+            )
 
     await callback.answer()
 
@@ -16273,8 +12583,6 @@ async def expeditor_complete_delivery(callback: types.CallbackQuery, state: FSMC
 # ═══════════════════════════════════════════════════════════════════════════
 # ЭКСПЕДИТОР: ИСТОРИЯ ДОСТАВОК
 # ═══════════════════════════════════════════════════════════════════════════
-
-
 @dp.message_handler(lambda m: m.text == "✔️ История доставок", state="*")
 async def expeditor_delivery_history(message: types.Message, state: FSMContext):
     """История завершённых доставок"""
@@ -16282,16 +12590,9 @@ async def expeditor_delivery_history(message: types.Message, state: FSMContext):
 
     user_id = message.from_user.id
 
-    if user_id not in users or users[user_id].get("role") != "expeditor":
         await message.answer("❌ Эта функция доступна только экспедиторам")
         return
 
-    # Получаем завершённые доставки
-    completed = [
-        req
-        for req in shipping_requests.values()
-        if req.get("expeditor_id") == user_id and req.get("status") == "completed"
-    ]
 
     if not completed:
         await message.answer(
@@ -16301,18 +12602,11 @@ async def expeditor_delivery_history(message: types.Message, state: FSMContext):
         return
 
     text = (
-        f"✔️ <b>История доставок</b>\n\n"
         f"📋 Всего завершено: <b>{len(completed)}</b>\n\n"
     )
 
-    for req in completed[-10:]:  # Последние 10
-        req_id = req.get("id", "N/A")
-        culture = req.get("culture", "N/A")
-        volume = req.get("volume", 0) or 0
-        completed_at = req.get("completed_at", "—")
 
         text += (
-            f"🚚 <b>Доставка #{req_id}</b>\n"
             f"   {culture} | {volume:.0f} т\n"
             f"   ✅ Завершена: {completed_at}\n\n"
         )
@@ -16336,7 +12630,6 @@ async def logist_view_expeditor_card(callback: types.CallbackQuery, state: FSMCo
         return
 
     card = expeditor_cards[expeditor_id]
-    expeditor = users.get(expeditor_id, {})
 
     # Увеличиваем счётчик просмотров
     card["views"] = card.get("views", 0) + 1
@@ -16353,15 +12646,12 @@ async def logist_view_expeditor_card(callback: types.CallbackQuery, state: FSMCo
 
     # Формируем детали карточки
     text = (
-        f"💳 <b>Карточка экспедитора</b>\n\n"
         f"{transport_emoji} <b>Транспорт:</b>\n"
         f"Тип: {transport_emoji} {transport_type}\n"
         f"Грузоподъёмность: {card.get('capacity', 0)} т\n\n"
         f"<b>📍 Регионы работы:</b>\n{regions_text}\n\n"
-        f"<b>💰 Тарифы:</b>\n"
         f"Цена за км: {card.get('price_per_km', 0):.2f} ₽/км\n\n"
         f"<b>📝 Описание:</b>\n{card.get('description', 'Не указано')}\n\n"
-        f"<b>👤 Контакты экспедитора:</b>\n"
         f"Имя: {card.get('user_name', expeditor.get('full_name', 'N/A'))}\n"
         f"Компания: {card.get('company', expeditor.get('company_name', 'N/A'))}\n"
         f"Телефон: <code>{card.get('phone', expeditor.get('phone', 'Не указан'))}</code>\n"
@@ -16376,7 +12666,6 @@ async def logist_view_expeditor_card(callback: types.CallbackQuery, state: FSMCo
     # ✅ ПРОВЕРЯЕМ VALID ID И ДОБАВЛЯЕМ КНОПКУ БЕЗОПАСНО
     try:
         # Проверяем что ID валидный
-        if expeditor_id > 0 and expeditor_id in users:
             username = expeditor.get("username")
 
             if username:
@@ -16478,48 +12767,27 @@ async def view_shipping_requests_callback(callback: CallbackQuery):
     """Просмотр заявок на доставку для конкретного пула"""
     pull_id = parse_callback_id(callback.data)
 
-    if pull_id not in pulls.get("pulls", {}):
         await callback.answer("❌ Пул не найден", show_alert=True)
         return
-
-    # Находим все заявки логистов для этого региона
-    pull = pulls["pulls"][pull_id]
-    pull_region = pull.get("region", "")
 
     relevant_requests = [
         req
         for req in shipping_requests.values()
-        if req.get("status") == "active"
-        and (pull_region in req.get("from", "") or pull_region in req.get("to", ""))
     ]
 
     if not relevant_requests:
         await callback.answer(
-            "❌ Нет доступных логистов для этого региона", show_alert=True
         )
         return
 
-    # ✅ ПОКАЗЫВАЕМ СПИСОК С КНОПКАМИ!
-    text = f"🚚 <b>Доступные логисты для пула #{pull_id}</b>\n\n"
-    text += "Выберите логиста для просмотра деталей:"
 
     keyboard = InlineKeyboardMarkup(row_width=1)
 
-    for idx, req in enumerate(relevant_requests[:10], 1):
         request_id = req.get("id")
-        logist_id = req.get("logist_id")  # ← ВАШЕ НАЗВАНИЕ!
-
-        if logist_id and logist_id in users:
-            logist = users[logist_id]
-            company = logist.get("name", "Логист")  # ← ВАШЕ ПОЛЕ!
-            price = req.get("price", 0)
-
-            button_text = f"🚛 {company} - {price:,.0f} ₽"
-            keyboard.add(
-                InlineKeyboardButton(
-                    button_text, callback_data=f"view_logist_request:{request_id}"
-                )
+        keyboard.add(
+            InlineKeyboardButton(
             )
+        )
 
     keyboard.add(
         InlineKeyboardButton("🔙 Назад к пулу", callback_data=f"view_pull:{pull_id}")
@@ -16538,76 +12806,28 @@ async def view_shipping_requests_callback(callback: CallbackQuery):
     lambda c: c.data.startswith("view_logist_request:"), state="*"
 )
 async def view_logist_request_details(callback: CallbackQuery):
-    """Экспортёр смотрит детали заявки логиста"""
     try:
-        request_id = int(callback.data.split(":")[1])
     except (IndexError, ValueError):
         await callback.answer("❌ Ошибка данных", show_alert=True)
         return
 
-    if request_id not in shipping_requests:
-        await callback.answer("❌ Заявка не найдена", show_alert=True)
         return
 
-    request = shipping_requests[request_id]
-    logist_id = request.get("logist_id")  # ← ВАШЕ НАЗВАНИЕ!
-
-    # Получаем данные логиста
-    logist_data = users.get(logist_id, {})
-
-    text = (
-        f"🚛 <b>Заявка логиста #{request_id}</b>\n\n"
-        f"<b>👤 Логист:</b> {logist_data.get('name', 'Не указано')}\n"
-        f"<b>📞 Телефон:</b> <code>{logist_data.get('phone', 'Не указан')}</code>\n"
-        f"<b>📧 Email:</b> {logist_data.get('email', 'Не указан')}\n"
-        f"<b>📍 Регион:</b> {logist_data.get('region', 'Не указан')}\n\n"
-        f"<b>📍 Маршрут:</b> {request.get('from', 'Н/Д')} → {request.get('to', 'Н/Д')}\n"
-        f"<b>💰 Цена:</b> {request.get('price', 0):,.0f} ₽\n"
-        f"<b>🚛 Транспорт:</b> {request.get('vehicle_type', 'Не указан')}\n"
-        f"<b>⚖️ Объём:</b> {request.get('volume', 'Не указан')} т\n\n"
-        f"<b>📝 Дополнительно:</b>\n{request.get('notes', 'Нет')}"
-    )
-
-    keyboard = InlineKeyboardMarkup(row_width=1)
-    keyboard.add(
-        InlineKeyboardButton(
-            "📞 Связаться с логистом",
-            url=f"tg://user?id={logist_id}",  # ← КНОПКА ДЛЯ СВЯЗИ!
-        ),
-        InlineKeyboardButton(
-            "✅ Выбрать этого логиста", callback_data=f"select_logist:{request_id}"
-        ),
-        InlineKeyboardButton(
-            "🔙 Назад к списку",
-            callback_data=f'view_shipping_requests:{request.get("pull_id", 0)}',  # ← ВОЗВРАТ К СПИСКУ
-        ),
-    )
-
-    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
-    await callback.answer()
 
 
 @dp.callback_query_handler(lambda c: c.data.startswith("select_logist:"), state="*")
 async def select_logist_for_pull(callback: CallbackQuery):
     """Экспортёр выбирает логиста для перевозки"""
     try:
-        request_id = int(callback.data.split(":")[1])
     except (IndexError, ValueError):
         await callback.answer("❌ Ошибка данных", show_alert=True)
         return
 
-    if request_id not in shipping_requests:
         await callback.answer("❌ Заявка не найдена", show_alert=True)
         return
 
-    request = shipping_requests[request_id]
-    logist_id = request.get("logist_id")
-    logist_data = users.get(logist_id, {})
 
     # Обновляем статус заявки
-    shipping_requests[request_id]["status"] = "selected"
-    shipping_requests[request_id]["selected_by"] = callback.from_user.id
-    shipping_requests[request_id]["selected_at"] = datetime.now().strftime(
         "%d.%m.%Y %H:%M"
     )
 
@@ -16615,20 +12835,14 @@ async def select_logist_for_pull(callback: CallbackQuery):
     try:
         await bot.send_message(
             logist_id,
-            f"🎉 <b>Ваша заявка выбрана!</b>\n\n"
-            f"Экспортёр выбрал вас для перевозки.\n"
-            f"Свяжитесь с заказчиком для уточнения деталей.",
             parse_mode="HTML",
         )
     except Exception as e:
         logging.error(f"❌ Ошибка уведомления логиста {logist_id}: {e}")
 
     await callback.message.edit_text(
-        f"✅ <b>Логист выбран!</b>\n\n"
         f"👤 Логист: {logist_data.get('name', 'Не указано')}\n"
         f"📞 Телефон: <code>{logist_data.get('phone', 'Не указан')}</code>\n\n"
-        f"Логист получил уведомление.\n"
-        f"Свяжитесь с ним для обсуждения деталей перевозки.",
         parse_mode="HTML",
     )
     await callback.answer("✅ Логист выбран!", show_alert=True)
@@ -16670,18 +12884,12 @@ async def send_daily_stats():
             role_stats[role] += 1
 
         # ✅ ИСПРАВЛЕНО: правильный подсчёт партий
-        total_batches = sum(len(user_batches) for user_batches in batches.values())
 
         # ✅ ИСПРАВЛЕНО: правильный подсчёт активных партий
         active_batches = sum(
             1
-            for user_batches in batches.values()
-            for batch in user_batches  # ← ИСПРАВЛЕНО! Итерируемся по партиям!
-            if batch.get("status") == "Активна"
         )
 
-        total_pulls = len(pulls)
-        open_pulls = len([p for p in pulls.values() if p.get("status") == "Открыт"])
         total_deals = len(deals)
         active_deals = len(
             [
@@ -16712,7 +12920,6 @@ async def send_daily_stats():
 
 async def setup_scheduler():
     """Настройка планировщика задач"""
-    global scheduler
     try:
         scheduler.add_job(update_prices_cache, "interval", hours=6)
         scheduler.add_job(update_news_cache, "interval", hours=2)
@@ -16738,25 +12945,12 @@ class LogisticStatesGroup(StatesGroup):
     desired_price = State()
 
 
-class ExcavatorStatesGroup(StatesGroup):
-    """Состояния для создания карточки экспедитора"""
-
-    service_type = State()
-    price = State()
-    terms = State()
-    ports = State()
-    notes = State()
-
-
 # ==================== ОБРАБОТЧИКИ ДЛЯ ЛОГИСТОВ ====================
-
-
 @dp.message_handler(lambda m: m.text == "➕ Создать заявку на перевозку", state="*")
 async def create_shipping_request_start(message: types.Message, state: FSMContext):
     """Начало создания заявки на перевозку"""
     user_id = message.from_user.id
 
-    if user_id not in users or users[user_id].get("role") != "logistic":
         await message.answer("❌ Эта функция доступна только логистам")
         return
 
@@ -16821,7 +13015,6 @@ async def logistic_volume(message: types.Message, state: FSMContext):
         )
         await LogisticStatesGroup.desired_price.set()
 
-    except Exception as e:
         await message.answer("❌ Неверный формат. Укажите число (например: 1500)")
 
 
@@ -16843,7 +13036,6 @@ async def logistic_desired_price(message: types.Message, state: FSMContext):
         )
         await LogisticStatesGroup.price.set()
 
-    except Exception as e:
         await message.answer(
             "❌ Неверный формат цены. Укажите число (например: 700 или 750.5)"
         )
@@ -16866,7 +13058,6 @@ async def logistic_price(message: types.Message, state: FSMContext):
         )
         await LogisticStatesGroup.vehicle_type.set()
 
-    except Exception as e:
         await message.answer("❌ Неверный формат. Укажите число (например: 700)")
 
 
@@ -16897,7 +13088,6 @@ async def logistic_notes(message: types.Message, state: FSMContext):
     data = await state.get_data()
 
     # ✅ ГЕНЕРИРУЕМ ID ПРАВИЛЬНО (без global)
-    request_id = max(logistics_requests.keys()) + 1 if logistics_requests else 1
 
     # ✅ СОЗДАЁМ ЗАЯВКУ С ПОЛНОЙ СТРУКТУРОЙ
     request = {
@@ -16919,7 +13109,6 @@ async def logistic_notes(message: types.Message, state: FSMContext):
     logistics_requests[request_id] = request
 
     # Формируем сообщение
-    logist = users[user_id]
     logist_name = logist.get("name", "Логист")
     logist_inn = logist.get("inn", "Не указан")
     logist_ogrn = logist.get("ogrn", "Не указан")
@@ -16987,32 +13176,14 @@ def get_status_name(status: str) -> str:
 async def show_logistic_requests_list(callback: types.CallbackQuery, state: FSMContext):
     """Список доступных заявок на доставку для логиста"""
     await state.finish()
-
     user_id = callback.from_user.id
 
     # ✅ Инициализируем клавиатуру ДО всех условий
     keyboard = InlineKeyboardMarkup(row_width=1)
 
-    # ✅ ИСХОДНЫЕ заявки экспортеров (как было)
-    available_requests = [
-        (f"exp_{req_id}", req)
-        for req_id, req in shipping_requests.items()
-        if req.get("status") == "active" and not req.get("logist_id")
-    ]
 
-    # ✅ ДОБАВЛЯЕМ заявки фермеров (новое)
-    available_requests.extend(
-        [
-            (f"farm_{req_id}", req)
-            for req_id, req in farmer_logistics_requests.items()
-            if req.get("status") == "active"
-        ]
-    )
 
     if not available_requests:
-        text = "🚚 <b>Активные заявки</b>\n\n"
-        text += "❌ Нет доступных заявок\n\n"
-        text += "<i>Заявки появятся, когда экспортёры и фермеры создадут новые запросы на доставку</i>"
 
         keyboard.add(InlineKeyboardButton("⬅️ Назад", callback_data="logist_main_menu"))
 
@@ -17020,39 +13191,29 @@ async def show_logistic_requests_list(callback: types.CallbackQuery, state: FSMC
         await callback.answer()
         return
 
-    available_requests.sort(key=lambda x: x[1].get("created_at", ""), reverse=True)
 
     text = "🚚 <b>Активные заявки</b>\n\n"
     text += f"📋 Всего заявок: <b>{len(available_requests)}</b>\n\n"
 
     for req_key, req in available_requests[:10]:
         # ✅ Определяем тип заявки
-        req_type = "farm" if req_key.startswith("farm_") else "exp"
 
         if req_type == "farm":
-            # 🌾 Для ФЕРМЕРА
             culture = req.get("culture", "Не указана")
             volume = req.get("volume", 0)
-            port = req.get("port_to", "")
-            transport = req.get("transport_type", "")
 
             button_text = f"🌾 {culture} {volume:.0f}т → {port} ({transport})"
         else:
-            # 📦 Для ЭКСПОРТЕРА (как было)
             pull_id = req.get("pull_id")
             pull_info = (
-                pulls["pulls"].get(pull_id) or pulls["pulls"].get(str(pull_id)) or {}
             )
             culture = pull_info.get("culture", "Не указана")
             volume = req.get("volume", 0)
-            route_from = req.get("route_from", "Не указано")
-            route_to = req.get("route_to", "Не указано")
 
             button_text = f"📦 {culture} {volume:.0f}т | {route_from} → {route_to}"
 
-        keyboard.add(
-            InlineKeyboardButton(button_text, callback_data=f"view_request:{req_key}")
-        )
+            keyboard.add(
+            )
 
     if len(available_requests) > 10:
         text += f"\n<i>... и ещё {len(available_requests) - 10} заявок</i>"
@@ -17075,29 +13236,18 @@ async def make_offer_start(callback: types.CallbackQuery, state: FSMContext):
     try:
         parts = callback.data.split(":")
         source = parts[1]  # exporter или farmer
-        req_id = int(parts[2])  # request_id
 
         logging.info(f"✅ HANDLER TRIGGERED: source={source}, req_id={req_id}")
-
     except (IndexError, ValueError) as e:
         logging.error(f"❌ PARSE ERROR: {e}, data={callback.data}")
         await callback.answer("❌ Ошибка обработки данных", show_alert=True)
         return
 
-    # ПРОВЕРЯЕМ ЗАЯВКУ
-    if req_id not in shipping_requests:
-        logging.error(f"❌ REQUEST NOT FOUND: {req_id}")
-        await callback.answer("❌ Заявка не найдена", show_alert=True)
-        return
+            await callback.answer("❌ Заявка не найдена", show_alert=True)
+            return
 
-    request = shipping_requests[req_id]
-    user_id = callback.from_user.id
 
-    # ✅ ПРОВЕРЯЕМ, НЕТ ЛИ УЖЕ ПРЕДЛОЖЕНИЯ
     existing_offer = any(
-        o.get("request_id") == req_id
-        and o.get("logist_id") == user_id
-        and o.get("status") != "cancelled"
         for o in logistic_offers.values()
     )
 
@@ -17110,36 +13260,24 @@ async def make_offer_start(callback: types.CallbackQuery, state: FSMContext):
         )
         return
 
-    # 💾 СОХРАНЯЕМ ID ЗАЯВКИ
-    await state.update_data(request_id=req_id)
 
-    # 📋 ИНФОРМАЦИЯ О ЗАЯВКЕ
     pull_id = request.get("pull_id")
-    pull_info = pulls.get(pull_id, {})
     expected_price = request.get("desired_price", "Не указана")
 
     text = f"""✅ <b>СОЗДАНИЕ ПРЕДЛОЖЕНИЯ</b>
 
 📦 Заявка #{req_id}
-🌾 Культура: {pull_info.get('culture', 'Не указана')}
 📊 Объём: {request.get('volume', 0):.1f} т
-📍 Маршрут: {request.get('route_from', '')} → {request.get('route_to', '')}
 💰 Ожидаемая цена: <code>{expected_price}</code> ₽/т
 
 ━━━━━━━━━━━━━━━━━━━━
 
-<b>Шаг 1/3: Выберите тип транспорта</b>"""
 
     keyboard = InlineKeyboardMarkup(row_width=2)
 
     vehicles = [
-        ("🚂 ЖД", "railway"),
-        ("🚚 Зерновоз", "grain"),
-        ("🚛 Фура", "fura"),
     ]
 
-    for label, callback_data in vehicles:
-        keyboard.add(InlineKeyboardButton(label, callback_data=callback_data))
 
     keyboard.add(InlineKeyboardButton("❌ Отмена", callback_data="cancel_offer"))
 
@@ -17150,7 +13288,6 @@ async def make_offer_start(callback: types.CallbackQuery, state: FSMContext):
         logging.error(f"❌ EDIT ERROR: {e}")
         await callback.message.answer(text, reply_markup=keyboard, parse_mode="HTML")
 
-    # ✅ ПЕРЕХОДИМ К ВЫБОРУ ТРАНСПОРТА
     await LogisticOfferStatesGroup.vehicle_type.set()
     await callback.answer()
 
@@ -17160,29 +13297,20 @@ async def make_offer_start(callback: types.CallbackQuery, state: FSMContext):
 )
 async def offer_vehicle_selected(callback: types.CallbackQuery, state: FSMContext):
     """Выбор типа транспорта"""
-    # 📝 ПАРСИМ CALLBACK DATA
     vehicle_type = callback.data.replace("vehicle_", "")
 
-    # 📦 СЛОВАРЬ ПРАВИЛЬНЫХ НАЗВАНИЙ ТРАНСПОРТА
     vehicles_display = {
-        "railway": "🚂 ЖД",
         "grain": "🚚 Зерновоз",
         "truck": "🚛 Фура",
     }
-
-    # 🎯 ПОЛУЧАЕМ КРАСИВОЕ НАЗВАНИЕ
     transport_display = vehicles_display.get(vehicle_type, "Неизвестный транспорт")
 
-    # 💾 СОХРАНЯЕМ В STATE
     await state.update_data(vehicle_type=vehicle_type)
 
-    # 📋 ПОЛУЧАЕМ ДАННЫЕ ЗАЯВКИ
     data = await state.get_data()
     request_id = data.get("request_id")
-    request = shipping_requests.get(request_id, {})
     volume = request.get("volume", 0)
 
-    # 📝 ФОРМИРУЕМ ТЕКСТ
     text = f"""✅ <b>СОЗДАНИЕ ПРЕДЛОЖЕНИЯ</b>
 
 ✓ Транспорт: <b>{transport_display}</b>
@@ -17196,11 +13324,9 @@ async def offer_vehicle_selected(callback: types.CallbackQuery, state: FSMContex
 Введите стоимость доставки в рублях:
 <i>(например: 50000)</i>"""
 
-    # ⌨️ КЛАВИАТУРА
     keyboard = InlineKeyboardMarkup()
     keyboard.add(InlineKeyboardButton("❌ Отмена", callback_data="cancel_offer"))
 
-    # 🔄 ОБНОВЛЯЕМ СООБЩЕНИЕ И ПЕРЕХОДИМ НА ШАГ 2
     try:
         await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
         logging.info(f"✅ VEHICLE SELECTED: {vehicle_type}")
@@ -17208,7 +13334,6 @@ async def offer_vehicle_selected(callback: types.CallbackQuery, state: FSMContex
         logging.error(f"❌ EDIT ERROR: {e}")
         await callback.message.answer(text, reply_markup=keyboard, parse_mode="HTML")
 
-    # ✅ ПЕРЕХОДИМ НА ШАГ ВВОДА ЦЕНЫ
     await LogisticOfferStatesGroup.price.set()
     await callback.answer()
 
@@ -17216,8 +13341,6 @@ async def offer_vehicle_selected(callback: types.CallbackQuery, state: FSMContex
 @dp.message_handler(state=LogisticOfferStatesGroup.price)
 async def offer_price_entered(message: types.Message, state: FSMContext):
     """Ввод цены"""
-    user_id = message.from_user.id
-
     try:
         price_str = (
             message.text.strip().replace(" ", "").replace(",", "").replace("₽", "")
@@ -17226,39 +13349,29 @@ async def offer_price_entered(message: types.Message, state: FSMContext):
 
         if price <= 0:
             await message.answer(
-                "❌ Цена должна быть больше нуля!\n\n" "Попробуйте ещё раз:"
             )
             return
 
-        if price > 10000000:
             await message.answer(
-                "❌ Цена слишком большая (максимум 10 млн ₽)!\n\n" "Попробуйте ещё раз:"
             )
             return
 
     except ValueError:
         await message.answer(
-            "❌ Неправильный формат цены!\n\n" "Введите число (например: 50000):"
         )
         return
 
     await state.update_data(price=price)
 
-    # 📋 ПОЛУЧАЕМ ДАННЫЕ
     data = await state.get_data()
     vehicle_type = data.get("vehicle_type")
 
-    # 📦 СЛОВАРЬ НАЗВАНИЙ ТРАНСПОРТА
     vehicles_display = {
-        "railway": "🚂 ЖД",
         "grain": "🚚 Зерновоз",
         "truck": "🚛 Фура",
     }
-
-    # 🎯 ПОЛУЧАЕМ НАЗВАНИЕ ТРАНСПОРТА
     transport = vehicles_display.get(vehicle_type, "Неизвестный транспорт")
 
-    # 📝 ФОРМИРУЕМ ТЕКСТ
     text = f"""✅ <b>СОЗДАНИЕ ПРЕДЛОЖЕНИЯ</b>
 
 ✓ Транспорт: <b>{transport}</b>
@@ -17283,11 +13396,8 @@ async def offer_date_entered(message: types.Message, state: FSMContext):
     """Ввод даты доставки"""
     date_str = message.text.strip()
 
-    # 🔍 ВАЛИДАЦИЯ ДАТЫ
     try:
         delivery_date = datetime.strptime(date_str, "%d.%m.%Y")
-
-        # ПРОВЕРКА, ЧТО ДАТА НЕ В ПРОШЛОМ
         today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
         if delivery_date < today:
             await message.answer(
@@ -17296,7 +13406,6 @@ async def offer_date_entered(message: types.Message, state: FSMContext):
             )
             return
 
-        # ПРОВЕРКА, ЧТО ДАТА НЕ СЛИШКОМ ДАЛЕКО
         max_date = today + timedelta(days=365)
         if delivery_date > max_date:
             await message.answer(
@@ -17312,10 +13421,8 @@ async def offer_date_entered(message: types.Message, state: FSMContext):
         )
         return
 
-    # ✅ СОХРАНЯЕМ ДАТУ
     await state.update_data(delivery_date=date_str)
 
-    # 📋 ПЕРЕХОДИМ К ПОДТВЕРЖДЕНИЮ
     try:
         await show_offer_confirmation(message, state, user_id=message.from_user.id)
     except Exception as e:
@@ -17359,32 +13466,22 @@ async def show_offer_confirmation(
     data = await state.get_data()
 
     request_id = data.get("request_id")
-    request = shipping_requests.get(request_id, {})
-    pull_id = request.get("pull_id")
-    pull_info = pulls.get(pull_id, {})
+        pull_id = request.get("pull_id")
 
     vehicle_type = data.get("vehicle_type")
     price = data.get("price")
     delivery_date = data.get("delivery_date")
     additional_info = data.get("additional_info", "")
 
-    # 📦 СЛОВАРЬ НАЗВАНИЙ ТРАНСПОРТА
     vehicles_display = {
-        "fura": "🚛 Фура",
-        "railway": "🚂 Ж/д вагон",
         "grain": "🚚 Зерновоз",
     }
-
-    # 🎯 ПОЛУЧАЕМ НАЗВАНИЕ ТРАНСПОРТА
     transport = vehicles_display.get(vehicle_type, "Неизвестный транспорт")
 
-    # 📝 ФОРМИРУЕМ ТЕКСТ
     text = f"""📋 <b>ПОДТВЕРЖДЕНИЕ ПРЕДЛОЖЕНИЯ</b>
 
 📦 <b>ЗАЯВКА #{request_id}</b>
-🌾 Культура: {pull_info.get('culture', 'Не указана')}
 📦 Объём: {request.get('volume', 0):.1f} т
-📍 Маршрут: {request.get('route_from', '')} → {request.get('route_to', '')}
 
 ━━━━━━━━━━━━━━━━━━━━
 
@@ -17424,35 +13521,25 @@ async def offer_confirmed(callback: types.CallbackQuery, state: FSMContext):
         user_id = callback.from_user.id
         data = await state.get_data()
 
-        # 📋 ИЗВЛЕКАЕМ ДАННЫЕ ИЗ СОСТОЯНИЯ
         request_id = data.get("request_id")
         vehicle_type = data.get("vehicle_type")
         price = data.get("price")
         delivery_date = data.get("delivery_date")
         additional_info = data.get("additional_info", "")
 
-        # ✅ ПРОВЕРКА ОБЯЗАТЕЛЬНЫХ ДАННЫХ
         if not all([request_id, vehicle_type, price, delivery_date]):
             await callback.answer(
                 "❌ Ошибка: отсутствуют обязательные данные", show_alert=True
             )
             return
 
-        # 📦 СЛОВАРЬ НАЗВАНИЙ ТРАНСПОРТА
         vehicles_display = {
-            "fura": "🚛 Фура",
             "railway": "🚂 Ж/д вагон",
             "grain": "🚚 Зерновоз",
         }
-
-        # 🎯 ПОЛУЧАЕМ НАЗВАНИЕ ТРАНСПОРТА
         transport = vehicles_display.get(vehicle_type, "Неизвестный транспорт")
 
-        # 💾 ГЕНЕРИРУЕМ ID ПРЕДЛОЖЕНИЯ
-        global logistic_offers
-        offer_id = max(logistic_offers.keys()) + 1 if logistic_offers else 1
 
-        # 📋 СОЗДАЁМ ПРЕДЛОЖЕНИЕ
         offer = {
             "id": offer_id,
             "request_id": request_id,
@@ -17462,20 +13549,12 @@ async def offer_confirmed(callback: types.CallbackQuery, state: FSMContext):
             "delivery_date": delivery_date,
             "additional_info": additional_info,
             "status": "pending",
-            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
 
         logistic_offers[offer_id] = offer
-        logging.info(f"✅ Предложение #{offer_id} создано в БД")
 
-        # 👤 ПОЛУЧАЕМ ИНФОРМАЦИЮ
-        request = shipping_requests.get(request_id, {})
-        exporter_id = request.get("exporter_id")
-        logist_name = users.get(user_id, {}).get(
-            "company_name", "Логистическая компания"
-        )
+            )
 
-        # 📨 УВЕДОМЛЯЕМ ЛОГИСТА
         text = f"""✅ <b>ПРЕДЛОЖЕНИЕ ОТПРАВЛЕНО!</b>
 
 
@@ -17485,8 +13564,6 @@ async def offer_confirmed(callback: types.CallbackQuery, state: FSMContext):
 📅 Дата: <b>{delivery_date}</b>
 
 
-Ваше предложение #{offer_id} отправлено экспортёру.
-Вы получите уведомление, когда он примет решение."""
 
         keyboard = InlineKeyboardMarkup(row_width=1)
         keyboard.add(
@@ -17496,16 +13573,7 @@ async def offer_confirmed(callback: types.CallbackQuery, state: FSMContext):
 
         await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
 
-        # 🔔 УВЕДОМЛЯЕМ ЭКСПОРТЁРА
-        print(
-            f"🔍 DEBUG: Начало отправки уведомления. exporter_id={exporter_id}, offer_id={offer_id}"
-        )
-
-        if exporter_id:
             try:
-                print(f"🔍 DEBUG: exporter_id найден: {exporter_id}, создаём сообщение")
-
-                exporter_text = f"""🔔 <b>НОВОЕ ПРЕДЛОЖЕНИЕ ПО ВАШЕЙ ЗАЯВКЕ!</b>
 
 
 📦 <b>Заявка #{request_id}</b>
@@ -17515,52 +13583,30 @@ async def offer_confirmed(callback: types.CallbackQuery, state: FSMContext):
 📅 Дата доставки: <b>{delivery_date}</b>"""
 
                 if additional_info:
-                    exporter_text += f"\n\nℹ️ Дополнительно:\n{additional_info}"
 
-                print(f"🔍 DEBUG: Сообщение составлено, создаём клавиатуру с кнопкой")
-
-                exporter_keyboard = InlineKeyboardMarkup()
-                exporter_keyboard.add(
-                    InlineKeyboardButton(
-                        "👁 Посмотреть", callback_data=f"view_offer_details_{offer_id}"
+                        InlineKeyboardButton(
+                            "👁 Посмотреть", callback_data=f"view_offer_details_{offer_id}"
+                        )
                     )
-                )
-
-                print(
-                    f"🔍 DEBUG: Отправляем сообщение экспортёру {exporter_id} с кнопкой view_offer_details_{offer_id}"
-                )
+                    )
 
                 await bot.send_message(
-                    exporter_id,
-                    exporter_text,
-                    reply_markup=exporter_keyboard,
                     parse_mode="HTML",
                 )
-
-                print(f"✅ DEBUG: Кнопка успешно отправлена экспортёру {exporter_id}")
-                logging.info(f"📧 Уведомление отправлено экспортёру {exporter_id}")
-
             except Exception as e:
-                print(f"❌ DEBUG ОШИБКА: {type(e).__name__}: {str(e)}")
                 logging.error(
-                    f"❌ Ошибка отправки уведомления экспортёру {exporter_id}: {e}",
                     exc_info=True,
                 )
         else:
-            print(
-                f"⚠️ DEBUG: exporter_id=None или пусто! request_id={request_id}, request={request}"
             )
-            logging.warning(f"⚠️ Экспортёр не найден для заявки #{request_id}")
 
         await state.finish()
         await callback.answer("✅ Предложение отправлено!")
 
         logging.info(
-            f"✅ Логист {user_id} создал предложение #{offer_id} для заявки #{request_id}"
         )
 
     except Exception as e:
-        print(f"❌ DEBUG КРИТИЧЕСКАЯ ОШИБКА: {type(e).__name__}: {str(e)}")
         logging.error(f"❌ Критическая ошибка в offer_confirmed: {e}", exc_info=True)
         await callback.answer(f"❌ Ошибка: {str(e)}", show_alert=True)
         await callback.message.answer(
@@ -17570,51 +13616,9 @@ async def offer_confirmed(callback: types.CallbackQuery, state: FSMContext):
         )
 
 
-@dp.callback_query_handler(text="cancel_offer", state="*")
-async def offer_cancelled(callback: types.CallbackQuery, state: FSMContext):
-    """Отмена создания предложения"""
-    user_id = callback.from_user.id
-
-    # 📋 ПОЛУЧАЕМ ДАННЫЕ ПЕРЕД ЗАВЕРШЕНИЕМ СОСТОЯНИЯ
-    data = await state.get_data()
-    request_id = data.get("request_id")
-
-    # 🔚 ЗАВЕРШАЕМ СОСТОЯНИЕ
-    await state.finish()
-
-    # 📝 ФОРМИРУЕМ ТЕКСТ
-    text = """❌ <b>СОЗДАНИЕ ПРЕДЛОЖЕНИЯ ОТМЕНЕНО</b>
-
-Вы отменили процесс создания предложения.
-Вернитесь на главное меню, чтобы продолжить."""
-
-    # 🎨 КЛАВИАТУРА
-    keyboard = InlineKeyboardMarkup(row_width=1)
-    keyboard.add(InlineKeyboardButton("🔙 Главное меню", callback_data="back_to_main"))
-
-    # 📤 ОТПРАВЛЯЕМ СООБЩЕНИЕ
-    try:
-        await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
-    except Exception as e:
-        logging.warning(f"⚠️ Не удалось отредактировать сообщение: {e}")
-        try:
-            await callback.message.answer(
-                text, reply_markup=keyboard, parse_mode="HTML"
-            )
-        except Exception as e:
-            logging.error(f"❌ Ошибка отправки сообщения об отмене: {e}")
-
-    await callback.answer("❌ Отмена выполнена", show_alert=False)
-
-    logging.info(
-        f"ℹ️ Логист {user_id} отменил создание предложения для заявки #{request_id}"
-    )
-
-
 # ============================================================================
 # ЛОГИСТ: УПРАВЛЕНИЕ ПРЕДЛОЖЕНИЯМИ
 # ============================================================================
-@dp.message_handler(lambda m: m.text == "💼 Мои предложения", state="*")
 async def logistic_my_offers_text_button(message: types.Message, state: FSMContext):
     """Логист нажал на ТЕКСТОВУЮ кнопку '💼 Мои предложения'"""
 
@@ -17630,7 +13634,6 @@ async def logistic_my_offers_text_button(message: types.Message, state: FSMConte
         my_offers = [
             (offer_id, offer)
             for offer_id, offer in logistic_offers.items()
-            if offer.get("logist_id") == user_id
         ]
 
         logger.info(f"[{user_id}] 📦 Найдено предложений: {len(my_offers)}")
@@ -17648,19 +13651,12 @@ async def logistic_my_offers_text_button(message: types.Message, state: FSMConte
             await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
             return
 
-        # ✅ ЛОГИРУЕМ РЕАЛЬНЫЕ СТАТУСЫ
-        by_status = {}
         for offer_id, offer in my_offers:
-            status = offer.get("status", "pending")
-            logger.info(
-                f"[{user_id}] 📌 Предложение #{offer_id}: статус = '{status}'"
-            )  # 🔍 ЛОГИРОВАНИЕ
             if status not in by_status:
                 by_status[status] = []
             by_status[status].append((offer_id, offer))
 
         logger.info(
-            f"[{user_id}] 📊 Все статусы: {dict((k, len(v)) for k, v in by_status.items())}"
         )
 
         text = f"📋 <b>МОИ ПРЕДЛОЖЕНИЯ</b> ({len(my_offers)} шт)\n\n"
@@ -17682,7 +13678,6 @@ async def logistic_my_offers_text_button(message: types.Message, state: FSMConte
                 if button_count >= 10:
                     break
                 price = offer.get("price", 0)
-                button_text = f"{emoji} #{offer_id} | {price:,.0f}₽"
                 keyboard.add(
                     InlineKeyboardButton(
                         button_text, callback_data=f"view_my_offer_{offer_id}"
@@ -17713,13 +13708,10 @@ async def show_my_offers(callback: types.CallbackQuery, state: FSMContext):
         try:
             await state.finish()
             logger.debug(f"[{user_id}] FSM state завершён")
-        except:
-            logger.debug(f"[{user_id}] State был пуст")
 
         my_offers = [
             (offer_id, offer)
             for offer_id, offer in logistic_offers.items()
-            if offer.get("logist_id") == user_id
         ]
 
         logger.info(f"[{user_id}] Найдено предложений: {len(my_offers)}")
@@ -17743,7 +13735,6 @@ async def show_my_offers(callback: types.CallbackQuery, state: FSMContext):
         # ✅ НЕ СОЗДАЁМ ПУСТОЙ СЛОВАРЬ! СОБИРАЕМ ВСЕ СТАТУСЫ
         by_status = {}
         for offer_id, offer in my_offers:
-            status = offer.get("status", "pending")
             logger.info(f"[{user_id}] 📌 Предложение #{offer_id}: статус = '{status}'")
             if status not in by_status:
                 by_status[status] = []
@@ -17795,31 +13786,20 @@ async def show_my_offers(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.callback_query_handler(lambda c: c.data.startswith("view_my_offer_"), state="*")
 async def view_my_offer_details(callback: types.CallbackQuery, state: FSMContext):
-    """Детальный просмотр своего предложения"""
     await state.finish()
     try:
-        offer_id = int(callback.data.split("_")[-1])
     except (IndexError, ValueError):
         await callback.answer("❌ Ошибка получения ID предложения", show_alert=True)
         return
 
-    if offer_id not in logistic_offers:
         await callback.answer("❌ Предложение не найдено", show_alert=True)
         return
-
-    offer = logistic_offers[offer_id]
     user_id = callback.from_user.id
-    if offer.get("logist_id") != user_id:
         await callback.answer("❌ Это не ваше предложение", show_alert=True)
         return
 
     request_id = offer.get("request_id")
-    request = shipping_requests.get(request_id, {})
-    pull_id = request.get("pull_id")
-    pull_info = pulls.get(pull_id, {})
-    exporter_id = request.get("exporter_id")
-    exporter_info = users.get(exporter_id, {})
-    exporter_company = exporter_info.get("company_name", "Не указана")
+        pull_id = request.get("pull_id")
     vehicles_display = {
         "fura": "🚛 Фура",
         "railway": "🚂 Ж/д вагон",
@@ -17828,14 +13808,9 @@ async def view_my_offer_details(callback: types.CallbackQuery, state: FSMContext
 
     text = f"📋 <b>МОЁ ПРЕДЛОЖЕНИЕ #{offer_id}</b>\n\n"
     text += f"📦 <b>ЗАЯВКА #{request_id}</b>\n"
-    text += f"🌾 Культура: {pull_info.get('culture', 'Не указана')}\n"
     text += f"📦 Объём: {request.get('volume', 0):.1f} т\n"
-    text += (
-        f"📍 Маршрут: {request.get('route_from', '')} → {request.get('route_to', '')}\n"
     )
-    text += f"👤 Заказчик: {exporter_company}\n\n"
     text += "━━━━━━━━━━━━━━━━━━━━\n\n"
-    text += f"<b>ВАШЕ ПРЕДЛОЖЕНИЕ:</b>\n\n"
     transport = vehicles_display.get(offer.get("vehicle_type"), "Не указан")
     text += f"🚛 Транспорт: <b>{transport}</b>\n"
     text += f"💰 Стоимость: <b>{offer.get('price', 0):,.0f} ₽</b>\n"
@@ -17846,25 +13821,19 @@ async def view_my_offer_details(callback: types.CallbackQuery, state: FSMContext
     if offer.get("updated_at"):
         text += f"✏️ Изменено: {offer.get('updated_at')}\n"
     text += "\n"
-    status = offer.get("status", "pending")
     status_icon = status_map.get(status, "⚪").split()[0]
     status_name = get_status_name(status)
 
     text += f"📊 Статус: <b>{status_icon} {status_name}</b>\n"
     if status == "accepted":
-        text += f"\n✅ <b>Ваше предложение принято!</b>\n"
-        text += f"<i>Ожидайте дальнейших инструкций от заказчика</i>"
     elif status == "rejected":
-        text += f"\n❌ <b>Предложение отклонено</b>\n"
         if offer.get("rejection_reason"):
             text += f"<i>Причина: {offer.get('rejection_reason')}</i>"
     elif status == "cancelled":
-        text += f"\n🚫 <b>Предложение отменено вами</b>"
         if offer.get("cancelled_at"):
             text += f"\n<i>Отменено: {offer.get('cancelled_at')}</i>"
 
     keyboard = InlineKeyboardMarkup(row_width=2)
-    if status == "pending":
         keyboard.add(
             InlineKeyboardButton(
                 "✏️ Редактировать цену", callback_data=f"edit_price_{offer_id}"
@@ -17888,22 +13857,16 @@ async def cancel_my_offer_confirm(callback: types.CallbackQuery, state: FSMConte
     await state.finish()
 
     try:
-        offer_id = int(callback.data.split("_")[-1])
     except (IndexError, ValueError):
         await callback.answer("❌ Ошибка получения ID", show_alert=True)
         return
 
-    if offer_id not in logistic_offers:
         await callback.answer("❌ Предложение не найдено", show_alert=True)
         return
 
-    offer = logistic_offers[offer_id]
-
-    if offer.get("logist_id") != callback.from_user.id:
         await callback.answer("❌ Это не ваше предложение", show_alert=True)
         return
 
-    if offer.get("status") != "pending":
         await callback.answer(
             "❌ Можно отменить только ожидающие предложения", show_alert=True
         )
@@ -17918,10 +13881,8 @@ async def cancel_my_offer_confirm(callback: types.CallbackQuery, state: FSMConte
     transport = vehicles_display.get(offer.get("vehicle_type"), "Неизвестный")
 
     text = f"❓ <b>ОТМЕНА ПРЕДЛОЖЕНИЯ #{offer_id}</b>\n\n"
-    text += f"Вы уверены, что хотите отменить это предложение?\n\n"
     text += f"🚛 Транспорт: {transport}\n"
     text += f"💰 Стоимость: {offer.get('price', 0):,.0f} ₽\n\n"
-    text += f"<i>Это действие нельзя будет отменить</i>"
 
     keyboard = InlineKeyboardMarkup(row_width=2)
     keyboard.add(
@@ -17939,56 +13900,11 @@ async def cancel_my_offer_confirm(callback: types.CallbackQuery, state: FSMConte
     lambda c: c.data.startswith("confirm_cancel_offer_"), state="*"
 )
 async def cancel_my_offer_confirmed(callback: types.CallbackQuery, state: FSMContext):
-    """Отмена предложения подтверждена"""
     await state.finish()
-
     try:
-        offer_id = int(callback.data.split("_")[-1])
     except (IndexError, ValueError):
         await callback.answer("❌ Ошибка получения ID", show_alert=True)
         return
-
-    if offer_id not in logistic_offers:
-        await callback.answer("❌ Предложение не найдено", show_alert=True)
-        return
-
-    offer = logistic_offers[offer_id]
-
-    # Обновляем статус
-    offer["status"] = "cancelled"
-    offer["cancelled_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    # Уведомляем экспортёра
-    request_id = offer.get("request_id")
-    request = shipping_requests.get(request_id, {})
-    exporter_id = request.get("exporter_id")
-    logist_name = users.get(callback.from_user.id, {}).get("company_name", "Логист")
-
-    if exporter_id:
-        try:
-            await bot.send_message(
-                exporter_id,
-                f"🔔 <b>Предложение #{offer_id} отменено</b>\n\n"
-                f"📦 Заявка #{request_id}\n"
-                f"👤 Логист: {logist_name}\n"
-                f"К сожалению, логист отменил своё предложение.",
-                parse_mode="HTML",
-            )
-        except Exception as e:
-            logging.error(f"Ошибка уведомления экспортёра: {e}")
-
-    text = f"✅ <b>ПРЕДЛОЖЕНИЕ #{offer_id} ОТМЕНЕНО</b>\n\n"
-    text += f"Ваше предложение успешно отменено.\n"
-    text += f"Экспортёр получил уведомление об этом."
-
-    keyboard = InlineKeyboardMarkup()
-    keyboard.add(InlineKeyboardButton("💼 Мои предложения", callback_data="my_offers"))
-    keyboard.add(InlineKeyboardButton("🔙 Главное меню", callback_data="back_to_main"))
-
-    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
-    await callback.answer("✅ Предложение отменено")
-
-    logging.info(f"❌ Логист {callback.from_user.id} отменил предложение #{offer_id}")
 
 
 @dp.callback_query_handler(lambda c: c.data.startswith("edit_offer_"), state="*")
@@ -17997,45 +13913,30 @@ async def edit_offer_start(callback: types.CallbackQuery, state: FSMContext):
     await state.finish()
 
     try:
-        offer_id = int(callback.data.split("_")[-1])
     except (IndexError, ValueError):
         await callback.answer("❌ Ошибка получения ID", show_alert=True)
         return
 
-    if offer_id not in logistic_offers:
         await callback.answer("❌ Предложение не найдено", show_alert=True)
         return
 
-    offer = logistic_offers[offer_id]
-
-    if offer.get("logist_id") != callback.from_user.id:
         await callback.answer("❌ Это не ваше предложение", show_alert=True)
         return
 
-    if offer.get("status") != "pending":
         await callback.answer(
             "❌ Можно редактировать только ожидающие предложения", show_alert=True
         )
         return
 
     text = f"✏️ <b>РЕДАКТИРОВАНИЕ ПРЕДЛОЖЕНИЯ #{offer_id}</b>\n\n"
-    text += f"Текущие данные:\n\n"
     text += f"🚛 Транспорт: {offer.get('vehicle_type')}\n"
     text += f"💰 Стоимость: {offer.get('price', 0):,.0f} ₽\n"
     text += f"📅 Дата: {offer.get('delivery_date')}\n\n"
-    text += f"Что вы хотите изменить?"
 
     keyboard = InlineKeyboardMarkup(row_width=1)
     keyboard.add(
         InlineKeyboardButton(
-            "🚛 Изменить транспорт", callback_data=f"edit_vehicle_{offer_id}"
-        ),
-        InlineKeyboardButton(
             "💰 Изменить цену", callback_data=f"edit_price_{offer_id}"
-        ),
-        InlineKeyboardButton("📅 Изменить дату", callback_data=f"edit_date_{offer_id}"),
-        InlineKeyboardButton(
-            "ℹ️ Изменить доп. информацию", callback_data=f"edit_info_{offer_id}"
         ),
     )
     keyboard.add(
@@ -18061,21 +13962,17 @@ async def edit_offer_price(callback: types.CallbackQuery, state: FSMContext):
     await state.finish()
 
     try:
-        offer_id = int(callback.data.split("_")[-1])
     except (IndexError, ValueError):
         await callback.answer("❌ Ошибка", show_alert=True)
         return
 
-    offer = logistic_offers.get(offer_id)
     if not offer:
         await callback.answer("❌ Предложение не найдено", show_alert=True)
         return
 
-    if offer.get("logist_id") != callback.from_user.id:
         await callback.answer("❌ Это не ваше предложение", show_alert=True)
         return
 
-    if offer.get("status") != "pending":
         await callback.answer(
             "❌ Нельзя редактировать обработанные предложения", show_alert=True
         )
@@ -18083,10 +13980,8 @@ async def edit_offer_price(callback: types.CallbackQuery, state: FSMContext):
 
     await state.update_data(offer_id=offer_id, field="price")
 
-    text = f"💰 <b>ИЗМЕНЕНИЕ ЦЕНЫ</b>\n\n"
     text += f"Заявка #{offer.get('request_id')}\n\n"
     text += f"Текущая цена: <b>{offer.get('price', 0):,.0f} ₽</b>\n\n"
-    text += f"Введите новую цену в рублях:"
 
     keyboard = InlineKeyboardMarkup()
     keyboard.add(
@@ -18100,12 +13995,10 @@ async def edit_offer_price(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.message_handler(state=EditOfferStatesGroup.value)
 async def edit_offer_value_entered(message: types.Message, state: FSMContext):
-    """Сохранение изменённого значения"""
     data = await state.get_data()
     offer_id = data.get("offer_id")
     field = data.get("field")
 
-    offer = logistic_offers.get(offer_id)
     if not offer:
         await message.answer("❌ Предложение не найдено")
         await state.finish()
@@ -18117,7 +14010,6 @@ async def edit_offer_value_entered(message: types.Message, state: FSMContext):
             new_price = float(
                 message.text.strip().replace(" ", "").replace(",", "").replace("₽", "")
             )
-            if new_price <= 0 or new_price > 10000000:
                 await message.answer(
                     "❌ Неправильная цена! Диапазон: 1 - 10 млн ₽\n\nПопробуйте ещё раз:"
                 )
@@ -18127,23 +14019,13 @@ async def edit_offer_value_entered(message: types.Message, state: FSMContext):
             offer["price"] = new_price
             offer["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-            text = f"✅ <b>ЦЕНА ИЗМЕНЕНА!</b>\n\n"
-            text += f"Было: {old_price:,.0f} ₽\n"
-            text += f"Стало: <b>{new_price:,.0f} ₽</b>\n\n"
-            text += f"Экспортёр получит уведомление об изменении"
 
-            # Уведомляем экспортёра
             request_id = offer.get("request_id")
-            request = shipping_requests.get(request_id, {})
-            exporter_id = request.get("exporter_id")
-            logist_name = users.get(message.from_user.id, {}).get(
                 "company_name", "Логист"
             )
 
-            if exporter_id:
                 try:
                     await bot.send_message(
-                        exporter_id,
                         f"🔔 <b>Предложение #{offer_id} изменено</b>\n\n"
                         f"📦 Заявка #{request_id}\n"
                         f"👤 Логист: {logist_name}\n"
@@ -18183,32 +14065,19 @@ async def edit_offer_value_entered(message: types.Message, state: FSMContext):
 async def notify_logistic_offer_accepted(offer_id: int, exporter_id: int):
     """Уведомить логиста о принятии предложения"""
     try:
-        if offer_id not in logistic_offers:
             return
-
-        offer = logistic_offers[offer_id]
-        logist_id = offer.get("logist_id")
 
         if not logist_id:
             return
 
         request_id = offer.get("request_id")
-        request = shipping_requests.get(request_id, {})
-        exporter_info = users.get(exporter_id, {})
-        exporter_company = exporter_info.get("company_name", "Компания")
 
-        text = f"🎉 <b>ВАШЕ ПРЕДЛОЖЕНИЕ ПРИНЯТО!</b>\n\n"
         text += f"📋 Предложение #{offer_id}\n"
         text += f"📦 Заявка #{request_id}\n"
         text += f"👤 Заказчик: {exporter_company}\n\n"
         text += f"🚛 Транспорт: {offer.get('vehicle_type')}\n"
         text += f"💰 Стоимость: {offer.get('price', 0):,.0f} ₽\n"
         text += f"📅 Дата доставки: {offer.get('delivery_date')}\n\n"
-        text += f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        text += f"✅ <b>Следующие шаги:</b>\n"
-        text += f"1. Свяжитесь с заказчиком\n"
-        text += f"2. Уточните детали погрузки\n"
-        text += f"3. Подготовьте транспорт\n\n"
 
         if exporter_info.get("phone"):
             text += f"📞 Телефон заказчика: {exporter_info.get('phone')}\n"
@@ -18238,33 +14107,20 @@ async def notify_logistic_offer_rejected(
 ):
     """Уведомить логиста об отклонении предложения"""
     try:
-        if offer_id not in logistic_offers:
             return
-
-        offer = logistic_offers[offer_id]
-        logist_id = offer.get("logist_id")
 
         if not logist_id:
             return
 
         request_id = offer.get("request_id")
-        exporter_info = users.get(exporter_id, {})
-        exporter_company = exporter_info.get("company_name", "Компания")
 
-        text = f"❌ <b>ПРЕДЛОЖЕНИЕ ОТКЛОНЕНО</b>\n\n"
         text += f"📋 Предложение #{offer_id}\n"
         text += f"📦 Заявка #{request_id}\n"
         text += f"👤 Заказчик: {exporter_company}\n\n"
-        text += f"К сожалению, ваше предложение не было принято.\n\n"
 
         if reason:
             text += f"💬 <b>Причина:</b>\n{reason}\n\n"
 
-        text += f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        text += f"💡 <b>Рекомендации:</b>\n"
-        text += f"• Пересмотрите свою ценовую политику\n"
-        text += f"• Предложите более гибкие условия\n"
-        text += f"• Ищите другие заявки\n"
 
         keyboard = InlineKeyboardMarkup()
         keyboard.add(
@@ -18289,42 +14145,29 @@ async def notify_logistic_offer_rejected(
 async def notify_logistic_new_request(request_id: int):
     """Уведомить всех логистов о новой заявке"""
     try:
-        if request_id not in shipping_requests:
             return
-
-        request = shipping_requests[request_id]
         pull_id = request.get("pull_id")
-        pull_info = pulls.get(pull_id, {})
 
-        # Получаем всех логистов
-        logistics = [
-            uid for uid, user in users.items() if user.get("role") == "logistic"
-        ]
 
         if not logistics:
             return
 
-        text = f"🔔 <b>НОВАЯ ЗАЯВКА НА ДОСТАВКУ!</b>\n\n"
         text += f"📦 Заявка #{request_id}\n"
         text += f"🌾 Культура: {pull_info.get('culture', 'Не указана')}\n"
         text += f"📦 Объём: {request.get('volume', 0):.1f} т\n"
         text += f"📍 Маршрут: {request.get('route_from', '')} → {request.get('route_to', '')}\n"
 
-        if request.get("desired_date"):
-            text += f"📅 Желаемая дата: {request.get('desired_date')}\n"
 
         if request.get("budget"):
             text += f"💰 Бюджет: {request.get('budget'):,.0f} ₽\n"
 
-        text += f"\n<i>Торопитесь! Конкуренты уже смотрят эту заявку</i>"
 
         keyboard = InlineKeyboardMarkup()
         keyboard.add(
-            InlineKeyboardButton(
-                "👀 Посмотреть заявку",
-                callback_data=f"view_shipping_request_{request_id}",
+                InlineKeyboardButton(
+                    "👀 Посмотреть заявку",
+                )
             )
-        )
         keyboard.add(
             InlineKeyboardButton(
                 "📦 Все заявки", callback_data="logistic_requests_list"
@@ -18354,24 +14197,17 @@ async def notify_logistic_new_request(request_id: int):
 async def notify_logistic_delivery_started(delivery_id: int):
     """Уведомить логиста о начале доставки"""
     try:
-        if delivery_id not in deliveries:
             return
-
-        delivery = deliveries[delivery_id]
-        logist_id = delivery.get("logist_id")
 
         if not logist_id:
             return
 
         request_id = delivery.get("request_id")
 
-        text = f"🚚 <b>ДОСТАВКА НАЧАЛАСЬ!</b>\n\n"
         text += f"📦 Доставка #{delivery_id}\n"
         text += f"📋 Заявка #{request_id}\n\n"
-        text += f"✅ Статус изменён на: <b>В пути</b>\n\n"
         text += f"📍 Маршрут: {delivery.get('route_from', '')} → {delivery.get('route_to', '')}\n"
         text += f"📅 Плановая дата: {delivery.get('delivery_date', '')}\n\n"
-        text += f"<i>Не забудьте обновить статус по прибытии!</i>"
 
         keyboard = InlineKeyboardMarkup()
         keyboard.add(
@@ -18393,27 +14229,16 @@ async def notify_logistic_delivery_started(delivery_id: int):
 async def notify_logistic_delivery_completed(delivery_id: int):
     """Уведомить логиста о завершении доставки"""
     try:
-        if delivery_id not in deliveries:
             return
-
-        delivery = deliveries[delivery_id]
-        logist_id = delivery.get("logist_id")
 
         if not logist_id:
             return
 
         offer_id = delivery.get("offer_id")
-        offer = logistic_offers.get(offer_id, {})
         price = offer.get("price", 0)
 
-        text = f"✅ <b>ДОСТАВКА ЗАВЕРШЕНА!</b>\n\n"
         text += f"📦 Доставка #{delivery_id}\n"
         text += f"💰 Сумма: <b>{price:,.0f} ₽</b>\n\n"
-        text += f"🎉 Поздравляем с успешным выполнением заказа!\n\n"
-        text += f"📊 <b>Следующие шаги:</b>\n"
-        text += f"• Получите оплату от заказчика\n"
-        text += f"• Закройте документы\n"
-        text += f"• Оставьте отзыв о сотрудничестве"
 
         keyboard = InlineKeyboardMarkup()
         keyboard.add(
@@ -18440,27 +14265,16 @@ async def notify_logistic_delivery_completed(delivery_id: int):
 async def notify_logistic_request_cancelled(request_id: int, reason: str = None):
     """Уведомить логистов об отмене заявки"""
     try:
-        if request_id not in shipping_requests:
             return
 
-        # Находим все предложения по этой заявке
-        related_offers = [
-            (offer_id, offer)
-            for offer_id, offer in logistic_offers.items()
-            if offer.get("request_id") == request_id
-            and offer.get("status") == "pending"
-        ]
 
-        if not related_offers:
             return
 
-        text = f"❌ <b>ЗАЯВКА ОТМЕНЕНА</b>\n\n"
         text += f"📦 Заявка #{request_id} была отменена заказчиком.\n\n"
 
         if reason:
             text += f"💬 Причина: {reason}\n\n"
 
-        text += f"Ваше предложение автоматически отменено."
 
         keyboard = InlineKeyboardMarkup()
         keyboard.add(
@@ -18470,18 +14284,13 @@ async def notify_logistic_request_cancelled(request_id: int, reason: str = None)
         )
 
         # Уведомляем каждого логиста
-        for offer_id, offer in related_offers:
-            logist_id = offer.get("logist_id")
-            if logist_id:
-                try:
-                    await bot.send_message(
-                        logist_id, text, reply_markup=keyboard, parse_mode="HTML"
-                    )
-                    # Отменяем предложение
-                    offer["status"] = "cancelled"
-                    await asyncio.sleep(0.1)
-                except Exception as e:
-                    logging.error(f"Ошибка уведомления логиста {logist_id}: {e}")
+            try:
+                await bot.send_message(
+                    logist_id, text, reply_markup=keyboard, parse_mode="HTML"
+                )
+                await asyncio.sleep(0.1)
+            except Exception as e:
+                logging.error(f"Ошибка уведомления логиста {logist_id}: {e}")
 
         logging.info(f"❌ Уведомления об отмене заявки #{request_id} отправлены")
 
@@ -18501,12 +14310,6 @@ async def show_my_deliveries(callback: types.CallbackQuery, state: FSMContext):
 
     user_id = callback.from_user.id
 
-    # Получаем доставки логиста
-    my_deliveries = [
-        (deliv_id, deliv)
-        for deliv_id, deliv in deliveries.items()
-        if deliv.get("logist_id") == user_id
-    ]
 
     if not my_deliveries:
         text = "🚚 <b>МОИ ДОСТАВКИ</b>\n\n"
@@ -18529,10 +14332,8 @@ async def show_my_deliveries(callback: types.CallbackQuery, state: FSMContext):
     by_status = {"pending": [], "in_progress": [], "completed": [], "cancelled": []}
 
     for deliv_id, deliv in my_deliveries:
-        status = deliv.get("status", "pending")
         by_status[status].append((deliv_id, deliv))
 
-    text = f"🚚 <b>МОИ ДОСТАВКИ</b>\n\n"
     text += f"Всего доставок: <b>{len(my_deliveries)}</b>\n\n"
 
     active = len(by_status["pending"]) + len(by_status["in_progress"])
@@ -18555,10 +14356,8 @@ async def show_my_deliveries(callback: types.CallbackQuery, state: FSMContext):
         if delivs:
             for deliv_id, deliv in delivs[:5]:
                 request_id = deliv.get("request_id")
-                request = shipping_requests.get(request_id, {})
 
                 route = (
-                    f"{request.get('route_from', '')} → {request.get('route_to', '')}"
                 )
 
                 button_text = f"{emoji} #{deliv_id} | {route}"
@@ -18584,46 +14383,29 @@ async def show_logistic_statistics(callback: types.CallbackQuery, state: FSMCont
     user_id = callback.from_user.id
 
     # Собираем статистику
-    my_offers = [o for o in logistic_offers.values() if o.get("logist_id") == user_id]
-    my_deliveries = [d for d in deliveries.values() if d.get("logist_id") == user_id]
 
     total_offers = len(my_offers)
-    accepted_offers = len([o for o in my_offers if o.get("status") == "accepted"])
-    rejected_offers = len([o for o in my_offers if o.get("status") == "rejected"])
-    pending_offers = len([o for o in my_offers if o.get("status") == "pending"])
 
     completed_deliveries = len(
-        [d for d in my_deliveries if d.get("status") == "completed"]
     )
     active_deliveries = len(
-        [d for d in my_deliveries if d.get("status") in ["pending", "in_progress"]]
     )
 
     # Подсчитываем общий заработок
-    total_earnings = sum(
-        logistic_offers.get(d.get("offer_id"), {}).get("price", 0)
-        for d in my_deliveries
-        if d.get("status") == "completed"
-    )
 
     # Конверсия
     conversion = (accepted_offers / total_offers * 100) if total_offers > 0 else 0
 
-    text = f"📊 <b>СТАТИСТИКА РАБОТЫ</b>\n\n"
-    text += f"━━━━━━━━━━━━━━━━━━━━\n\n"
 
-    text += f"<b>ПРЕДЛОЖЕНИЯ:</b>\n"
     text += f"📋 Всего отправлено: <b>{total_offers}</b>\n"
     text += f"✅ Принято: <b>{accepted_offers}</b>\n"
     text += f"❌ Отклонено: <b>{rejected_offers}</b>\n"
     text += f"🕐 Ожидают ответа: <b>{pending_offers}</b>\n"
     text += f"📈 Конверсия: <b>{conversion:.1f}%</b>\n\n"
 
-    text += f"<b>ДОСТАВКИ:</b>\n"
     text += f"🚚 Активные: <b>{active_deliveries}</b>\n"
     text += f"✅ Завершённые: <b>{completed_deliveries}</b>\n\n"
 
-    text += f"<b>ФИНАНСЫ:</b>\n"
     text += f"💰 Общий заработок: <b>{total_earnings:,.0f} ₽</b>\n"
     if completed_deliveries > 0:
         avg_earning = total_earnings / completed_deliveries
@@ -18638,169 +14420,15 @@ async def show_logistic_statistics(callback: types.CallbackQuery, state: FSMCont
     await callback.answer()
 
 
-# ==================== ОБРАБОТЧИКИ ДЛЯ ЭКСПЕДИТОРОВ ====================
-
-
-@dp.message_handler(lambda m: m.text == "➕ Создать карточку услуг", state="*")
-async def create_expeditor_offer_start(message: types.Message, state: FSMContext):
-    """Начало создания карточки экспедитора"""
-    user_id = message.from_user.id
-
-    if user_id not in users or users[user_id].get("role") != "expeditor":
-        await message.answer("❌ Эта функция доступна только экспедиторам")
-        return
-
-    await message.answer(
-        "🚛 <b>Создание карточки услуг</b>\n\n"
-        "Шаг 1/5: Тип услуги\n\n"
-        "Укажите тип услуги (например: Оформление ДТ, Таможенное оформление):",
-        parse_mode="HTML",
-    )
-    await ExcavatorStatesGroup.service_type.set()
-
-
-@dp.message_handler(state=ExcavatorStatesGroup.service_type)
-async def expeditor_service_type(message: types.Message, state: FSMContext):
-    """Обработка типа услуги"""
-    service_type = message.text.strip()
-
-    await state.update_data(service_type=service_type)
-
-    await message.answer(
-        "🚛 <b>Создание карточки услуг</b>\n\n"
-        "Шаг 2/5: Стоимость\n\n"
-        "Укажите стоимость услуги (₽):",
-        parse_mode="HTML",
-    )
-    await ExcavatorStatesGroup.price.set()
-
-
-@dp.message_handler(state=ExcavatorStatesGroup.price)
-async def expeditor_price(message: types.Message, state: FSMContext):
-    """Обработка стоимости"""
-    try:
-        price = float(message.text.replace(",", ".").replace(" ", ""))
-        if price <= 0:
-            raise ValueError
-
-        await state.update_data(price=price)
-
-        await message.answer(
-            "🚛 <b>Создание карточки услуг</b>\n\n"
-            "Шаг 3/5: Сроки выполнения\n\n"
-            "Укажите сроки (например: 3-5 дней):",
-            parse_mode="HTML",
-        )
-        await ExcavatorStatesGroup.terms.set()
-
-    except Exception as e:
-        await message.answer("❌ Неверный формат. Укажите число (например: 15000)")
-
-
-@dp.message_handler(state=ExcavatorStatesGroup.terms)
-async def expeditor_terms(message: types.Message, state: FSMContext):
-    """Обработка сроков"""
-    terms = message.text.strip()
-
-    await state.update_data(terms=terms)
-
-    await message.answer(
-        "🚛 <b>Создание карточки услуг</b>\n\n"
-        "Шаг 4/5: Порты\n\n"
-        "Укажите порты, в которых работаете (через запятую):",
-        parse_mode="HTML",
-    )
-    await ExcavatorStatesGroup.ports.set()
-
-
-@dp.message_handler(state=ExcavatorStatesGroup.ports)
-async def expeditor_ports(message: types.Message, state: FSMContext):
-    """Обработка портов"""
-    ports = message.text.strip()
-
-    await state.update_data(ports=ports)
-
-    await message.answer(
-        "🚛 <b>Создание карточки услуг</b>\n\n"
-        "Шаг 5/5: Примечания (необязательно)\n\n"
-        "Дополнительная информация или /skip для пропуска:",
-        parse_mode="HTML",
-    )
-    await ExcavatorStatesGroup.notes.set()
-
-
-@dp.message_handler(lambda m: m.text == "/skip", state=ExcavatorStatesGroup.notes)
-@dp.message_handler(state=ExcavatorStatesGroup.notes)
-async def expeditor_notes(message: types.Message, state: FSMContext):
-    """Завершение создания карточки"""
-    user_id = message.from_user.id
-
-    notes = "" if message.text == "/skip" else message.text.strip()
-    await state.update_data(notes=notes)
-
-    data = await state.get_data()
-
-    # Генерируем ID предложения
-    global expeditor_offers
-    offer_id = len(expeditor_offers) + 1
-
-    # Создаем предложение
-    offer = {
-        "id": offer_id,
-        "expeditor_id": user_id,
-        "service_type": data["service_type"],
-        "price": data["price"],
-        "terms": data["terms"],
-        "ports": data["ports"],
-        "notes": notes,
-        "status": "active",
-        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    }
-
-    expeditor_offers[offer_id] = offer
-
-    # Формируем сообщение
-    expeditor_name = users[user_id].get("name", "Экспедитор")
-
-    text = f"✅ <b>Карточка услуг #{offer_id} создана!</b>\n\n"
-    text += f"📋 Услуга: {data['service_type']}\n"
-    text += f"💰 Стоимость: {data['price']:,.0f} ₽\n"
-    text += f"⏱ Сроки: {data['terms']}\n"
-    text += f"🚢 Порты: {data['ports']}\n"
-    if notes:
-        text += f"📝 Примечания: {notes}\n"
-    text += f"\n👤 Контакт: {expeditor_name}\n"
-    text += f"📞 Телефон: {users[user_id].get('phone', 'Не указан')}"
-
-    await message.answer(text, parse_mode="HTML", reply_markup=expeditor_keyboard())
-
-    await state.finish()
-
-    logging.info(f"✅ Экспедитор {user_id} создал карточку услуг #{offer_id}")
-
-
 # ==================== ФУНКЦИИ СОХРАНЕНИЯ ====================
-
-
 def save_shipping_requests():
-    """Сохранение заявок на перевозку"""
-    try:
-        with open("data/shipping_requests.pkl", "wb") as f:
-            pickle.dump(shipping_requests, f)
-    except Exception as e:
-        logging.error(f"Ошибка сохранения shipping_requests: {e}")
 
 
 def load_shipping_requests():
-    """Загрузка заявок на перевозку"""
-    global shipping_requests
     try:
-        if False:  # Pickle disabled
-            with open("data/shipping_requests.pkl", "rb") as f:
                 shipping_requests = pickle.load(f)
-                logging.info(
-                    f"✅ Заявки на перевозку загружены: {len(shipping_requests)}"
-                )
+            logging.info(
+            )
     except Exception as e:
         logging.error(f"Ошибка загрузки shipping_requests: {e}")
         shipping_requests = {}
@@ -18809,10 +14437,6 @@ def load_shipping_requests():
 # ═══════════════════════════════════════════════════════════════════════════
 # СОЗДАНИЕ ЗАЯВКИ НА ЛОГИСТИКУ (ОБРАБОТЧИКИ)
 # ═══════════════════════════════════════════════════════════════════════════
-
-
-# ===== ШАГ 1: Пункт отправки =====
-# ===== ШАГ 1: Пункт отправки =====
 @dp.message_handler(state=ShippingRequestStatesGroup.route_from)
 async def shipping_route_from(message: types.Message, state: FSMContext):
     """Шаг 1: Пункт отправки"""
@@ -18857,13 +14481,10 @@ async def shipping_route_to(message: types.Message, state: FSMContext):
         await state.finish()
         return
 
-    total_volume = pull.get("target_volume", 0)
 
     await message.answer(
         f"📍 Маршрут: <b>{data['route_from']}</b> → <b>{route_to}</b>\n\n"
         "<b>Шаг 3 из 7</b>\n\n"
-        f"Введите объём груза для перевозки (тонн)\n"
-        f"Объём пула: {total_volume:.0f} т",
         parse_mode="HTML",
     )
 
@@ -18893,12 +14514,7 @@ async def shipping_volume(message: types.Message, state: FSMContext):
             await state.finish()
             return
 
-        target_volume = pull.get("target_volume", 0)
-
-        if volume > target_volume:
             await message.answer(
-                f"❌ Указанный объём превышает объём пула!\n"
-                f"Максимум: {target_volume:.0f} т"
             )
             return
 
@@ -19011,10 +14627,8 @@ async def shipping_final_confirmation(message: types.Message, state: FSMContext)
     """Шаг 7: Финальное создание заявки"""
 
     data = await state.get_data()
-    user_id = message.from_user.id
     pull_id = data.get("pull_id")
 
-    # ✅ ИСПРАВЛЕНО: получаем пул из правильного места
     all_pulls = pulls.get("pulls", {})
     pull = all_pulls.get(pull_id) or all_pulls.get(str(pull_id))
 
@@ -19023,30 +14637,17 @@ async def shipping_final_confirmation(message: types.Message, state: FSMContext)
         await state.finish()
         return
 
-    # Генерируем ID
-    request_id = max(shipping_requests.keys(), default=0) + 1
-
-    # Берём данные экспортера из пула
-    exporter_id = pull.get("exporter_id")
     if not exporter_id:
         await message.answer("❌ Экспортёр не найден. Операция отменена.")
         await state.finish()
         return
 
-    exporter = users.get(exporter_id, {})
 
     # ✅ СОЗДАЁМ ЗАЯВКУ
     request = {
         "id": request_id,
         "pull_id": pull_id,
         "exporter_id": exporter_id,
-        "route_from": data.get("route_from", ""),
-        "route_to": data.get("route_to", ""),
-        "volume": data.get("volume", 0),
-        "culture": data.get("culture", ""),
-        "price_rub": data.get("price_rub", 0),
-        "desired_date": data.get("desired_date", "Не указана"),
-        "status": "active",
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "logist_id": None,
     }
@@ -19056,41 +14657,21 @@ async def shipping_final_confirmation(message: types.Message, state: FSMContext)
 
     await state.finish()
 
-    # ✅ ФИНАЛЬНОЕ СООБЩЕНИЕ
     summary = (
         f"✅ <b>Заявка на логистику #{request_id} создана!</b>\n\n"
         f"📦 Пул: #{pull_id}\n"
-        f"🌾 Культура: {data.get('culture', '')}\n"
-        f"📦 Объём: {data.get('volume', 0):.0f} т\n"
-        f"💰 <b>Цена: {data.get('price_rub', 0):,} ₽/т</b>\n"
-        f"📍 Маршрут: {data.get('route_from', '')} → {data.get('route_to', '')}\n"
-        f"📅 Дата: {data.get('desired_date', 'Не указана')}\n\n"
         f"👤 Контакт: {exporter.get('name', 'N/A')}\n"
         f"📋 ИНН: <code>{exporter.get('inn', 'Не указан')}</code>\n"
         f"📋 ОГРН: <code>{exporter.get('ogrn', 'Не указан')}</code>\n"
         f"📞 Телефон: <code>{exporter.get('phone', 'N/A')}</code>\n"
         f"📧 Email: <code>{exporter.get('email', 'N/A')}</code>\n\n"
-        f"🔔 Логисты получат уведомление о вашей заявке"
     )
 
     await message.answer(summary, parse_mode="HTML", reply_markup=exporter_keyboard())
 
-    # ✅ ОТПРАВЛЯЕМ ЛОГИСТАМ
-    logistics_users = [
-        uid for uid, user in users.items() if user.get("role") == "logistic"
-    ]
-
-    for logist_id in logistics_users:
-        try:
-            await bot.send_message(logist_id, summary, parse_mode="HTML")
-            logging.info(f"✅ Уведомление логисту {logist_id} о заявке #{request_id}")
-        except Exception as e:
-            logging.error(f"❌ Ошибка отправки логисту {logist_id}: {e}")
 
     logging.info(
         f"✅ Заявка #{request_id} создана\n"
-        f"Цена: {data.get('price_rub', 0)} ₽/т\n"
-        f"Маршрут: {data.get('route_from')} → {data.get('route_to')}"
     )
 
 
@@ -19102,10 +14683,7 @@ async def attach_contractors_to_pull(pull_id):
     Автоматическое прикрепление логистов и экспедиторов к закрытому пуллу
     Вызывается когда пулл достигает нужного тоннажа
     """
-    if pull_id not in pulls.get("pulls", {}):
         return
-
-    pull = pulls["pulls"][pull_id]
     exporter_id = pull.get("exporter_id")
     pull_port = pull.get("port", "")
     pull_region = pull.get("region", "")
@@ -19113,23 +14691,13 @@ async def attach_contractors_to_pull(pull_id):
     # Находим подходящих логистов
     suitable_logistics = []
     for req_id, request in shipping_requests.items():
-        if request.get("status") != "active":
             continue
 
         # Проверяем совпадение по региону/порту
-        req_to = request.get("to", "").lower()
-        if pull_port.lower() in req_to or pull_region.lower() in req_to:
-            logist_id = request.get("logist_id")
-            if logist_id in users:
                 suitable_logistics.append(
                     {
                         "request_id": req_id,
                         "logist_id": logist_id,
-                        "logist_name": users[logist_id].get("name", "Логист"),
-                        "phone": users[logist_id].get("phone", "Не указан"),
-                        "route": f"{request['from']} → {request['to']}",
-                        "price": request["price"],
-                        "volume": request["volume"],
                         "vehicle": request.get("vehicle_type", "Не указан"),
                     }
                 )
@@ -19137,31 +14705,20 @@ async def attach_contractors_to_pull(pull_id):
     # Находим подходящих экспедиторов
     suitable_expeditors = []
     for offer_id, offer in expeditor_offers.items():
-        if offer.get("status") != "active":
             continue
 
         # Проверяем совпадение по порту
-        offer_ports = offer.get("ports", "").lower()
-        if pull_port.lower() in offer_ports:
             expeditor_id = offer.get("expeditor_id")
-            if expeditor_id in users:
                 suitable_expeditors.append(
                     {
                         "offer_id": offer_id,
                         "expeditor_id": expeditor_id,
-                        "expeditor_name": users[expeditor_id].get("name", "Экспедитор"),
-                        "phone": users[expeditor_id].get("phone", "Не указан"),
-                        "service": offer["service_type"],
-                        "price": offer["price"],
-                        "terms": offer["terms"],
-                        "ports": offer["ports"],
                     }
                 )
 
     # Отправляем экспортеру карточки подрядчиков
     if exporter_id and (suitable_logistics or suitable_expeditors):
         text = f"🎉 <b>Пулл #{pull_id} собран!</b>\n\n"
-        text += f"📦 {pull['culture']}, {pull['volume']} т\n"
         text += f"🚢 Порт: {pull_port}\n\n"
 
         if suitable_logistics:
@@ -19210,7 +14767,6 @@ async def attach_contractors_to_pull(pull_id):
                     # Формируем сообщение для фермера
                     farmer_text = f"🎉 <b>Пулл #{pull_id} собран!</b>\n\n"
                     farmer_text += (
-                        f"📦 {pull['culture']}, {pull.get('target_volume', 0)} т\n"
                     )
                     farmer_text += f"🚢 Порт: {pull_port}\n\n"
 
@@ -19241,8 +14797,6 @@ async def attach_contractors_to_pull(pull_id):
 
                     await bot.send_message(
                         farmer_id,
-                        f"✅ Вы участвуете в пулле на {target_volume:.1f} т!\n"
-                        f"Ваша партия {batch['volume']:.1f} т добавлена в пулл #{pull_id}",
                     )
                     logging.info(
                         f"✅ Фермеру {farmer_id} отправлено уведомление о сборе пулла #{pull_id}"
@@ -19255,7 +14809,6 @@ async def attach_contractors_to_pull(pull_id):
         try:
             text = "📢 <b>Ваш тариф передан экспортеру!</b>\n\n"
             text += f"Пулл #{pull_id}\n"
-            text += f"📦 {pull['culture']}, {pull['volume']} т\n"
             text += f"🚢 Порт: {pull_port}\n\n"
             text += "Экспортер может связаться с вами для обсуждения условий перевозки."
 
@@ -19271,7 +14824,6 @@ async def attach_contractors_to_pull(pull_id):
         try:
             text = "📢 <b>Ваши услуги переданы экспортеру!</b>\n\n"
             text += f"Пулл #{pull_id}\n"
-            text += f"📦 {pull['culture']}, {pull['volume']} т\n"
             text += f"🚢 Порт: {pull_port}\n\n"
             text += "Экспортер может связаться с вами для оформления документов."
 
@@ -19286,17 +14838,9 @@ async def attach_contractors_to_pull(pull_id):
 async def on_startup(dp):
     logging.info("🚀 Бот Exportum запущен")
 
-    # Загрузка данных из файлов
     load_data()
-    load_users_from_json()
-    load_users_from_pickle()
-    load_pulls_from_pickle()
-    load_batches_from_pickle()
-    load_logistic_offers()
     load_deliveries()
-    load_expeditor_offers()
     load_logistic_ratings()
-    load_expeditor_cards()
 
     # ✅ ЗАГРУЗКА ЗАЯВОК ПРИ СТАРТЕ
     await load_requests_from_file()
@@ -19429,7 +14973,6 @@ async def show_available_batches_exporter(message: types.Message, state: FSMCont
     logging.info(f"📦 Обработчик 'Доступные партии' вызван пользователем {user_id}")
 
     # ✅ ПРОВЕРКА РОЛИ
-    if user_id not in users or users[user_id].get("role") != "exporter":
         logging.warning(f"❌ Пользователь {user_id} не является экспортёром")
         await message.answer("⚠️ Эта функция доступна только экспортёрам.")
         return
@@ -19440,7 +14983,6 @@ async def show_available_batches_exporter(message: types.Message, state: FSMCont
         for batch in farmer_batches:  # ← ПЕРЕБИРАЕМ farmer_batches, НЕ user_batches
             # ✅ Проверяем статус партии
             if batch.get("status") in ["active", "Активна", "available", "доступна"]:
-                farmer_name = users.get(farmer_id, {}).get("name", "Неизвестно")
                 available.append(
                     {"batch": batch, "farmer_id": farmer_id, "farmer_name": farmer_name}
                 )
@@ -19523,71 +15065,31 @@ async def on_shutdown(dp):
 # ══════════════════════════════════════════════════════════════════════════
 # ПРОСМОТР ДЕТАЛЕЙ ДОСТАВКИ
 # ═══════════════════════════════════════════════════════════════════════════
-
-
-@dp.callback_query_handler(lambda c: c.data.startswith("view_delivery:"), state="*")
 async def view_delivery_details(callback: types.CallbackQuery, state: FSMContext):
-    """Просмотр деталей доставки"""
     await state.finish()
 
     try:
-        offer_id = int(callback.data.split(":")[1])
     except (IndexError, ValueError):
-        await callback.answer("❌ Ошибка данных", show_alert=True)
         return
 
-    if offer_id not in logistic_offers:
         await callback.answer("❌ Доставка не найдена", show_alert=True)
         return
 
-    offer = logistic_offers[offer_id]
-    request_id = offer.get("request_id")
-    request = shipping_requests.get(request_id, {})
-    exporter_id = request.get("exporter_id")
-    exporter = users.get(exporter_id, {})
 
-    # Формируем текст
     text = (
-        f"🚛 <b>Доставка #{offer_id}</b>\n\n"
-        f"<b>📦 Груз:</b>\n"
-        f"🌾 Культура: {request.get('culture', 'Н/Д')}\n"
-        f"⚖️ Объём: {request.get('volume', 0):.0f} т\n"
-        f"📍 Откуда: {request.get('route_from', '?')}\n"
-        f"📍 Куда: {request.get('route_to', '?')}\n"
-        f"📅 Желаемая дата: {request.get('desired_date', 'Не указана')}\n\n"
-        f"<b>🚛 Условия доставки:</b>\n"
-        f"🚚 Транспорт: {offer.get('vehicle_type', 'Не указан')}\n"
-        f"💰 Стоимость: {offer.get('price', 0):,} ₽\n"
-        f"📅 Дата: {offer.get('delivery_date', 'Не указана')}\n\n"
-        f"<b>👤 Заказчик:</b>\n"
-        f"🏢 {exporter.get('company_name', 'Не указана')}\n"
-        f"👤 {exporter.get('name', 'Не указано')}\n"
-        f"📞 <code>{exporter.get('phone', 'Не указан')}</code>\n"
-        f"📧 {exporter.get('email', 'Не указан')}\n\n"
-        f"<b>📊 Статус:</b> {get_offer_status_display(offer.get('status', 'pending'))}"
-    )
 
-    if offer.get("completed_at"):
-        text += f"\n✅ <b>Завершена:</b> {offer.get('completed_at')}"
 
     keyboard = InlineKeyboardMarkup(row_width=1)
-    keyboard.add(
-        InlineKeyboardButton(
-            "📞 Связаться с заказчиком", url=f"tg://user?id={exporter_id}"
+                keyboard.add(
+                    InlineKeyboardButton(
+                    )
+                )
+                keyboard.add(
+                    InlineKeyboardButton(
+                    )
+                )
+                keyboard.add(
         )
-    )
-
-    # Если доставка в процессе - можно завершить
-    if offer.get("status") in ["accepted", "in_progress"]:
-        keyboard.add(
-            InlineKeyboardButton(
-                "✅ Завершить доставку", callback_data=f"complete_delivery:{offer_id}"
-            )
-        )
-
-    keyboard.add(
-        InlineKeyboardButton("🔙 К списку доставок", callback_data="back_to_deliveries")
-    )
 
     await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
     await callback.answer()
@@ -19595,51 +15097,33 @@ async def view_delivery_details(callback: types.CallbackQuery, state: FSMContext
 
 @dp.callback_query_handler(lambda c: c.data.startswith("complete_delivery:"), state="*")
 async def complete_delivery(callback: types.CallbackQuery):
-    """Завершение доставки"""
     try:
-        offer_id = int(callback.data.split(":")[1])
     except (IndexError, ValueError):
         await callback.answer("❌ Ошибка данных", show_alert=True)
         return
 
-    if offer_id not in logistic_offers:
         await callback.answer("❌ Доставка не найдена", show_alert=True)
         return
 
     # Обновляем статус
-    logistic_offers[offer_id]["status"] = "completed"
-    logistic_offers[offer_id]["completed_at"] = datetime.now().strftime(
-        "%d.%m.%Y %H:%M"
-    )
+                )
 
-    # Уведомляем экспортёра
-    request_id = logistic_offers[offer_id].get("request_id")
-    request = shipping_requests.get(request_id, {})
-    exporter_id = request.get("exporter_id")
 
-    if exporter_id:
         try:
             await bot.send_message(
-                exporter_id,
-                f"✅ <b>Доставка завершена!</b>\n\n"
                 f"Логист завершил доставку по заявке #{request_id}.\n"
                 f"Груз доставлен: {request.get('route_to', 'пункт назначения')}.",
                 parse_mode="HTML",
             )
             logging.info(
-                f"✅ Уведомление экспортёру {exporter_id} о завершении доставки #{offer_id}"
             )
         except Exception as e:
-            logging.error(f"❌ Ошибка уведомления экспортёра: {e}")
 
     await callback.answer("✅ Доставка завершена!", show_alert=True)
 
     # Обновляем сообщение
     text = (
         f"✅ <b>Доставка #{offer_id} завершена!</b>\n\n"
-        f"Спасибо за работу! \n"
-        f"Доставка отмечена как выполненная.\n\n"
-        f"💰 Заработано: {logistic_offers[offer_id].get('price', 0):,} ₽"
     )
 
     keyboard = InlineKeyboardMarkup(row_width=1)
@@ -19655,8 +15139,6 @@ async def complete_delivery(callback: types.CallbackQuery):
 )
 async def back_to_deliveries_handler(callback: types.CallbackQuery, state: FSMContext):
     """Вернуться к списку доставок"""
-    await logistics_my_deliveries_handler(callback.message, state)
-    await callback.answer()
 
 
 @dp.message_handler(
@@ -19667,7 +15149,6 @@ async def logistics_services_stats_handler(message: types.Message, state: FSMCon
     await state.finish()
     user_id = message.from_user.id
 
-    if user_id not in users or users[user_id].get("role") != "logistic":
         await message.answer("❌ Доступно только для логистов")
         return
 
@@ -19690,7 +15171,6 @@ async def logistics_services_stats_handler(message: types.Message, state: FSMCon
 async def show_news_and_prices(message: types.Message, state: FSMContext):
     """Отображение новостей и цен"""
     user_id = message.from_user.id
-    if user_id not in users:
         await message.answer("⚠️ Сначала завершите регистрацию.")
         return
 
@@ -19713,10 +15193,6 @@ async def callback_show_prices(callback_query: types.CallbackQuery):
     """Показать цены"""
     await bot.answer_callback_query(callback_query.id)
     try:
-        regional_prices = parse_russia_regional_prices()
-        fob_prices = parse_fob_black_sea()
-        cbot_prices = parse_cbot_futures()
-        message_text = format_prices_message(regional_prices, fob_prices, cbot_prices)
 
         keyboard = InlineKeyboardMarkup()
         keyboard.add(InlineKeyboardButton("🔄 Обновить", callback_data="show_prices"))
@@ -19729,7 +15205,6 @@ async def callback_show_prices(callback_query: types.CallbackQuery):
             callback_query.from_user.id,
             callback_query.message.message_id,
             reply_markup=keyboard,
-            parse_mode="Markdown",
         )
     except MessageNotModified:
         pass
@@ -19742,8 +15217,6 @@ async def callback_show_news(callback_query: types.CallbackQuery):
     """Показать новости"""
     await bot.answer_callback_query(callback_query.id)
     try:
-        news_list = parse_grain_news()
-        message_text = format_news_message(news_list)
 
         keyboard = InlineKeyboardMarkup()
         keyboard.add(InlineKeyboardButton("🔄 Обновить", callback_data="show_news"))
@@ -19756,7 +15229,6 @@ async def callback_show_news(callback_query: types.CallbackQuery):
             callback_query.from_user.id,
             callback_query.message.message_id,
             reply_markup=keyboard,
-            parse_mode="Markdown",
         )
     except MessageNotModified:
         pass
@@ -19808,9 +15280,7 @@ async def view_batch_details_direct(
     batch = None
 
     # ✅ ПРАВИЛЬНЫЙ ПОИСК ПАРТИИ
-    user_batches = batches.get(user_id, [])
     for b in user_batches:
-        if str(b.get("id")) == str(batch_id):
             batch = b
             break
 
@@ -19821,7 +15291,6 @@ async def view_batch_details_direct(
     active_matches = [
         m
         for m in matches.values()
-        if m["batch_id"] == batch_id and m["status"] == "active"
     ]
 
     text = f"""
@@ -19859,14 +15328,12 @@ async def back_to_my_batches(callback: types.CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
 
     # Проверка роли
-    if user_id not in users or users[user_id].get("role") != "farmer":
         await callback.answer(
             "❌ Эта функция доступна только фермерам", show_alert=True
         )
         return
 
     # Получаем партии пользователя
-    user_batches = batches.get(user_id, [])
 
     if not user_batches:
         keyboard = InlineKeyboardMarkup().add(
@@ -19883,14 +15350,10 @@ async def back_to_my_batches(callback: types.CallbackQuery, state: FSMContext):
 
     # Фильтруем партии по статусам
     active_batches = [
-        b for b in user_batches if b.get("status") in ["Активна", "active", "Доступна"]
     ]
     reserved_batches = [
-        b for b in user_batches if b.get("status") in ["Зарезервирована", "reserved"]
     ]
-    sold_batches = [b for b in user_batches if b.get("status") in ["Продана", "sold"]]
     withdrawn_batches = [
-        b for b in user_batches if b.get("status") in ["Снята", "withdrawn", "Снято"]
     ]
 
     # Считаем партии с совпадениями
@@ -19898,7 +15361,6 @@ async def back_to_my_batches(callback: types.CallbackQuery, state: FSMContext):
         b
         for b in active_batches
         if any(
-            m.get("batch_id") == b.get("id") and m.get("status") == "active"
             for m in matches.values()
         )
     ]
@@ -19953,21 +15415,12 @@ async def filter_batches(callback: types.CallbackQuery, state: FSMContext):
     await state.finish()
 
     user_id = callback.from_user.id
-    status_filter = callback.data.split(":")[1]
 
     # Получаем партии пользователя
-    user_batches = batches.get(user_id, [])
 
-    # Маппинг фильтров
     status_map = {
-        "active": (["Активна", "active", "Доступна"], "✅ Активные"),
-        "reserved": (["Зарезервирована", "reserved"], "🔒 Зарезервированные"),
-        "sold": (["Продана", "sold"], "💰 Проданные"),
-        "withdrawn": (["Снята", "withdrawn", "Снято"], "❌ Снятые с продажи"),
     }
 
-    status_list, title = status_map.get(status_filter, ([], ""))
-    filtered_batches = [b for b in user_batches if b.get("status") in status_list]
 
     keyboard = InlineKeyboardMarkup(row_width=1)
 
@@ -19988,7 +15441,6 @@ async def filter_batches(callback: types.CallbackQuery, state: FSMContext):
             )
     else:
         await callback.message.edit_text(
-            f"📦 {title}\n\nЛ партий не найдено",
             reply_markup=InlineKeyboardMarkup().add(
                 InlineKeyboardButton("← Назад", callback_data="back_to_my_batches")
             ),
@@ -20030,10 +15482,8 @@ async def back_to_requests(callback: types.CallbackQuery, state: FSMContext):
     for req_id, req in shipping_requests.items():
         status = req.get("status")
         logging.info(f"   - ID {req_id}: status='{status}'")
-        if status == "active":
             all_requests.append(
                 {
-                    "id": req_id,
                     "source": "exporter",
                     "culture": req.get("culture", "—"),
                     "volume": req.get("volume", 0),
@@ -20042,15 +15492,12 @@ async def back_to_requests(callback: types.CallbackQuery, state: FSMContext):
             )
 
     logging.info(
-        f"🔍 DEBUG: farmer_logistics_requests ({len(farmer_logistics_requests)} всего)"
     )
     for req_id, req in farmer_logistics_requests.items():
         status = req.get("status")
         logging.info(f"   - ID {req_id}: status='{status}'")
-        if status == "active":
             all_requests.append(
                 {
-                    "id": req_id,
                     "source": "farmer",
                     "culture": req.get("culture", "—"),
                     "volume": req.get("volume", 0),
@@ -20067,7 +15514,6 @@ async def back_to_requests(callback: types.CallbackQuery, state: FSMContext):
 
 
 📋 Всего заявок: {len(all_requests)}
-🚛 От экспортёров | 🌾 От фермеров
 
 
 Выберите заявку для просмотра деталей и создания предложения:
@@ -20080,17 +15526,14 @@ async def back_to_requests(callback: types.CallbackQuery, state: FSMContext):
         text += "\n\n❌ <b>Активных заявок не найдено</b>"
     else:
         for req in all_requests:
-            if req["source"] == "exporter":
                 emoji = "🚛"
             else:
-                emoji = "🌾"
 
             label = f"{emoji} {req['culture']} • {req['volume']:.0f}т"
-            keyboard.add(
-                InlineKeyboardButton(
-                    label, callback_data=f"view_request:{req['source']}:{req['id']}"
+                keyboard.add(
+                    InlineKeyboardButton(
+                    )
                 )
-            )
     try:
         await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
     except Exception as e:
@@ -20110,18 +15553,14 @@ async def back_to_exporter_menu(callback: types.CallbackQuery, state: FSMContext
 
     user_id = callback.from_user.id
 
-    if user_id not in users:
         await callback.answer("❌ Пользователь не найден", show_alert=True)
         return
 
-    user = users[user_id]
     name = user.get("name", "Экспортёр")
 
     try:
         await callback.message.delete()
     except Exception as e:
-        print(f"Ошибка: {e}")
-        pass
 
     keyboard = exporter_keyboard()
 
@@ -20158,7 +15597,6 @@ async def contact_farmer_handler(callback: types.CallbackQuery, state: FSMContex
         await callback.answer("❌ Ошибка обработки данных", show_alert=True)
         return
 
-    farmer = users.get(farmer_id)
     if not farmer:
         await callback.answer("❌ Фермер не найден", show_alert=True)
         return
@@ -20172,12 +15610,9 @@ async def contact_farmer_handler(callback: types.CallbackQuery, state: FSMContex
 
     # Уведомляем фермера о заинтересованности
     try:
-        exporter_name = users[callback.from_user.id].get("name", "Экспортёр")
         await bot.send_message(
             farmer_id,
-            f"✅ <b>Экспортёр проявил интерес!</b>\n\n"
             f"👤 {exporter_name} заинтересовался вашей партией #{batch_id}\n\n"
-            f"Ожидайте звонка!",
             parse_mode="HTML",
         )
     except Exception as e:
@@ -20188,7 +15623,6 @@ async def contact_farmer_handler(callback: types.CallbackQuery, state: FSMContex
 async def start_search(message: types.Message, state: FSMContext):
     """Начать поиск партий"""
     user_id = message.from_user.id
-    if user_id not in users:
         await message.answer("⚠️ Сначала завершите регистрацию.")
         return
 
@@ -20241,8 +15675,6 @@ async def callback_search_by_culture(
 async def callback_search_by_region(callback_query: types.CallbackQuery):
     """Поиск по региону"""
     await bot.answer_callback_query(callback_query.id)
-    await SearchBatchesStatesGroup.region.set()
-    keyboard = region_keyboard()
     try:
         await bot.edit_message_text(
             "📍 <b>Выберите регион:</b>",
@@ -20258,8 +15690,6 @@ async def callback_search_by_region(callback_query: types.CallbackQuery):
 # ═══════════════════════════════════════════════════════════════════════════════
 # ФУНКЦИИ ПУБЛИКАЦИИ В КАНАЛ И ОТЧЕТЫ
 # ═══════════════════════════════════════════════════════════════════════════════
-
-
 async def publish_pull_to_channel(pull_data):
     """Публикация пулла в Telegram канал"""
     try:
@@ -20320,26 +15750,18 @@ async def generate_weekly_report():
             [u for u in users.values() if u.get("role") == "exporter"]
         )
         logistics_count = len(
-            [u for u in users.values() if u.get("role") == "logistic"]
         )
         expeditors_count = len(
-            [u for u in users.values() if u.get("role") == "expeditor"]
         )
 
-        total_batches = sum(len(batches) for user_batches in batches.values())
-        total_pulls = len(pulls)
         total_deals = len(deals)
 
         total_batch_volume = 0
-        for farmer_id, batches in batches.items():
-            for batch in user_batches:
-                total_batch_volume += batch.get("volume", 0)
+            total_batch_volume += batch.get("volume", 0)
 
         prices = []
-        for farmer_id, batches in batches.items():
-            for batch in user_batches:
-                if batch.get("price"):
-                    prices.append(batch["price"])
+            if batch.get("price"):
+                prices.append(batch["price"])
 
         avg_price = sum(prices) / len(prices) if prices else 0
 
@@ -20367,14 +15789,10 @@ async def generate_weekly_report():
 📅 Дата отчета: {datetime.now().strftime('%d.%m.%Y %H:%M')}
 """
 
-        admin_id = 1481790360  # Замените на ID админа
-        await bot.send_message(admin_id, report_text, parse_mode="HTML")
 
         try:
             await bot.send_message(CHANNEL_ID, report_text, parse_mode="HTML")
         except Exception as e:
-            print(f"Ошибка: {e}")
-            pass
 
         logging.info("✅ Еженедельный отчет отправлен")
     except Exception as e:
@@ -20383,7 +15801,6 @@ async def generate_weekly_report():
 
 async def schedule_weekly_reports():
     """Запуск scheduler для еженедельных отчетов"""
-    global scheduler
     try:
         scheduler.add_job(
             generate_weekly_report, "cron", day_of_week="mon", hour=9, minute=0
@@ -20391,255 +15808,6 @@ async def schedule_weekly_reports():
         logging.info("✅ Scheduler запущен: еженедельные отчеты активны")
     except Exception as e:
         logging.error(f"❌ Ошибка запуска scheduler: {e}")
-
-
-# ============================================================================
-# CALLBACK ОБРАБОТЧИКИ АДМИН-ПАНЕЛИ
-# ============================================================================
-
-
-@dp.callback_query_handler(lambda c: c.data == "admin_refresh_stats", state="*")
-async def admin_refresh_statistics(callback: CallbackQuery, state: FSMContext):
-    """Обновление статистики"""
-    await state.finish()
-
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("🚫 Доступ запрещен", show_alert=True)
-        return
-
-    stats_message = format_admin_statistics()
-
-    keyboard = InlineKeyboardMarkup(row_width=2)
-    keyboard.add(
-        InlineKeyboardButton("🔄 Обновить", callback_data="admin_refresh_stats"),
-        InlineKeyboardButton("📊 Детали", callback_data="admin_detailed_stats"),
-    )
-
-    try:
-        await callback.message.edit_text(
-            stats_message, reply_markup=keyboard, parse_mode="HTML"
-        )
-        await callback.answer("✅ Обновлено")
-    except MessageNotModified:
-        await callback.answer("Данные актуальны")
-    except Exception as e:
-        await callback.answer(f"Ошибка: {str(e)}", show_alert=True)
-
-
-@dp.callback_query_handler(lambda c: c.data == "admin_refresh_analytics", state="*")
-async def admin_refresh_analytics_callback(callback: CallbackQuery, state: FSMContext):
-    """Обновление аналитики"""
-    await state.finish()
-
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("🚫 Доступ запрещен", show_alert=True)
-        return
-
-    analytics_message = format_admin_analytics()
-
-    keyboard = InlineKeyboardMarkup(row_width=2)
-    keyboard.add(
-        InlineKeyboardButton("🔄 Обновить", callback_data="admin_refresh_analytics"),
-        InlineKeyboardButton("📤 Экспорт", callback_data="admin_export_analytics"),
-    )
-
-    try:
-        await callback.message.edit_text(
-            analytics_message, reply_markup=keyboard, parse_mode="HTML"
-        )
-        await callback.answer("✅ Обновлено")
-    except MessageNotModified:
-        await callback.answer("Данные актуальны")
-    except Exception as e:
-        await callback.answer(f"Ошибка: {str(e)}", show_alert=True)
-
-
-@dp.callback_query_handler(lambda c: c.data == "export_users", state="*")
-async def export_users_callback(callback: CallbackQuery, state: FSMContext):
-    """Экспорт пользователей в CSV"""
-    await state.finish()
-
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("🚫 Доступ запрещен", show_alert=True)
-        return
-
-    try:
-        output = StringIO()
-        writer = csv.writer(output)
-        writer.writerow(["ID", "Роль", "Телефон", "Email", "Регион", "ИНН", "Компания"])
-
-        for user_id_data, user_data in users.items():
-            writer.writerow(
-                [
-                    user_id_data,
-                    user_data.get("role", ""),
-                    user_data.get("phone", ""),
-                    user_data.get("email", ""),
-                    user_data.get("region", ""),
-                    user_data.get("inn", ""),
-                    user_data.get("company_name", ""),
-                ]
-            )
-
-        output.seek(0)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-        await bot.send_document(
-            callback.from_user.id,
-            ("users_" + timestamp + ".csv", output.getvalue().encode("utf-8-sig")),
-            caption=f"📤 Экспорт пользователей\nВсего: {len(users)}",
-        )
-
-        await callback.answer("✅ Файл отправлен")
-        logging.info(f"Экспорт пользователей выполнен: {len(users)} записей")
-
-    except Exception as e:
-        logging.error(f"Ошибка экспорта пользователей: {e}")
-        await callback.answer(f"❌ Ошибка: {str(e)}", show_alert=True)
-
-
-@dp.callback_query_handler(lambda c: c.data == "export_pools", state="*")
-async def export_pools_callback(callback: CallbackQuery, state: FSMContext):
-    """Экспорт пулов в CSV"""
-    await state.finish()
-
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("🚫 Доступ запрещен", show_alert=True)
-        return
-
-    try:
-        output = StringIO()
-        writer = csv.writer(output)
-        writer.writerow(
-            ["ID", "Экспортёр", "Статус", "Культура", "Объём", "Цена", "Дата создания"]
-        )
-
-        for pool_id, pool_data in pools.items():
-            exporter = users.get(pool_data.get("exporter_id"), {})
-            writer.writerow(
-                [
-                    pool_id,
-                    exporter.get("company_name", "Неизвестно"),
-                    pool_data.get("status", ""),
-                    pool_data.get("culture", ""),
-                    pool_data.get("volume", 0),
-                    pool_data.get("price", 0),
-                    pool_data.get("created_at", ""),
-                ]
-            )
-
-        output.seek(0)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-        await bot.send_document(
-            callback.from_user.id,
-            ("pools_" + timestamp + ".csv", output.getvalue().encode("utf-8-sig")),
-            caption=f"📤 Экспорт пулов\nВсего: {len(pulls)}",
-        )
-
-        await callback.answer("✅ Файл отправлен")
-        logging.info(f"Экспорт пулов выполнен: {len(pulls)} записей")
-
-    except Exception as e:
-        logging.error(f"Ошибка экспорта пулов: {e}")
-        await callback.answer(f"❌ Ошибка: {str(e)}", show_alert=True)
-
-
-@dp.callback_query_handler(lambda c: c.data == "export_batches", state="*")
-async def export_batches_callback(callback: CallbackQuery, state: FSMContext):
-    """Экспорт партий в CSV"""
-    await state.finish()
-
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("🚫 Доступ запрещен", show_alert=True)
-        return
-
-    try:
-        output = StringIO()
-        writer = csv.writer(output)
-        writer.writerow(
-            ["Фермер ID", "Фермер", "Batch ID", "Культура", "Объём", "Цена", "Регион"]
-        )
-
-        for farmer_id, batches in batches.items():
-            farmer = users.get(farmer_id, {})
-            farmer_name = farmer.get("company_name", "Неизвестно")
-            for batch in user_batches:
-                writer.writerow(
-                    [
-                        farmer_id,
-                        farmer_name,
-                        batch.get("id", ""),
-                        batch.get("culture", ""),
-                        batch.get("volume", 0),
-                        batch.get("price", 0),
-                        batch.get("region", ""),
-                    ]
-                )
-
-        output.seek(0)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        total_batches = sum(len(batches) for user_batches in batches.values())
-
-        await bot.send_document(
-            callback.from_user.id,
-            ("batches_" + timestamp + ".csv", output.getvalue().encode("utf-8-sig")),
-            caption=f"📤 Экспорт партий\nВсего: {total_batches}",
-        )
-
-        await callback.answer("✅ Файл отправлен")
-        logging.info(f"Экспорт партий выполнен: {total_batches} записей")
-
-    except Exception as e:
-        logging.error(f"Ошибка экспорта партий: {e}")
-        await callback.answer(f"❌ Ошибка: {str(e)}", show_alert=True)
-
-
-@dp.callback_query_handler(lambda c: c.data == "export_full", state="*")
-async def export_full_backup_callback(callback: CallbackQuery, state: FSMContext):
-    """Полный бэкап всех данных"""
-    await state.finish()
-
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("🚫 Доступ запрещен", show_alert=True)
-        return
-
-    try:
-        save_data()
-
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_dir = f"backup_{timestamp}"
-
-        os.makedirs(backup_dir, exist_ok=True)
-
-        for filename in [
-            "users.pkl",
-            "pools.pkl",
-            "batches.pkl",
-            "shipping_requests.pkl",
-        ]:
-            if os.path.exists(filename):
-                shutil.copy(filename, os.path.join(backup_dir, filename))
-
-        archive_name = f"backup_{timestamp}"
-        shutil.make_archive(archive_name, "zip", backup_dir)
-        shutil.rmtree(backup_dir)
-
-        with open(f"{archive_name}.zip", "rb") as backup_file:
-            await bot.send_document(
-                callback.from_user.id,
-                backup_file,
-                caption=f"💾 Полная резервная копия\nДата: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}",
-            )
-
-        os.remove(f"{archive_name}.zip")
-
-        await callback.answer("✅ Бэкап создан и отправлен")
-        logging.info(f"Создан полный бэкап: {archive_name}.zip")
-
-    except Exception as e:
-        logging.error(f"Ошибка создания бэкапа: {e}")
-        await callback.answer(f"❌ Ошибка: {str(e)}", show_alert=True)
 
 
 @dp.callback_query_handler(lambda c: c.data == "reload_data", state="*")
@@ -20660,217 +15828,7 @@ async def reload_data_callback(callback: CallbackQuery, state: FSMContext):
         logging.error(f"Ошибка перезагрузки данных: {e}")
 
 
-# ============================================================================
-# CALLBACK ОБРАБОТЧИКИ ДЛЯ АДМИН-ПАНЕЛИ
-# ============================================================================
-
-
-@dp.callback_query_handler(lambda c: c.data == "adminstat", state="*")
-async def admin_statistics_callback(callback: types.CallbackQuery, state: FSMContext):
-    """Статистика через callback"""
-    await state.finish()
-
-    user_id = callback.from_user.id
-    if user_id != ADMIN_ID:
-        await callback.answer("❌ Нет доступа", show_alert=True)
-        return
-
-    try:
-        msg = format_admin_statistics()
-
-        keyboard = InlineKeyboardMarkup(row_width=2)
-        keyboard.add(
-            InlineKeyboardButton("🔄 Обновить", callback_data="adminstat"),
-            InlineKeyboardButton("◀️ Назад", callback_data="backtoadmin"),
-        )
-
-        await callback.message.edit_text(msg, reply_markup=keyboard, parse_mode="HTML")
-        await callback.answer("✅ Статистика обновлена")
-    except Exception as e:
-        logging.error(f"Ошибка статистики: {e}")
-        await callback.answer(f"❌ Ошибка: {e}", show_alert=True)
-
-
-@dp.callback_query_handler(lambda c: c.data == "adminanalytics", state="*")
-async def admin_analytics_callback(callback: types.CallbackQuery, state: FSMContext):
-    """Аналитика через callback"""
-    await state.finish()
-
-    user_id = callback.from_user.id
-    if user_id != ADMIN_ID:
-        await callback.answer("❌ Нет доступа", show_alert=True)
-        return
-
-    try:
-        msg = format_admin_analytics()
-
-        keyboard = InlineKeyboardMarkup(row_width=2)
-        keyboard.add(
-            InlineKeyboardButton("🔄 Обновить", callback_data="adminanalytics"),
-            InlineKeyboardButton("◀️ Назад", callback_data="backtoadmin"),
-        )
-
-        await callback.message.edit_text(msg, reply_markup=keyboard, parse_mode="HTML")
-        await callback.answer("✅ Аналитика обновлена")
-    except Exception as e:
-        logging.error(f"Ошибка аналитики: {e}")
-        await callback.answer(f"❌ Ошибка: {e}", show_alert=True)
-
-
-@dp.callback_query_handler(lambda c: c.data == "adminexport", state="*")
-async def admin_export_callback(callback: types.CallbackQuery, state: FSMContext):
-    """Экспорт данных через callback"""
-    await state.finish()
-
-    user_id = callback.from_user.id
-    if user_id != ADMIN_ID:
-        await callback.answer("❌ Нет доступа", show_alert=True)
-        return
-
-    keyboard = InlineKeyboardMarkup(row_width=2)
-    keyboard.add(
-        InlineKeyboardButton("👥 Пользователи", callback_data="exportusers"),
-        InlineKeyboardButton("📦 Пуллы", callback_data="exportpulls"),
-        InlineKeyboardButton("🌾 Партии", callback_data="exportbatches"),
-        InlineKeyboardButton("📋 Заявки", callback_data="exportrequests"),
-        InlineKeyboardButton("💼 Полный бэкап", callback_data="exportfull"),
-        InlineKeyboardButton("◀️ Назад", callback_data="backtoadmin"),
-    )
-
-    await callback.message.edit_text(
-        "📤 <b>Экспорт данных</b>\n\nВыберите данные для экспорта:",
-        reply_markup=keyboard,
-        parse_mode="HTML",
-    )
-    await callback.answer()
-
-
-@dp.callback_query_handler(lambda c: c.data == "adminusers", state="*")
-async def admin_users_callback(callback: types.CallbackQuery, state: FSMContext):
-    """Список пользователей через callback"""
-    await state.finish()
-
-    user_id = callback.from_user.id
-    if user_id != ADMIN_ID:
-        await callback.answer("❌ Нет доступа", show_alert=True)
-        return
-
-    try:
-        # ✅ СОСТАВЛЯЕМ СООБЩЕНИЕ ПРЯМО ЗДЕСЬ
-        msg = "👥 <b>ПОЛЬЗОВАТЕЛИ СИСТЕМЫ</b>\\n\\n"
-
-        farmers = [u for u in users.values() if u.get("role") == "farmer"]
-        exporters = [u for u in users.values() if u.get("role") == "exporter"]
-        logists = [u for u in users.values() if u.get("role") == "logist"]
-        expeditors = [u for u in users.values() if u.get("role") == "expeditor"]
-
-        msg += f"🌾 <b>Фермеры:</b> {len(farmers)}\\n"
-        for user in farmers[:5]:
-            msg += f"  • {user.get('name', 'N/A')} ({user.get('phone', 'N/A')})\\n"
-        if len(farmers) > 5:
-            msg += f"  ... и ещё {len(farmers) - 5}\\n"
-        msg += "\\n"
-
-        msg += f"📦 <b>Экспортеры:</b> {len(exporters)}\\n"
-        for user in exporters[:5]:
-            msg += f"  • {user.get('name', 'N/A')} ({user.get('phone', 'N/A')})\\n"
-        if len(exporters) > 5:
-            msg += f"  ... и ещё {len(exporters) - 5}\\n"
-        msg += "\\n"
-
-        msg += f"🚚 <b>Логисты:</b> {len(logists)}\\n"
-        for user in logists[:5]:
-            msg += f"  • {user.get('name', 'N/A')} ({user.get('phone', 'N/A')})\\n"
-        if len(logists) > 5:
-            msg += f"  ... и ещё {len(logists) - 5}\\n"
-        msg += "\\n"
-
-        msg += f"✈️ <b>Экспедиторы:</b> {len(expeditors)}\\n"
-        for user in expeditors[:5]:
-            msg += f"  • {user.get('name', 'N/A')} ({user.get('phone', 'N/A')})\\n"
-        if len(expeditors) > 5:
-            msg += f"  ... и ещё {len(expeditors) - 5}\\n"
-
-        keyboard = InlineKeyboardMarkup(row_width=2)
-        keyboard.add(
-            InlineKeyboardButton("🔄 Обновить", callback_data="adminusers"),
-            InlineKeyboardButton("◀️ Назад", callback_data="backtoadmin"),
-        )
-
-        await callback.message.edit_text(msg, reply_markup=keyboard, parse_mode="HTML")
-        await callback.answer("✅ Список пользователей")
-
-    except Exception as e:
-        logging.error(f"Ошибка списка пользователей: {e}")
-        await callback.answer(f"❌ Ошибка: {e}", show_alert=True)
-
-
-@dp.callback_query_handler(lambda c: c.data == "adminbroadcast", state="*")
-async def admin_broadcast_callback(callback: types.CallbackQuery, state: FSMContext):
-    """Рассылка через callback"""
-    await state.finish()
-
-    user_id = callback.from_user.id
-    if user_id != ADMIN_ID:
-        await callback.answer("❌ Нет доступа", show_alert=True)
-        return
-
-    keyboard = InlineKeyboardMarkup(row_width=1)
-    keyboard.add(InlineKeyboardButton("◀️ Назад", callback_data="backtoadmin"))
-
-    await callback.message.edit_text(
-        "📧 <b>Рассылка сообщений</b>\\n\\n"
-        "Отправьте сообщение для рассылки всем пользователям:\\n\\n"
-        "<i>Например: /broadcast Важное объявление</i>",
-        reply_markup=keyboard,
-        parse_mode="HTML",
-    )
-    await callback.answer()
-
-
-@dp.callback_query_handler(lambda c: c.data == "adminprices", state="*")
-async def admin_prices_callback(callback: types.CallbackQuery, state: FSMContext):
-    """Обновление цен через callback"""
-    await state.finish()
-
-    user_id = callback.from_user.id
-    if user_id != ADMIN_ID:
-        await callback.answer("❌ Нет доступа", show_alert=True)
-        return
-
-    await callback.answer("⏳ Обновляю цены...", show_alert=True)
-
-    keyboard = InlineKeyboardMarkup(row_width=1)
-    keyboard.add(InlineKeyboardButton("◀️ Назад", callback_data="backtoadmin"))
-
-    try:
-        # Запускаем обновление цен (если функция существует)
-        # await update_grain_prices()
-
-        # ✅ ТОЛЬКО ОДИН edit_text!
-        await callback.message.edit_text(
-            "✅ <b>Цены обновлены!</b>\\n\\n"
-            "Данные успешно загружены из источников.\\n"
-            f"Время обновления: {datetime.now().strftime('%H:%M:%S')}",
-            reply_markup=keyboard,
-            parse_mode="HTML",
-        )
-        logging.info("✅ Цены успешно обновлены")
-
-    except Exception as e:
-        logging.error(f"❌ Ошибка обновления цен: {e}")
-
-        # ✅ ТОЛЬКО ОДИН edit_text!
-        await callback.message.edit_text(
-            f"❌ <b>Ошибка обновления цен</b>\\n\\n{str(e)[:100]}",
-            reply_markup=keyboard,
-            parse_mode="HTML",
-        )
-
-
 # === HANDLER: Присоединение партий к пуллу ===
-
-
 @dp.callback_query_handler(
     lambda c: c.data and c.data.startswith("selectbatch_"), state="*"
 )
@@ -20892,18 +15850,14 @@ async def process_batch_selection_for_pull(
             return
 
         load_batches_from_pickle()
-        pulls = load_pulls()
 
-        batch = next((b for b in batches if b.get("id") == batch_id), None)
         if not batch:
             await callback_query.answer("❌ Партия не найдена", show_alert=True)
             return
 
-        if str(batch.get("farmer_id")) != str(user_id):
             await callback_query.answer("❌ Не ваша партия", show_alert=True)
             return
 
-        pull = next((p for p in pulls if p.get("id") == pull_id), None)
         if not pull:
             await callback_query.answer("❌ Пулл не найден", show_alert=True)
             return
@@ -20911,22 +15865,18 @@ async def process_batch_selection_for_pull(
         if "batches" not in pull:
             pull["batches"] = []
 
-        if batch_id in pull["batches"]:
             await callback_query.answer("⚠️ Уже добавлена", show_alert=True)
             return
 
-        pull["batches"].append(batch_id)
         current_volume = pull.get("current_volume", 0)
         pull["current_volume"] = current_volume + batch.get("volume", 0)
 
-        save_pulls(pulls)
 
         await callback_query.answer("✅ Партия добавлена!", show_alert=True)
 
         logging.info(f"✅ Партия {batch_id} добавлена в пулл {pull_id}")
 
         try:
-            if hasattr(gs, "sync_pull_to_sheets"):
                 gs.sync_pull_to_sheets(pull_id, pull)
         except Exception as e:
             logging.debug(f"Синхронизация: {e}")
@@ -20951,8 +15901,6 @@ async def safe_notify_exporter(pull, batch):
             logging.debug("У пулла нет exporter_id")
             return
 
-        users = load_users()
-        if exporter_id not in users:
             logging.debug(f"Экспортёр {exporter_id} не найден")
             return
 
@@ -20991,26 +15939,12 @@ async def show_my_pulls_farmer(message: types.Message, state: FSMContext):
     """Показать пуллы в которых участвует фермер"""
     user_id = message.from_user.id
 
-    if user_id not in users:
         await message.answer("❌ Пользователь не найден")
         return
 
     my_pulls = []
 
-    for exporter_id, pulls in exporter_pulls.items():
-        for pull in pulls:
-            # Проверяем участвует ли фермер в этом пулле
-            for batch_id in pull.get("batches", []):
-                if user_id in batches:
-                    for batch in batches[user_id]:
-                        if batch.get("id") == batch_id:
-                            my_pulls.append(
-                                {
-                                    "pull": pull,
-                                    "exporter_id": exporter_id,
-                                    "batch": batch,
-                                }
-                            )
+        )
 
     if not my_pulls:
         await message.answer(
@@ -21027,12 +15961,8 @@ async def show_my_pulls_farmer(message: types.Message, state: FSMContext):
         batch = item["batch"]
 
         status_emoji = {"open": "🟢", "filling": "🟡", "closed": "🔴"}.get(
-            pull.get("status", "open"), "❓"
         )
-        msg += f"{i}. {status_emoji} {pull['culture']}\n"
-        msg += f"   Ваша партия: {batch['volume']} т\n"
         msg += f"   Порт: {pull.get('port', 'не указан')}\n"
-        msg += f"   Прогресс: {pull.get('current_volume', 0)}/{pull['target_volume']} т\n\n"
 
     await message.answer(msg, parse_mode="Markdown")
 
@@ -21042,7 +15972,6 @@ async def create_batch_start(message: types.Message, state: FSMContext):
     """Начать создание партии"""
     user_id = message.from_user.id
 
-    if user_id not in users or users[user_id].get("role") != "farmer":
         await message.answer("❌ Эта функция доступна только фермерам")
         return
 
@@ -21051,7 +15980,6 @@ async def create_batch_start(message: types.Message, state: FSMContext):
         reply_markup=culture_keyboard(),
         parse_mode="Markdown",
     )
-    await CreateBatchStates.culture.set()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -21070,7 +15998,6 @@ async def debug_account(message: types.Message):
 
     # Проверяем users
     if user_id in users:
-        user_data = users[user_id]
         info.append("✅ Найден в памяти (users)")
         info.append(f"   Роль: {user_data.get('role', 'не указана')}")
         info.append(f"   Телефон: {user_data.get('phone', 'не указан')}")
@@ -21083,10 +16010,6 @@ async def debug_account(message: types.Message):
         batch_count = len(batches[user_id])
         info.append(f"📦 Партий фермера: {batch_count}\n")
 
-    # Проверяем exporter_pulls
-    if user_id in exporter_pulls:
-        pull_count = len(exporter_pulls[user_id])
-        info.append(f"🎯 Пуллов экспортёра: {pull_count}\n")
 
     # Проверяем Google Sheets
     try:  # ← ПРАВИЛЬНЫЙ ОТСТУП!
@@ -21109,18 +16032,13 @@ async def debug_account(message: types.Message):
 # СИСТЕМА ЛОГИСТИЧЕСКИХ ЗАЯВОК
 # ============================================================================
 # -------------------- ЭКСПОРТЁР: СОЗДАНИЕ ЗАЯВКИ --------------------
-@dp.message_handler(lambda m: m.text == "🚚 Заявка на логистику", state="*")
 async def create_logistics_request_start(message: types.Message, state: FSMContext):
-    """Начало создания заявки на логистику — исправленный вариант"""
     await state.finish()
     user_id = message.from_user.id
 
-    if user_id not in users or users[user_id].get("role") != "exporter":
         await message.answer("❌ Эта функция доступна только экспортёрам")
         return
 
-    # --- Попробуем универсально достать пулы
-    # Сначала пытаемся pulls['pulls'], если нет — сам pulls
     true_pulls = None
     if (
         isinstance(pulls, dict)
@@ -21133,42 +16051,18 @@ async def create_logistics_request_start(message: types.Message, state: FSMConte
     else:
         true_pulls = {}
 
-    logging.info(f"\n{'='*50}")
     logging.info(f"USER {user_id} requested logistics")
     logging.info(f"ALL PULLS IN SYSTEM: {len(true_pulls)}")
-
-    for pid, p in true_pulls.items():
-        logging.info(
-            f"  Pull #{pid}: exporter_id={p.get('exporter_id')}, status={p.get('status')}, culture={p.get('culture')}"
-        )
-
-    logging.info(f"{'='*50}\n")
 
     exporter_pulls = {}
     for pid, p in true_pulls.items():
         exp_id = p.get("exporter_id")
-        pull_status = str(p.get("status", "")).lower().strip()
-        logging.info(
-            f"Checking pull {pid}: exp_id={exp_id}, user_id={user_id}, match={exp_id == user_id}, status={pull_status}"
-        )
-        if exp_id == user_id and pull_status not in [
-            "filled",
-            "заполнен",
-            "shipped",
-            "отправлен",
-            "closed",
-            "закрыт",
-        ]:
-            exporter_pulls[pid] = p
-            logging.info(f"  ✅ ADDED to exporter_pulls")
+                logging.info(
+                )
+                exporter_pulls[pid] = p
 
-    logging.info(f"FOUND {len(exporter_pulls)} active pulls for user {user_id}")
 
     if not exporter_pulls:
-        await message.answer(
-            "❌ У вас нет активных пулов.\n\n"
-            "Создайте пул, чтобы заказать логистику.",
-            reply_markup=exporter_keyboard(),
         )
         return
 
@@ -21176,17 +16070,10 @@ async def create_logistics_request_start(message: types.Message, state: FSMConte
     for pull_id, pull in list(exporter_pulls.items())[:10]:
         culture = pull.get("culture", "Неизвестно")
         current_vol = pull.get("current_volume", 0) or 0
-        btn_text = f"#{pull_id} • {culture} • {current_vol:.0f} т"
         keyboard.add(
-            InlineKeyboardButton(
-                btn_text, callback_data=f"create_logistic_req:{pull_id}"
-            )
         )
 
     await message.answer(
-        "🚚 <b>Заявка на логистику</b>\n\n"
-        f"<b>Найдено пулов: {len(exporter_pulls)}</b>\n\n"
-        "Выберите пул для организации перевозки:",
         reply_markup=keyboard,
         parse_mode="HTML",
     )
@@ -21203,25 +16090,17 @@ async def select_pull_for_logistics(callback: types.CallbackQuery, state: FSMCon
         await callback.answer("❌ Ошибка", show_alert=True)
         return
 
-    if pull_id not in pulls.get("pulls", {}):
         await callback.answer("❌ Пул не найден", show_alert=True)
         return
 
-    pull = pulls["pulls"][pull_id]
-
     await state.update_data(
         pull_id=pull_id,
-        culture=pull["culture"],
         volume=pull.get("current_volume", 0),
         port=pull.get("port", ""),
     )
 
     await callback.message.edit_text(
-        f"🚚 <b>Заявка на логистику</b>\n\n"
-        f"<b>Шаг 1 из 4</b>\n\n"
-        f"Пул: #{pull_id} • {pull['culture']} • {pull.get('current_volume', 0):.0f} т\n"
         f"Порт: {pull.get('port', '')}\n\n"
-        f"Откуда (регион/город погрузки):",
         parse_mode="HTML",
     )
 
@@ -21238,11 +16117,8 @@ async def logistics_request_from(message: types.Message, state: FSMContext):
     data = await state.get_data()
 
     await message.answer(
-        f"🚚 <b>Заявка на логистику</b>\n\n"
-        f"<b>Шаг 2 из 4</b>\n\n"
         f"Откуда: <b>{route_from}</b>\n"
         f"Куда: <b>{data.get('port', '')}</b>\n\n"
-        f"Желаемая дата погрузки (ДД.ММ.ГГГГ):",
         parse_mode="HTML",
     )
 
@@ -21266,13 +16142,9 @@ async def logistics_request_date(message: types.Message, state: FSMContext):
     data = await state.get_data()
 
     await message.answer(
-        f"🚚 <b>Заявка на логистику</b>\n\n"
-        f"<b>Шаг 3 из 4</b>\n\n"
         f"Откуда: <b>{data.get('route_from', '')}</b>\n"
         f"Куда: <b>{data.get('port', '')}</b>\n"
         f"Дата: <b>{loading_date}</b>\n\n"
-        f"Ожидаемая цена доставки за тонну (₽/т):\n"
-        f"<i>Например: 500 или 1200.5</i>",
         parse_mode="HTML",
     )
 
@@ -21299,7 +16171,6 @@ async def logistics_request_desired_price(message: types.Message, state: FSMCont
 
         await CreateLogisticRequestStatesGroup.notes.set()
 
-    except (ValueError, Exception) as e:
         await message.answer(
             "❌ Неверный формат цены. Укажите число (например: 700 или 750.5)"
         )
@@ -21318,15 +16189,12 @@ async def logistics_request_finish(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
 
     pull_id = data["pull_id"]
-    pull = pulls["pulls"][pull_id]
 
     logistics_request_counter += 1
 
     # ✅ СОЗДАЁМ ЗАЯВКУ С ПОЛЕМ desired_price
     request = {
         "id": logistics_request_counter,
-        "exporter_id": user_id,
-        "exporter_name": users[user_id].get("name", ""),
         "pull_id": pull_id,
         "culture": data["culture"],
         "volume": data["volume"],
@@ -21347,7 +16215,6 @@ async def logistics_request_finish(message: types.Message, state: FSMContext):
     await state.finish()
 
     # ✅ ПОКАЗЫВАЕМ ОЖИДАЕМУЮ ЦЕНУ В ИТОГЕ
-    exporter = users[user_id]
     exporter_inn = exporter.get("inn", "Не указан")
     exporter_ogrn = exporter.get("ogrn", "Не указан")
     exporter_phone = exporter.get("phone", "Не указан")
@@ -21372,7 +16239,6 @@ async def logistics_request_finish(message: types.Message, state: FSMContext):
         f"📋 ОГРН: <code>{exporter_ogrn}</code>\n"
         f"📞 Телефон: <code>{exporter_phone}</code>\n"
         f"📧 Email: <code>{exporter_email}</code>\n\n"
-        f"🔔 Логисты получат уведомление о вашей заявке"
     )
 
     await message.answer(summary, parse_mode="HTML", reply_markup=exporter_keyboard())
@@ -21401,19 +16267,12 @@ async def view_logistics_request_details(
         await callback.answer(f"❌ Ошибка: {e}", show_alert=True)
         return
 
-    # Проверяем наличие заявки
-    if req_id not in logistics_requests:
         await callback.answer("❌ Заявка не найдена", show_alert=True)
         return
 
-    req = logistics_requests[req_id]
     user_id = callback.from_user.id
 
-    # Проверяем, откликался ли уже
     already_offered = any(
-        o.get("logist_id") == user_id and o.get("status") != "cancelled"
-        for o in logistics_offers.values()
-        if o.get("request_id") == req_id
     )
 
     # ✅ ПОЛНАЯ ИНФОРМАЦИЯ О ЗАЯВКЕ
@@ -21433,7 +16292,6 @@ async def view_logistics_request_details(
 Срок доставки: {req.get('delivery_date', 'Не указан')}
 
 <b>💼 Статистика:</b>
-Откликов получено: {req.get('offers_count', 0)}
 Статус: {req.get('status', 'active')}
 """
 
@@ -21441,51 +16299,35 @@ async def view_logistics_request_details(
         msg += f"\n<b>📝 Дополнительно:</b>\n{req['notes']}"
 
     # Информация о заказчике
-    farmer_id = req.get("farmer_id")
-    if farmer_id and farmer_id in users:
-        farmer = users[farmer_id]
         msg += f"""
 
 <b>👨‍🌾 Заказчик:</b>
-Имя: {farmer.get('name', 'Не указано')}
-Телефон: <code>{farmer.get('phone', 'Не указан')}</code>
-Email: <code>{farmer.get('email', 'Не указан')}</code>
-Регион: {farmer.get('region', 'Не указан')}
 """
 
     keyboard = InlineKeyboardMarkup(row_width=1)
 
-    # Кнопка отклика (если заявка активна и не было отклика)
-    if not already_offered and req.get("status") in ["active", "has_offers"]:
         keyboard.add(
             InlineKeyboardButton(
-                "✅ Откликнуться на заявку", callback_data=f"respond_logistics:{req_id}"
             )
         )
-    elif already_offered:
         keyboard.add(
             InlineKeyboardButton("✔️ Вы уже откликнулись", callback_data="noop")
         )
 
     # Кнопка контакта (если это не ваша заявка)
-    if farmer_id and farmer_id != user_id:
         keyboard.add(
             InlineKeyboardButton(
                 "📞 Позвонить заказчику",
-                url=f"tel:{users.get(farmer_id, {}).get('phone', '')}",
+        )
             )
-        )
-        keyboard.add(
-            InlineKeyboardButton(
-                "💬 Написать в Telegram", url=f"tg://user?id={farmer_id}"
+            keyboard.add(
+                InlineKeyboardButton(
+                )
             )
-        )
-
-    keyboard.add(
-        InlineKeyboardButton(
-            "◀️ Назад к заявкам", callback_data="back_to_logistics_requests"
-        )
-    )
+                    keyboard.add(
+                        InlineKeyboardButton(
+                        )
+                    )
 
     await callback.message.edit_text(msg, reply_markup=keyboard, parse_mode="HTML")
     await callback.answer()
@@ -21495,7 +16337,6 @@ Email: <code>{farmer.get('email', 'Не указан')}</code>
 async def respond_to_logistics_request(
     callback: types.CallbackQuery, state: FSMContext
 ):
-    """Отклик на заявку логиста"""
 
     try:
         req_id = parse_callback_id(callback.data)
@@ -21503,114 +16344,14 @@ async def respond_to_logistics_request(
         await callback.answer("❌ Ошибка", show_alert=True)
         return
 
-    # ✅ ДОБАВЛЯЕМ: ищем в ОБОИХ хранилищах
-    req = logistics_requests.get(req_id)
-    req_storage = "logistics"
 
-    if not req:
-        req = shipping_requests.get(req_id)
-        req_storage = "shipping"
 
-    if not req:
         await callback.answer("❌ Заявка не найдена", show_alert=True)
         return
-
-    user_id = callback.from_user.id
-
-    # ✅ ДОБАВЛЯЕМ: используем нужное хранилище для offers
-    if "offers" not in req:
-        req["offers"] = []
-
-    # Проверяем дубль
-    if any(o.get("logist_id") == user_id for o in req["offers"]):
-        await callback.answer("❌ Вы уже откликнулись", show_alert=True)
         return
 
-    # Генерируем ID для отклика
-    offer_id = len(req["offers"]) + 1
-
-    # Сохраняем отклик в список offers
-    req["offers"].append(
-        {
-            "offer_id": offer_id,
-            "request_id": req_id,
-            "logist_id": user_id,
-            "logist_name": users.get(user_id, {}).get("name", "Неизвестно"),
-            "logist_phone": users.get(user_id, {}).get("phone", "Не указан"),
-            "logist_inn": users.get(user_id, {}).get("inn", "Не указан"),
-            "logist_ogrn": users.get(user_id, {}).get("ogrn", "Не указан"),
-            "status": "pending",
-            "created_at": datetime.now().strftime("%d.%m.%Y %H:%M"),
-            "message": "Готов выполнить перевозку",
-        }
-    )
-
-    # Увеличиваем счетчик откликов
-    req["offers_count"] = len(req["offers"])
-    req["status"] = "has_offers"
-
-    # ✅ ДОБАВЛЯЕМ: определяем куда сохранять
-    if req_storage == "logistics":
-        logistics_requests[req_id] = req
-    else:
-        shipping_requests[req_id] = req
-
-    save_data()
-
-    # Уведомляем заказчика
-    farmer_id = req.get("farmer_id") or req.get(
-        "user_id"
-    )  # ✅ ДОБАВЛЯЕМ: user_id для фермеров
-    if farmer_id:
-        farmer_name = users.get(farmer_id, {}).get("name", "Неизвестно")
-        notify_msg = f"""
-✅ <b>Новый отклик на вашу заявку!</b>
 
 
-📋 Заявка: #{req_id}
-👤 Логист: {users.get(user_id, {}).get('name', 'Неизвестно')}
-📱 Телефон: <code>{users.get(user_id, {}).get('phone', 'Не указан')}</code>
-
-
-Всего откликов: {req['offers_count']}
-
-
-📲 Посмотреть все отклики: /my_requests
-"""
-        try:
-            await bot.send_message(farmer_id, notify_msg, parse_mode="HTML")
-        except:
-            pass
-
-    # Подтверждение для логиста
-    msg = f"""
-✅ <b>Отклик отправлен!</b>
-
-
-📋 Заявка: #{req_id}
-🌾 Культура: {req.get('culture', 'Н/Д')}
-📦 Объем: {req.get('volume', 0):.0f} т
-
-
-Заказчик сможет связаться с вами по номеру:
-<code>{users.get(user_id, {}).get('phone', 'Не указан')}</code>
-
-
-⏳ Ожидаем решения заказчика...
-"""
-
-    keyboard = InlineKeyboardMarkup()
-    keyboard.add(
-        InlineKeyboardButton(
-            "◀️ Назад к заявкам", callback_data="back_to_logistics_requests"
-        )
-    )
-
-    await callback.message.edit_text(msg, reply_markup=keyboard, parse_mode="HTML")
-    await callback.answer("✅ Ваш отклик зарегистрирован!", show_alert=True)
-
-
-@dp.message_handler(state=LogisticOfferStatesGroup.price)
 async def logistics_offer_price(message: types.Message, state: FSMContext):
     """Цена за перевозку"""
     try:
@@ -21621,37 +16362,26 @@ async def logistics_offer_price(message: types.Message, state: FSMContext):
         await state.update_data(price=price)
 
         await message.answer(
-            f"💼 <b>Отклик на заявку</b>\n\n"
-            f"<b>Шаг 2 из 4</b>\n\n"
             f"Цена: <b>{price:,.0f} ₽/т</b>\n\n"
-            f"Тип транспорта (например: Фура 20т, Зерновоз):",
             parse_mode="HTML",
         )
 
-        await LogisticOfferStatesGroup.vehicle_type.set()
 
     except ValueError:
         await message.answer("❌ Некорректная цена. Введите положительное число.")
 
 
-@dp.message_handler(state=LogisticOfferStatesGroup.vehicle_type)
 async def logistics_offer_vehicle(message: types.Message, state: FSMContext):
     """Тип транспорта"""
     vehicle_type = message.text.strip()
     await state.update_data(vehicle_type=vehicle_type)
 
     await message.answer(
-        f"💼 <b>Отклик на заявку</b>\n\n"
-        f"<b>Шаг 3 из 4</b>\n\n"
-        f"Транспорт: <b>{transport}</b>\n\n"
-        f"Срок доставки (дней):",
         parse_mode="HTML",
     )
 
-    await LogisticOfferStatesGroup.delivery_date.set()
 
 
-@dp.message_handler(state=LogisticOfferStatesGroup.delivery_date)
 async def logistics_offer_days(message: types.Message, state: FSMContext):
     """Срок доставки"""
     try:
@@ -21662,14 +16392,10 @@ async def logistics_offer_days(message: types.Message, state: FSMContext):
         await state.update_data(delivery_days=delivery_days)
 
         await message.answer(
-            f"💼 <b>Отклик на заявку</b>\n\n"
-            f"<b>Шаг 4 из 4</b>\n\n"
             f"Срок: <b>{delivery_days} дней</b>\n\n"
-            f"Дополнительная информация (или /skip):",
             parse_mode="HTML",
         )
 
-        await LogisticOfferStatesGroup.additional_info.set()
 
     except ValueError:
         await message.answer("❌ Некорректный срок. Введите целое число дней.")
@@ -21681,9 +16407,7 @@ async def logistics_offer_days(message: types.Message, state: FSMContext):
 
 
 @dp.message_handler(
-    lambda m: m.text == "/skip", state=LogisticOfferStatesGroup.additional_info
 )
-@dp.message_handler(state=LogisticOfferStatesGroup.additional_info)
 async def logistics_offer_finish(message: types.Message, state: FSMContext):
     """Завершение отклика логиста"""
     global logistics_offer_counter
@@ -21692,23 +16416,15 @@ async def logistics_offer_finish(message: types.Message, state: FSMContext):
     data = await state.get_data()
     user_id = message.from_user.id
 
-    req_id = data["request_id"]
-    req = logistics_requests.get(req_id)
 
-    if not req:
         await message.answer("❌ Заявка не найдена. Попробуйте ещё раз.")
         await state.finish()
         return
 
-    logistics_offer_counter += 1
 
     offer = {
-        "id": logistics_offer_counter,
         "request_id": req_id,
         "logist_id": user_id,
-        "logist_name": users[user_id].get("name", "N/A"),
-        "logist_phone": users[user_id].get("phone", "N/A"),
-        "logist_email": users[user_id].get("email", "N/A"),
         "price": data["price"],
         "vehicle_type": data["vehicle_type"],
         "delivery_days": data["delivery_days"],
@@ -21717,11 +16433,8 @@ async def logistics_offer_finish(message: types.Message, state: FSMContext):
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
-    logistics_offers[logistics_offer_counter] = offer
 
     # Обновляем счётчик откликов в заявке
-    req["offers_count"] = req.get("offers_count", 0) + 1
-    if req["status"] == "active":
         req["status"] = "has_offers"
 
     save_logistics_requests_to_pickle()
@@ -21734,7 +16447,6 @@ async def logistics_offer_finish(message: types.Message, state: FSMContext):
 
     # ИТОГОВОЕ СООБЩЕНИЕ ЛОГИСТУ
     summary = (
-        f"✅ <b>Отклик отправлен!</b>\n\n"
         f"📋 Заявка: #{req_id}\n"
         f"🌾 {req['culture']} • {req['volume']:.0f} т\n"
         f"📍 {req['route_from']} → {req['route_to']}\n\n"
@@ -21742,10 +16454,6 @@ async def logistics_offer_finish(message: types.Message, state: FSMContext):
         f"💵 <b>Общая сумма:</b> <code>{total_price:,.0f}</code> ₽\n"
         f"🚛 <b>Транспорт:</b> {data['vehicle_type']}\n"
         f"⏱ <b>Срок:</b> {data['delivery_days']} дн.\n\n"
-        f"👤 Логист: {users[user_id].get('name', 'N/A')}\n"
-        f"☎️ <code>{users[user_id].get('phone', 'N/A')}</code>\n"
-        f"📧 <code>{users[user_id].get('email', 'N/A')}</code>\n\n"
-        f"Экспортёр получит уведомление о вашем отклике."
     )
 
     await message.answer(summary, parse_mode="HTML", reply_markup=logistic_keyboard())
@@ -21754,65 +16462,34 @@ async def logistics_offer_finish(message: types.Message, state: FSMContext):
     await notify_exporter_about_offer(req, offer)
 
     logging.info(
-        f"✅ Logistics offer {logistics_offer_counter} created by logist {user_id}"
     )
 
 
 # ============================================================================
 # 🔔 ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ УВЕДОМЛЕНИЙ
 # ============================================================================
-async def notify_logistics_about_new_request(request):
-    """Уведомление логистов о новой заявке на логистику"""
-    logistics_users = [uid for uid, u in users.items() if u.get("role") == "logistic"]
 
-    # ✅ ИСПРАВЛЕНО: используем .get() с дефолтным значением
-    desired_date = request.get("desired_date", "Не указана")
 
     msg = (
-        f"✅ <b>Заявка на логистику #{request['id']}</b>\n\n"
-        f"📦 Пул: #{request['pull_id']}\n"
-        f"🌾 Культура: {request['culture']}\n"
-        f"📊 Объём: {request['volume']:.0f} т\n"
-        f"📍 Маршрут: {request['route_from']} → {request['route_to']}\n"
-        f"📅 Дата: {desired_date}\n\n"  # ✅ ИСПРАВЛЕНО
-        f"👤 Экспортер: {request['exporter_name']}\n"
-        f"☎️ <code>{request['exporter_phone']}</code>\n\n"
-        f"💼 Откликнитесь через меню 'Активные заявки'"
     )
 
     for logist_id in logistics_users:
         try:
             await bot.send_message(logist_id, msg, parse_mode="HTML")
             logging.info(
-                f"✅ Notified logist {logist_id} about request #{request['id']}"
             )
         except Exception as e:
             logging.error(f"❌ Error notifying logist {logist_id}: {e}")
 
 
-async def notify_exporter_about_offer(request, offer):
-    """Уведомление экспортёра о новом отклике логиста на заявку"""
     exporter_id = request.get("exporter_id")
-    total_price = offer.get("price", 0) * request.get("volume", 0)
     msg = (
-        f"💼 <b>Новый отклик на заявку #{request.get('id', '-')}</b>\n\n"
-        f"📦 Пул: #{request.get('pull_id', '-')}\n"
-        f"🌾 {request.get('culture', '-')} • {request.get('volume', 0):.0f} т\n"
-        f"📍 {request.get('route_from', '-')} → {request.get('route_to', '-')}\n\n"
-        f"👤 <b>Логист:</b> {offer.get('logist_name', '-')}\n"
-        f"☎️ <code>{offer.get('logist_phone', '-')}</code>\n"
-        f"📧 <code>{offer.get('logist_email', '-')}</code>\n\n"
-        f"💰 <b>Цена:</b> <code>{offer.get('price', 0):,.0f}</code> ₽/т\n"
-        f"💵 <b>Сумма:</b> <code>{total_price:,.0f}</code> ₽\n"
-        f"🚛 <b>Транспорт:</b> {offer.get('vehicle_type', '-')}\n"
-        f"⏱ <b>Срок:</b> {offer.get('delivery_days', '-')} дн.\n\n"
-        f"Нажмите 'Мои заявки' чтобы рассмотреть предложение"
     )
 
     try:
         await bot.send_message(exporter_id, msg, parse_mode="HTML")
         logging.info(
-            f"✅ Notified exporter {exporter_id} about offer #{offer.get('id', '-')}"
+            f"✅ Notified exporter {exporter_id} about offer #{offer.get('id','-')}"
         )
     except Exception as e:
         logging.error(f"❌ Error notifying exporter {exporter_id}: {e}")
@@ -21827,8 +16504,6 @@ async def back_to_logistics_requests_handler(
 ):
     """Возврат к списку активных заявок"""
     await state.finish()
-    await show_active_requests(callback.message, state)
-    await callback.answer()
 
 
 @dp.callback_query_handler(lambda c: c.data == "noop", state="*")
@@ -21866,30 +16541,14 @@ if "expeditor_cards" not in globals():
 
 @dp.message_handler(Text(equals="📋 Моя карточка"), state="*")
 async def show_my_card_menu(message: types.Message, state: FSMContext):
-    """Показать меню карточки логиста/экспедитора"""
     await state.finish()
 
     user_id = message.from_user.id
-    if user_id not in users:
         await message.answer("❌ Вы не зарегистрированы. Используйте /start")
         return
 
-    user = users[user_id]
     role = user.get("role")
 
-    if role == "logistic":
-        if user_id in logistics_cards:
-            card = logistics_cards[user_id]
-            text = f"""
-📋 <b>Ваша карточка логиста</b>
-
-🚚 <b>Маршруты:</b> {card.get('routes', 'Не указано')}
-💰 <b>Цена за км:</b> {card.get('price_per_km', 'Не указано')} ₽/км
-💰 <b>Цена за тонну:</b> {card.get('price_per_ton', 'Не указано')} ₽/т
-📦 <b>Мин. объём:</b> {card.get('min_volume', 'Не указано')} т
-🚛 <b>Тип транспорта:</b> {card.get('transport_type', 'Не указано')}
-🏢 <b>Порты:</b> {card.get('ports', 'Не указано')}
-"""
             keyboard = InlineKeyboardMarkup(row_width=1)
             keyboard.add(
                 InlineKeyboardButton(
@@ -21898,37 +16557,22 @@ async def show_my_card_menu(message: types.Message, state: FSMContext):
                 InlineKeyboardButton("🗑 Удалить", callback_data="delete_logistic_card"),
             )
         else:
-            text = "📋 У вас ещё нет карточки. Создайте её, чтобы получать заказы!"
-            keyboard = InlineKeyboardMarkup()
             keyboard.add(
                 InlineKeyboardButton(
                     "➕ Создать карточку", callback_data="create_logistic_card"
                 )
             )
 
-    elif role == "expeditor":
-        if user_id in expeditor_cards:
-            card = expeditor_cards[user_id]
-            text = f"""
-📋 <b>Ваша карточка экспедитора</b>
 
-📜 <b>Услуги:</b> {card.get('services', 'Не указано')}
-💰 <b>Стоимость ДТ:</b> {card.get('dt_price', 'Не указано')} ₽
-🏢 <b>Порты:</b> {card.get('ports', 'Не указано')}
-⭐ <b>Опыт:</b> {card.get('experience', 'Не указано')}
-"""
             keyboard = InlineKeyboardMarkup(row_width=1)
             keyboard.add(
                 InlineKeyboardButton(
-                    "✏️ Редактировать", callback_data="edit_expeditor_card"
                 ),
                 InlineKeyboardButton(
                     "🗑 Удалить", callback_data="delete_expeditor_card"
                 ),
             )
         else:
-            text = "📋 У вас ещё нет карточки. Создайте её, чтобы получать заказы!"
-            keyboard = InlineKeyboardMarkup()
             keyboard.add(
                 InlineKeyboardButton(
                     "➕ Создать карточку", callback_data="create_expeditor_card"
@@ -21961,7 +16605,6 @@ async def start_create_logistic_card(callback: types.CallbackQuery, state: FSMCo
 
 @dp.message_handler(state=CreateLogisticCardStates.routes)
 async def process_logistic_routes(message: types.Message, state: FSMContext):
-    await state.update_data(routes=message.text)
     await message.answer(
         "💰 Шаг 2/7\n\nУкажите цену за километр (руб.):", parse_mode="HTML"
     )
@@ -21974,7 +16617,6 @@ async def process_price_per_km(message: types.Message, state: FSMContext):
         price = float(message.text.replace(",", "."))
         await state.update_data(price_per_km=price)
         await message.answer(
-            "💰 Шаг 3/7\n\nУкажите цену за тонну (руб.):", parse_mode="HTML"
         )
         await CreateLogisticCardStates.price_per_ton.set()
     except ValueError:
@@ -22011,7 +16653,6 @@ async def process_min_volume(message: types.Message, state: FSMContext):
 
 @dp.message_handler(state=CreateLogisticCardStates.transport_type)
 async def process_transport_type(message: types.Message, state: FSMContext):
-    await state.update_data(transport_type=message.text)
 
     keyboard = InlineKeyboardMarkup(row_width=2)
     ports = [
@@ -22024,7 +16665,6 @@ async def process_transport_type(message: types.Message, state: FSMContext):
         "Агрофуд",
         "Моспорт",
         "ЦГП",
-        "ФЗТ",
         "АМП",
         "Армада",
         "Стрелец",
@@ -22059,7 +16699,6 @@ async def toggle_port_selection(callback: types.CallbackQuery, state: FSMContext
 
     await state.update_data(selected_ports=selected_ports)
 
-    # Обновляем клавиатуру
     keyboard = InlineKeyboardMarkup(row_width=2)
     ports = [
         "Ариб",
@@ -22071,7 +16710,6 @@ async def toggle_port_selection(callback: types.CallbackQuery, state: FSMContext
         "Агрофуд",
         "Моспорт",
         "ЦГП",
-        "ФЗТ",
         "АМП",
         "Армада",
         "Стрелец",
@@ -22099,7 +16737,6 @@ async def ports_selected(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer("❌ Выберите хотя бы один порт", show_alert=True)
         return
 
-    await state.update_data(ports=", ".join(selected_ports))
     await callback.message.edit_text(
         "📝 Шаг 7/7\n\nВведите дополнительную информацию (или напишите 'нет'):",
         parse_mode="HTML",
@@ -22110,31 +16747,20 @@ async def ports_selected(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.message_handler(state=CreateLogisticCardStates.additional_info)
 async def save_logistic_card(message: types.Message, state: FSMContext):
-    additional = message.text if message.text.lower() != "нет" else ""
     await state.update_data(additional_info=additional)
-
     data = await state.get_data()
     user_id = message.from_user.id
 
     logistics_cards[user_id] = {
         # Основные данные карточки
         "user_id": user_id,
-        "vehicle_type": data.get("vehicle_type", "Не указано"),
-        "capacity": data.get("capacity", 0),
-        "ports": data.get("ports", []),
-        "price_per_ton": data.get("price_per_ton", 0),
-        "description": description,
-        "transport_type": data.get("transport_type", "Не указано"),
         # Метаданные карточки
         "status": "active",
         "created_at": datetime.now().strftime("%d.%m.%Y %H:%M"),
         "views": 0,
-        # ✅ Данные пользователя (контактные лица)
         "name": user_data.get("name", "Не указано"),
-        "user_name": user_data.get("name", "Не указано"),
         "phone": user_data.get("phone", "Не указан"),
         "email": user_data.get("email", "Не указан"),
-        # ✅ Реквизиты компании
         "company": user_data.get("company_details", "Не указана"),
         "inn": user_data.get("inn", "Не указан"),
         "ogrn": user_data.get("ogrn", "Не указан"),
@@ -22156,69 +16782,45 @@ async def save_logistic_card(message: types.Message, state: FSMContext):
 # ====================================================================
 # СОЗДАНИЕ КАРТОЧКИ ЭКСПЕДИТОРА (АНАЛОГИЧНО)
 # ====================================================================
-
-
 @dp.callback_query_handler(lambda c: c.data == "create_expeditor_card", state="*")
 async def start_create_expeditor_card(callback: types.CallbackQuery, state: FSMContext):
     await state.finish()
     await callback.message.edit_text(
-        "📜 <b>Создание карточки экспедитора</b>\n\nШаг 1/5\n\n"
-        "Опишите ваши услуги (например: Оформление ДТ, таможенное сопровождение):",
         parse_mode="HTML",
     )
-    await CreateExpeditorCardStates.services.set()
     await callback.answer()
 
 
-@dp.message_handler(state=CreateExpeditorCardStates.services)
-async def process_expeditor_services(message: types.Message, state: FSMContext):
-    await state.update_data(services=message.text)
-    await message.answer(
-        "💰 Шаг 2/5\n\nУкажите стоимость оформления ДТ (руб.):", parse_mode="HTML"
+
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    ports = [
+        "Ариб",
+        "ПКФ «Волга-Порт»",
+        "ПКФ «Юг-Тер»",
+        "ПАО «Астр.Порт»",
+        "Универ.Порт",
+        "Юж.Порт",
+        "Агрофуд",
+        "Моспорт",
+        "ЦГП",
+        "АМП",
+        "Армада",
+        "Стрелец",
+        "Альфа",
+    ]
+    for port in ports:
+        keyboard.insert(
+            InlineKeyboardButton(port, callback_data=f"selectexpport_{port}")
+        )
+    keyboard.add(
+        InlineKeyboardButton("✅ Готово", callback_data="expeditor_ports_selected")
     )
-    await CreateExpeditorCardStates.dt_price.set()
 
-
-@dp.message_handler(state=CreateExpeditorCardStates.dt_price)
-async def process_dt_price(message: types.Message, state: FSMContext):
-    try:
-        price = float(message.text.replace(",", ".").replace(" ", ""))
-        await state.update_data(dt_price=price)
-
-        keyboard = InlineKeyboardMarkup(row_width=2)
-        ports = [
-            "Ариб",
-            "ПКФ «Волга-Порт»",
-            "ПКФ «Юг-Тер»",
-            "ПАО «Астр.Порт»",
-            "Универ.Порт",
-            "Юж.Порт",
-            "Агрофуд",
-            "Моспорт",
-            "ЦГП",
-            "ФЗТ",
-            "АМП",
-            "Армада",
-            "Стрелец",
-            "Альфа",
-        ]
-
-        for port in ports:
-            keyboard.insert(
-                InlineKeyboardButton(port, callback_data=f"selectexpport_{port}")
-            )
-        keyboard.add(
-            InlineKeyboardButton("✅ Готово", callback_data="expeditor_ports_selected")
-        )
-
-        await message.answer(
-            "🏢 Шаг 3/5\n\nВыберите порты, в которых работаете:",
-            reply_markup=keyboard,
-            parse_mode="HTML",
-        )
-        await CreateExpeditorCardStates.ports.set()
-    except ValueError:
-        await message.answer("❌ Введите число. Попробуйте снова:")
+    await message.answer(
+        reply_markup=keyboard,
+        parse_mode="HTML",
+    )
+    await CreateExpeditorCardStates.ports.set()
 
 
 @dp.callback_query_handler(
@@ -22248,7 +16850,6 @@ async def toggle_expeditor_port(callback: types.CallbackQuery, state: FSMContext
         "Агрофуд",
         "Моспорт",
         "ЦГП",
-        "ФЗТ",
         "АМП",
         "Армада",
         "Стрелец",
@@ -22263,7 +16864,6 @@ async def toggle_expeditor_port(callback: types.CallbackQuery, state: FSMContext
         InlineKeyboardButton("✅ Готово", callback_data="expeditor_ports_selected")
     )
 
-    await callback.message.edit_reply_markup(reply_markup=keyboard)
     await callback.answer()
 
 
@@ -22279,56 +16879,24 @@ async def expeditor_ports_selected(callback: types.CallbackQuery, state: FSMCont
         await callback.answer("❌ Выберите хотя бы один порт", show_alert=True)
         return
 
-    await state.update_data(ports=", ".join(selected_ports))
     await callback.message.edit_text(
-        "⭐ Шаг 4/5\n\nУкажите ваш опыт работы (лет):", parse_mode="HTML"
     )
-    await CreateExpeditorCardStates.experience.set()
     await callback.answer()
 
 
-@dp.message_handler(state=CreateExpeditorCardStates.experience)
-async def process_expeditor_experience(message: types.Message, state: FSMContext):
-    await state.update_data(experience=message.text)
     await message.answer(
-        "📝 Шаг 5/5\n\nВведите дополнительную информацию (или 'нет'):",
         parse_mode="HTML",
     )
-    await CreateExpeditorCardStates.additional_info.set()
 
 
-@dp.message_handler(state=CreateExpeditorCardStates.additional_info)
-async def save_expeditor_card(message: types.Message, state: FSMContext):
-    additional = message.text if message.text.lower() != "нет" else ""
-    await state.update_data(additional_info=additional)
 
     data = await state.get_data()
     user_id = message.from_user.id
 
     expeditor_cards[user_id] = {
-        # Основные данные карточки
         "user_id": user_id,
-        "vehicle_type": data.get("vehicle_type", "Не указано"),
-        "capacity": data.get("capacity", 0),
-        "regions": data.get("regions", []),
-        "price_per_km": data.get("price_per_km", 0),
-        "description": description,
-        "services": data.get("services", "Не указаны"),
-        "dt_price": data.get("dt_price", 0),
-        # Метаданные карточки
         "status": "active",
         "created_at": datetime.now().strftime("%d.%m.%Y %H:%M"),
-        "views": 0,
-        # ✅ Данные пользователя (контактные лица)
-        "name": user_data.get("name", "Не указано"),
-        "user_name": user_data.get("name", "Не указано"),
-        "phone": user_data.get("phone", "Не указан"),
-        "email": user_data.get("email", "Не указан"),
-        # ✅ Реквизиты компании
-        "company": user_data.get("company_details", "Не указана"),
-        "inn": user_data.get("inn", "Не указан"),
-        "ogrn": user_data.get("ogrn", "Не указан"),
-        "region": user_data.get("region", "Не указан"),
     }
 
     save_expeditor_cards_to_pickle()
@@ -22336,7 +16904,6 @@ async def save_expeditor_card(message: types.Message, state: FSMContext):
     await state.finish()
     await message.answer(
         "✅ <b>Карточка экспедитора создана!</b>\n\n"
-        "Теперь экспортёры будут получать вашу карточку при закрытии пулов.",
         parse_mode="HTML",
     )
 
@@ -22346,62 +16913,38 @@ async def save_expeditor_card(message: types.Message, state: FSMContext):
 # ====================================================================
 # ВЫБОР ЛОГИСТА ЭКСПОРТЁРОМ
 # ====================================================================
-
-
 @dp.callback_query_handler(lambda c: c.data.startswith("select_logistic_"))
 async def select_logistic_handler(callback: types.CallbackQuery):
-    """Выбор логиста для сделки"""
     try:
         parts = callback.data.split("_")
         logistic_id = int(parts[2])
         deal_id = int(parts[3])
 
-        if deal_id not in deals:
             await callback.answer("❌ Сделка не найдена", show_alert=True)
             return
 
-        deals[deal_id]["logistic_id"] = logistic_id
-        deals[deal_id]["logistic_selected_at"] = datetime.now().strftime(
             "%Y-%m-%d %H:%M:%S"
         )
         save_deals_to_pickle()
 
-        logistic = users.get(logistic_id, {})
         inn = logistic.get("inn", "Не указано")
         ogrn = logistic.get("ogrn", "Не указано")
-        company = logistic.get("company_details", "Не указано")
 
-        await callback.message.edit_text(
-            f"✅ <b>Логист выбран!</b>\n\n"
             f"👤 Контакт: {logistic.get('name', 'Не указано')}\n"
             f"🏢 Компания: {company}\n"
             f"📋 ИНН: <code>{inn}</code>\n"
             f"📋 ОГРН: <code>{ogrn}</code>\n"
-            f"📞 Телефон: <code>{logistic.get('phone', 'Не указано')}</code>\n"
-            f"📧 Email: <code>{logistic.get('email', 'Не указано')}</code>",
-            parse_mode="HTML",
         )
 
-        # Уведомление логисту
-        deal = deals[deal_id]
         pull_id = deal.get("pull_id")
-        pull = pulls.get(pull_id, {})
 
         try:
-            await bot.send_message(
-                logistic_id,
-                f"🎉 <b>ВЫ ВЫБРАНЫ!</b>\n\n"
                 f"📦 Сделка #{deal_id}\n"
                 f"🎯 Объём: {pull.get('current_volume', 0)} т\n"
-                f"🏢 Порт: {pull.get('port', 'Не указано')}\n\n"
-                f"Свяжитесь с экспортёром!",
-                parse_mode="HTML",
             )
             logging.info(
-                f"✅ Логист {logistic_id} уведомлен о выборе для сделки {deal_id}"
             )
         except Exception as e:
-            logging.error(f"Ошибка при отправке уведомления: {e}")
 
         logging.info(f"✅ Логист {logistic_id} выбран для сделки {deal_id}")
 
@@ -22413,52 +16956,29 @@ async def select_logistic_handler(callback: types.CallbackQuery):
 # ====================================================================
 # ВЫБОР ЭКСПЕДИТОРА ЭКСПОРТЁРОМ
 # ====================================================================
-
-
-@dp.callback_query_handler(lambda c: c.data.startswith("select_expeditor_"))
 async def select_expeditor_handler(callback: types.CallbackQuery):
     try:
         parts = callback.data.split("_")
         expeditor_id = int(parts[2])
         deal_id = int(parts[3])
 
-        if deal_id not in deals:
             await callback.answer("❌ Сделка не найдена", show_alert=True)
             return
 
-        deals[deal_id]["expeditor_id"] = expeditor_id
-        deals[deal_id]["expeditor_selected_at"] = datetime.now().strftime(
             "%Y-%m-%d %H:%M:%S"
         )
         save_deals_to_pickle()
 
-        expeditor = users.get(expeditor_id, {})
-        await callback.message.edit_text(
-            f"✅ <b>Экспедитор выбран!</b>\n\n"
-            f"📜 Компания: {expeditor.get('company', 'Не указано')}\n"
             f"👤 Контакт: {expeditor.get('name', 'Не указано')}\n"
-            f"📞 Телефон: {expeditor.get('phone', 'Не указано')}",
-            parse_mode="HTML",
         )
 
-        # Уведомление экспедитору
-        deal = deals[deal_id]
         pull_id = deal.get("pull_id")
-        pull = pulls.get(pull_id, {})
 
         try:
-            await bot.send_message(
-                expeditor_id,
-                f"🎉 <b>ВЫ ВЫБРАНЫ!</b>\n\n"
                 f"📦 Сделка #{deal_id}\n"
                 f"🎯 Объём: {pull.get('current_volume', 0)} т\n"
-                f"🏢 Порт: {pull.get('port', 'Не указано')}\n\n"
-                f"Свяжитесь с экспортёром!",
-                parse_mode="HTML",
             )
         except Exception as e:
-            print(f"Ошибка: {e}")
-            pass
 
         logging.info(f"✅ Expeditor {expeditor_id} selected for deal {deal_id}")
 
@@ -22476,7 +16996,6 @@ async def back_to_menu_handler(callback: types.CallbackQuery, state: FSMContext)
     """Возврат в главное меню"""
     await state.finish()
     user_id = callback.from_user.id
-    role = users.get(user_id, {}).get("role", "")
 
     # ✅ ИСПРАВЛЕНИЕ: используем get_role_keyboard
     if role == "farmer":
@@ -22491,13 +17010,10 @@ async def back_to_menu_handler(callback: types.CallbackQuery, state: FSMContext)
             reply_markup=get_role_keyboard("exporter"),
             parse_mode="HTML",
         )
-    elif role == "logistics":
         await callback.message.answer(
             "🚚 <b>Главное меню логиста</b>\n\n" "Выберите действие:",
-            reply_markup=get_role_keyboard("logistics"),
             parse_mode="HTML",
         )
-    elif role == "expeditor":
         await callback.message.answer(
             "📋 <b>Главное меню экспедитора</b>\n\n" "Выберите действие:",
             reply_markup=get_role_keyboard("expeditor"),
@@ -22515,7 +17031,6 @@ async def cancel_handler(callback: types.CallbackQuery, state: FSMContext):
     await state.finish()
     await callback.message.answer("❌ Действие отменено")
     await back_to_menu_handler(callback, state)
-    await callback.answer()
 
 
 @dp.callback_query_handler(lambda c: c.data == "cancel_action", state="*")
@@ -22544,7 +17059,6 @@ async def transport_type_handler(callback: types.CallbackQuery):
 async def view_my_batches_handler(callback: types.CallbackQuery):
     """Просмотр моих партий"""
     user_id = callback.from_user.id
-    user_batches = batches.get(user_id, [])
 
     if not user_batches:
         await callback.message.answer("📦 У вас пока нет созданных партий")
@@ -22619,408 +17133,44 @@ async def broadcast_confirm_handler(callback: types.CallbackQuery, state: FSMCon
     await callback.answer()
 
 
-@dp.callback_query_handler(
-    lambda c: c.data in ["exportusers", "export_users"], state="*"
-)
-async def export_users_unified_handler(callback: types.CallbackQuery):
-    """Экспорт пользователей (унифицированный)"""
-    await export_users_handler(callback)
 
 
-@dp.callback_query_handler(
-    lambda c: c.data in ["exportbatches", "export_batches"], state="*"
-)
-async def export_batches_unified_handler(callback: types.CallbackQuery):
-    """Экспорт партий (унифицированный)"""
-    await export_batches_handler(callback)
-
-
-@dp.callback_query_handler(
-    lambda c: c.data in ["exportpulls", "export_pools"], state="*"
-)
-async def export_pulls_unified_handler(callback: types.CallbackQuery):
-    """Экспорт пулов (унифицированный)"""
-    await export_pools_handler(callback)
-
-
-@dp.callback_query_handler(lambda c: c.data in ["exportfull", "export_full"], state="*")
-async def export_full_unified_handler(callback: types.CallbackQuery):
-    """Полный экспорт (унифицированный)"""
-    await export_full_handler(callback)
-
-
-@dp.callback_query_handler(lambda c: c.data == "back_to_pools", state="*")
-async def back_to_pools_handler(callback: types.CallbackQuery):
-    """Возврат к списку пулов"""
-    await show_pools_list(callback.message)
+    )
     await callback.answer()
 
 
-# ============================================================================
-# ФИНАЛЬНЫЕ НЕДОСТАЮЩИЕ ОБРАБОТЧИКИ
-# ============================================================================
 
-
-@dp.callback_query_handler(lambda c: c.data == "admin_detailed_stats", state="*")
-async def admin_detailed_stats_handler(callback: types.CallbackQuery):
-    """Детальная статистика для админа"""
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("🚫 Доступ запрещен", show_alert=True)
         return
 
-    # Подсчёт статистики
-    total_users = len(users)
-    roles_count = {}
-    for user in users.values():
-        role = user.get("role", "unknown")
-        roles_count[role] = roles_count.get(role, 0) + 1
-
-    total_batches = sum(len(b) for b in batches.values())
-    active_batches = sum(
-        1
-        for user_batches in batches.values()
-        for batch in user_batches
-        if batch.get("status") == "Активна"
-    )
-    total_pulls = len(pulls)
-    active_pulls = sum(1 for p in pulls.values() if p.get("status") == "active")
-
-    text = "<b>📊 Детальная статистика:</b>\n\n"
-    text += f"👥 <b>Пользователи:</b> {total_users}\n"
-    for role, count in roles_count.items():
-        text += f"   • {role}: {count}\n"
-
-    text += f"\n📦 <b>Партии:</b>\n"
-    text += f"   • Всего: {total_batches}\n"
-    text += f"   • Активных: {active_batches}\n"
-
-    text += f"\n🌾 <b>Пулы:</b>\n"
-    text += f"   • Всего: {total_pulls}\n"
-    text += f"   • Активных: {active_pulls}\n"
-
-    keyboard = InlineKeyboardMarkup(row_width=1)
-    keyboard.add(
-        InlineKeyboardButton(
-            "📤 Экспорт данных", callback_data="admin_export_analytics"
-        ),
-        InlineKeyboardButton("◀️ Назад", callback_data="admin"),
-    )
-
-    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
-    await callback.answer()
-
-
-@dp.callback_query_handler(lambda c: c.data == "admin_export_analytics", state="*")
-async def admin_export_analytics_handler(callback: types.CallbackQuery):
-    """Экспорт аналитики"""
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("🚫 Доступ запрещен", show_alert=True)
         return
-
-    try:
-        from io import StringIO
-        import csv
-
-        output = StringIO()
-        writer = csv.writer(output)
-
-        # Заголовок
-        writer.writerow(["Метрика", "Значение"])
-
-        # Данные
-        writer.writerow(["Всего пользователей", len(users)])
-        writer.writerow(["Всего партий", sum(len(b) for b in batches.values())])
-        writer.writerow(["Всего пулов", len(pulls)])
-
-        roles_count = {}
-        for user in users.values():
-            role = user.get("role", "unknown")
-            roles_count[role] = roles_count.get(role, 0) + 1
-
-        for role, count in roles_count.items():
-            writer.writerow([f"Пользователи: {role}", count])
-
-        output.seek(0)
-
-        from aiogram.types import BufferedInputFile
-
-        file = BufferedInputFile(
-            output.getvalue().encode("utf-8-sig"), filename="analytics.csv"
-        )
-
-        await callback.message.answer_document(
-            file, caption="📊 Аналитика экспортирована"
-        )
-        await callback.answer()
-
-    except Exception as e:
-        logging.error(f"Ошибка экспорта аналитики: {e}")
-        await callback.answer("❌ Ошибка экспорта", show_alert=True)
-
-
-@dp.callback_query_handler(lambda c: c.data == "admin_search_user", state="*")
-async def admin_search_user_handler(callback: types.CallbackQuery):
-    """Поиск пользователя админом"""
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("🚫 Доступ запрещен", show_alert=True)
         return
 
     await callback.message.answer(
-        "🔍 <b>Поиск пользователя</b>\n\n"
-        "Введите один из параметров:\n"
-        "• Telegram ID\n"
-        "• Номер телефона\n"
-        "• Email\n"
-        "• ИНН",
-        parse_mode="HTML",
     )
     await callback.answer()
 
 
-@dp.callback_query_handler(lambda c: c.data.startswith("doctype_"), state="*")
-async def doctype_handler(callback: types.CallbackQuery, state: FSMContext):
-    """Обработка выбора типа документа (CPT, FOB, CIF, EXW)"""
-    doctype = callback.data.split("_", 1)[1] if "_" in callback.data else "CPT"
-
-    # Сохраняем выбранный тип документа
-    await state.update_data(doctype=doctype)
-
-    await callback.answer(f"✅ Выбран тип: {doctype}")
-
-    # Продолжаем логику в зависимости от контекста
-    data = await state.get_data()
-
-    # Показываем следующий шаг
-    keyboard = InlineKeyboardMarkup(row_width=1)
-    keyboard.add(
-        InlineKeyboardButton("➡️ Продолжить", callback_data="continue_shipping"),
-        InlineKeyboardButton("◀️ Назад", callback_data="back_to_menu"),
-    )
-
-    await callback.message.edit_text(
-        f"✅ <b>Тип документа:</b> {doctype}\n\n"
-        f"Нажмите 'Продолжить' для следующего шага",
-        reply_markup=keyboard,
-        parse_mode="HTML",
-    )
-
-
-@dp.callback_query_handler(lambda c: c.data == "continue_shipping", state="*")
-async def continue_shipping_handler(callback: types.CallbackQuery):
-    """Продолжение процесса создания заявки"""
-    await callback.answer("✅ Продолжаем...")
-    # Дальнейшая логика
-
-    keyboard.add(InlineKeyboardButton("◀️ Назад", callback_data="back_to_menu"))
-
-    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
-    await callback.answer()
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# ЛОГИСТ: МОИ ПРЕДЛОЖЕНИЯ
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-@dp.callback_query_handler(lambda c: c.data.startswith("viewoffer:"))
-async def view_offer_details(callback: types.CallbackQuery):
-    """Просмотр деталей предложения"""
     try:
-        user_id = callback.from_user.id
-        offer_id = int(callback.data.split(":")[1])
+    user_id = callback.from_user.id
+        await callback.answer("❌ Предложение не найдено", show_alert=True)
+        return
 
-        # Проверяем существование предложения
-        if offer_id not in logistic_offers:
-            await callback.answer("❌ Предложение не найдено", show_alert=True)
-            return
-
-        offer = logistic_offers[offer_id]
-
-        # Проверяем, это предложение этого логиста
-        if offer.get("logist_id") != user_id:
-            await callback.answer("❌ Это не ваше предложение", show_alert=True)
-            return
-
-        # Получаем данные
-        request_id = offer.get("request_id")
-        status = offer.get("status", "pending")
-        price = offer.get("price", 0)
-        vehicle_type = offer.get("vehicle_type", "?")
-        delivery_date = offer.get("delivery_date", "?")
-        additional_info = offer.get("additional_info", "")
-        created_at = offer.get("created_at", "?")
-
-        # Получаем данные заявки
-        request = shipping_requests.get(request_id, {})
-        culture = request.get("culture", "Не указана")
-        route_from = request.get("route_from", "?")
-        route_to = request.get("route_to", "?")
-        volume = request.get("volume", 0)
-
-        # Словарь транспорта
-        vehicles = {
-            "fura": "🚛 Фура",
-            "railway": "🚂 Ж/д вагон",
-            "grain": "🚚 Зерновоз",
-        }
-
-        # Словарь статусов
-        statuses = {
-            "pending": ("⏳", "ОЖИДАЕТ ОТВЕТА"),
-            "accepted": ("✅", "ПРИНЯТО"),
-            "in_progress": ("🚚", "В РАБОТЕ"),
-            "rejected": ("❌", "ОТКЛОНЕНО"),
-        }
-
-        emoji, status_text = statuses.get(status, ("❓", "НЕИЗВЕСТНО"))
-
-        # Формируем текст
-        text = f"""📋 <b>ДЕТАЛИ ПРЕДЛОЖЕНИЯ #{offer_id}</b>
-
-{emoji} <b>Статус:</b> {status_text}
-
-<b>━━ ЗАЯВКА ━━</b>
-📦 Заявка №: <b>#{request_id}</b>
-🌾 Культура: <b>{culture}</b>
-📊 Объем: <b>{volume:,} т</b>
-📍 Маршрут: <b>{route_from} → {route_to}</b>
-
-<b>━━ ВАШЕ ПРЕДЛОЖЕНИЕ ━━</b>
-🚛 Транспорт: <b>{vehicles.get(vehicle_type, vehicle_type)}</b>
-💰 Цена: <b>{price:,} ₽</b>
-📅 Дата доставки: <b>{delivery_date}</b>
-⏰ Создано: <b>{created_at}</b>"""
-
-        if additional_info:
-            text += f"\n\n<b>ℹ️ Дополнительно:</b>\n{additional_info}"
-
-        # Кнопки
-        keyboard = InlineKeyboardMarkup()
-
-        # Кнопка редактирования только для ожидающих
-        if status == "pending":
-            keyboard.add(
-                InlineKeyboardButton(
-                    "✏️ Изменить цену", callback_data=f"editprice:{offer_id}"
-                ),
-                InlineKeyboardButton(
-                    "🗑️ Удалить", callback_data=f"deleteoffer:{offer_id}"
-                ),
-            )
-
-        keyboard.add(InlineKeyboardButton("🔙 Назад", callback_data="back_to_offers"))
-
-        await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
-        await callback.answer()
-
-    except Exception as e:
-        logging.error(f"Ошибка в view_offer_details: {e}")
-        await callback.answer(f"❌ Ошибка: {str(e)}", show_alert=True)
+        return
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# ЛОГИСТ: ПРОСМОТР ДЕТАЛЕЙ ПРЕДЛОЖЕНИЯ
-# ═══════════════════════════════════════════════════════════════════════════
 
-
-@dp.callback_query_handler(lambda c: c.data.startswith("viewoffer:"), state="*")
-async def view_offer_details_callback(callback: types.CallbackQuery, state: FSMContext):
-    """Просмотр деталей конкретного предложения"""
     await state.finish()
-
     try:
-        offer_id = int(callback.data.split(":")[1])
     except (IndexError, ValueError):
         await callback.answer("❌ Ошибка данных", show_alert=True)
         return
 
-    if offer_id not in logistic_offers:
         await callback.answer("❌ Предложение не найдено", show_alert=True)
         return
-
-    offer = logistic_offers[offer_id]
     request_id = offer.get("request_id")
-    request = shipping_requests.get(request_id, {})
 
-    if not request:
-        await callback.answer("❌ Заявка не найдена", show_alert=True)
         return
 
-    exporter_id = request.get("exporter_id")
-    exporter = users.get(exporter_id, {})
-    pull_id = request.get("pull_id")
-    pull = pulls.get(pull_id, {})
-
-    status = offer.get("status", "pending")
-    status_text = {
-        "pending": "⏳ Ожидает ответа",
-        "accepted": "✅ Принято",
-        "in_progress": "🚚 В работе",
-        "rejected": "❌ Отклонено",
-        "completed": "✔️ Завершено",
-        "cancelled": "🚫 Отменено",
-    }.get(status, "❓ Неизвестно")
-
-    text = (
-        f"<b>📊 Статус:</b> {status_text}\n\n"
-        f"<b>📋 Ваше предложение:</b>\n"
-        f"🚛 Транспорт: {offer.get('vehicle_type', 'Не указан')}\n"
-        f"💰 Цена: {offer.get('price', 0):,} ₽\n"
-        f"📅 Дата доставки: {offer.get('delivery_date', 'Не указана')}\n"
-        f"📝 Комментарий: {offer.get('comment', 'Нет')}\n"
-        f"📅 Создано: {offer.get('created_at', 'Н/Д')}\n\n"
-        f"<b>📦 Связанная заявка #{request_id}:</b>\n"
-        f"🌾 Культура: {request.get('culture', 'Н/Д')}\n"
-        f"⚖️ Объём: {request.get('volume', 0):.0f} т\n"
-        f"📍 Откуда: {request.get('route_from', 'Не указано')}\n"
-        f"📍 Куда: {request.get('route_to', 'Не указано')}\n"
-        f"📅 Желаемая дата: {request.get('desired_date', 'Не указана')}\n"
-        f"🚢 Порт: {pull.get('port', 'Не указан')}\n\n"
-        f"<b>👤 Заказчик (экспортёр):</b>\n"
-        f"🏢 Компания: {exporter.get('company_name', 'Не указана')}\n"
-        f"👤 Имя: {exporter.get('name', 'Не указано')}\n"
-        f"📞 Телефон: <code>{exporter.get('phone', 'Не указан')}</code>\n"
-        f"📧 Email: {exporter.get('email', 'Не указан')}\n"
-        f"📍 Регион: {exporter.get('region', 'Не указан')}"
-    )
-
-    keyboard = InlineKeyboardMarkup(row_width=1)
-
-    # Кнопка связаться
-    keyboard.add(
-        InlineKeyboardButton(
-            "📞 Связаться с заказчиком", url=f"tg://user?id={exporter_id}"
-        )
-    )
-
-    # 🚫 КНОПКА ОТМЕНЫ (только для pending)
-    if status == "pending":
-        keyboard.add(
-            InlineKeyboardButton(
-                "🚫 Отменить предложение", callback_data=f"cancel_offer:{offer_id}"
-            )
-        )
-
-    # Дополнительные кнопки
-    if status == "accepted":
-        keyboard.add(
-            InlineKeyboardButton(
-                "🚚 Перейти к доставке", callback_data=f"view_delivery:{offer_id}"
-            )
-        )
-    elif status == "rejected":
-        text += f"\n\n<b>❌ Причина отклонения:</b>\n{offer.get('rejection_reason', 'Не указана')}"
-    elif status == "cancelled":
-        text += f"\n\n<b>🚫 Отменено:</b> {offer.get('cancelled_at', 'Н/Д')}"
-
-    keyboard.add(
-        InlineKeyboardButton(
-            "🔙 К списку предложений", callback_data="back_to_offers_list"
-        )
-    )
-
-    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
-    await callback.answer()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -23032,19 +17182,14 @@ async def view_offer_details_callback(callback: types.CallbackQuery, state: FSMC
 async def cancel_offer_handler(callback: types.CallbackQuery):
     """Отмена предложения логистом"""
     try:
-        offer_id = int(callback.data.split(":")[1])
     except (IndexError, ValueError):
         await callback.answer("❌ Ошибка данных", show_alert=True)
         return
 
-    if offer_id not in logistic_offers:
         await callback.answer("❌ Предложение не найдено", show_alert=True)
         return
 
-    offer = logistic_offers[offer_id]
-
     # Проверяем что предложение ещё в статусе pending
-    if offer.get("status") != "pending":
         await callback.answer(
             "❌ Можно отменить только предложения в ожидании ответа", show_alert=True
         )
@@ -23056,13 +17201,10 @@ async def cancel_offer_handler(callback: types.CallbackQuery):
         InlineKeyboardButton(
             "✅ Да, отменить", callback_data=f"confirm_cancel_offer:{offer_id}"
         ),
-        InlineKeyboardButton("❌ Нет", callback_data=f"viewoffer:{offer_id}"),
     )
 
     await callback.message.edit_text(
         f"🚫 <b>Отмена предложения #{offer_id}</b>\n\n"
-        f"Вы уверены что хотите отменить это предложение?\n"
-        f"Это действие нельзя отменить.",
         reply_markup=keyboard,
         parse_mode="HTML",
     )
@@ -23076,37 +17218,24 @@ async def confirm_cancel_offer(callback: types.CallbackQuery):
     """Подтверждение и финальная обработка отмены предложения"""
     try:
         # Парсим offer_id
-        offer_id = int(callback.data.split(":")[1])
     except (IndexError, ValueError):
         await callback.answer("❌ Ошибка данных", show_alert=True)
         return
 
-    # Проверяем существование предложения
-    if offer_id not in logistic_offers:
         await callback.answer("❌ Предложение не найдено", show_alert=True)
         return
 
-    offer = logistic_offers[offer_id]
     request_id = offer.get("request_id")
-    request = shipping_requests.get(request_id, {})
-    exporter_id = request.get("exporter_id")
 
     # Обновляем статус предложения
-    logistic_offers[offer_id]["status"] = "cancelled"
-    logistic_offers[offer_id]["cancelled_at"] = datetime.now().strftime(
-        "%d.%m.%Y %H:%M"
-    )
 
     # Получаем данные для уведомления
     price = offer.get("price", 0)
     vehicle_type = offer.get("vehicle_type", "Не указан")
     delivery_date = offer.get("delivery_date", "Не указана")
 
-    # 📬 Уведомляем экспортёра об отмене
-    if exporter_id:
         try:
             await bot.send_message(
-                chat_id=exporter_id,
                 text=f"""🚫 <b>Логист отменил предложение</b>
 
 📋 Предложение: #{offer_id}
@@ -23119,10 +17248,8 @@ async def confirm_cancel_offer(callback: types.CallbackQuery):
                 parse_mode="HTML",
             )
             logging.info(
-                f"✅ Уведомление экспортёру {exporter_id} об отмене предложения #{offer_id}"
             )
         except Exception as e:
-            logging.error(f"❌ Ошибка отправки уведомления экспортёру: {e}")
 
     # ✅ Показываем сообщение об успешной отмене
     keyboard = InlineKeyboardMarkup()
@@ -23136,10 +17263,8 @@ async def confirm_cancel_offer(callback: types.CallbackQuery):
         f"""✅ <b>Предложение успешно отменено</b>
 
 🚫 Предложение: #{offer_id}
-⏰ Отменено: {logistic_offers[offer_id]['cancelled_at']}
 📝 Статус: ОТМЕНЕНО
 
-<i>Экспортёр получил уведомление об отмене</i>""",
         reply_markup=keyboard,
         parse_mode="HTML",
     )
@@ -23164,7 +17289,6 @@ async def back_to_offers_list(callback: types.CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
 
     # Проверяем доступ
-    if user_id not in users or users[user_id].get("role") != "logistic":
         await callback.answer("❌ Доступ запрещен", show_alert=True)
         return
 
@@ -23173,7 +17297,6 @@ async def back_to_offers_list(callback: types.CallbackQuery, state: FSMContext):
         my_offers = {
             oid: o
             for oid, o in logistic_offers.items()
-            if o.get("logist_id") == user_id
         }
 
         # Если предложений нет
@@ -23196,17 +17319,10 @@ async def back_to_offers_list(callback: types.CallbackQuery, state: FSMContext):
             return
 
         # Подсчёт по статусам
-        pending = sum(1 for o in my_offers.values() if o.get("status") == "pending")
-        accepted = sum(1 for o in my_offers.values() if o.get("status") == "accepted")
-        rejected = sum(1 for o in my_offers.values() if o.get("status") == "rejected")
         in_progress = sum(
-            1 for o in my_offers.values() if o.get("status") == "in_progress"
         )
-        completed = sum(1 for o in my_offers.values() if o.get("status") == "completed")
-        cancelled = sum(1 for o in my_offers.values() if o.get("status") == "cancelled")
 
         text = (
-            f"💼 <b>Мои предложения</b>\n\n"
             f"📊 <b>Всего:</b> {len(my_offers)}\n"
             f"⏳ Ожидают ответа: {pending}\n"
             f"✅ Приняты: {accepted}\n"
@@ -23214,7 +17330,6 @@ async def back_to_offers_list(callback: types.CallbackQuery, state: FSMContext):
             f"✔️ Завершены: {completed}\n"
             f"❌ Отклонены: {rejected}\n"
             f"🚫 Отменены: {cancelled}\n\n"
-            f"<b>Последние предложения:</b>\n\n"
         )
 
         keyboard = InlineKeyboardMarkup(row_width=1)
@@ -23229,16 +17344,12 @@ async def back_to_offers_list(callback: types.CallbackQuery, state: FSMContext):
                 "completed": 3,
                 "rejected": 4,
                 "cancelled": 5,
-            }.get(x[1].get("status"), 6),
         )
 
         # Показываем первые 10 предложений
         for idx, (offer_id, offer) in enumerate(sorted_offers[:10], 1):
             req_id = offer.get("request_id")
-            status = offer.get("status", "pending")
             price = offer.get("price", 0)
-            vehicle = offer.get("vehicle_type", "Не указан")
-
             # Эмодзи статуса
             status_emoji = {
                 "pending": "⏳",
@@ -23250,8 +17361,7 @@ async def back_to_offers_list(callback: types.CallbackQuery, state: FSMContext):
             }.get(status, "❓")
 
             # Получаем культуру из заявки
-            request = shipping_requests.get(req_id, {})
-            culture = request.get("culture", "Н/Д")
+                culture = request.get("culture", "Н/Д")
 
             text += f"{idx}. {status_emoji} <b>Предложение #{offer_id}</b>\n"
             text += f"   📋 Заявка #{req_id} | {culture}\n"
@@ -23261,7 +17371,6 @@ async def back_to_offers_list(callback: types.CallbackQuery, state: FSMContext):
             keyboard.add(
                 InlineKeyboardButton(
                     f"{status_emoji} Предложение #{offer_id}",
-                    callback_data=f"viewoffer:{offer_id}",
                 )
             )
 
@@ -23284,21 +17393,9 @@ async def back_to_offers_list(callback: types.CallbackQuery, state: FSMContext):
 # ============================================================================
 
 
-class EditCardStates(StatesGroup):
-    """Состояния для редактирования карточки логиста"""
-
-    vehicle_type = State()
-    capacity = State()
-    regions = State()
-    price_per_km = State()
-    description = State()
-
-
 # ============================================================================
 # ✏️ МЕНЮ РЕДАКТИРОВАНИЯ КАРТОЧКИ
 # ============================================================================
-
-
 @dp.callback_query_handler(lambda c: c.data == "edit_logistic_card", state="*")
 async def edit_logistic_card_menu(callback: types.CallbackQuery, state: FSMContext):
     """Меню редактирования карточки логиста"""
@@ -23310,8 +17407,6 @@ async def edit_logistic_card_menu(callback: types.CallbackQuery, state: FSMConte
     if user_id not in logistics_cards:
         await callback.answer("❌ Карточка не найдена", show_alert=True)
         return
-
-    card = logistics_cards[user_id]
 
     keyboard = InlineKeyboardMarkup(row_width=1)
     keyboard.add(
@@ -23332,14 +17427,12 @@ async def edit_logistic_card_menu(callback: types.CallbackQuery, state: FSMConte
     )
 
     await callback.message.edit_text(
-        "✏️ <b>Редактирование карточки</b>\n\n" "Выберите что хотите изменить:",
         reply_markup=keyboard,
         parse_mode="HTML",
     )
     await callback.answer()
 
 
-# Редактирование транспорта
 @dp.callback_query_handler(lambda c: c.data == "edit_card_vehicle", state="*")
 async def edit_card_vehicle(callback: types.CallbackQuery, state: FSMContext):
     """Изменить тип транспорта в карточке"""
@@ -23347,29 +17440,19 @@ async def edit_card_vehicle(callback: types.CallbackQuery, state: FSMContext):
 
     user_id = callback.from_user.id
 
-    # Получаем текущий тип транспорта
-    current_vehicle = "не установлен"
     if user_id in logistics_cards:
-        current_vehicle = logistics_cards[user_id].get("vehicle_type", "не установлен")
 
-    # Словарь для отображения
     vehicle_display = {
-        "fura": "🚛 Фура",
-        "railway": "🚂 Ж/д вагон",
         "grain": "🚚 Зерновоз",
     }
 
     keyboard = InlineKeyboardMarkup(row_width=2)
     keyboard.add(
-        InlineKeyboardButton("🚂 ЖД", callback_data="edit_vtype_railway"),
         InlineKeyboardButton("🚚 Зерновоз", callback_data="edit_vtype_grain"),
         InlineKeyboardButton("🚛 Фура", callback_data="edit_vtype_truck"),
-        InlineKeyboardButton("❌ Отмена", callback_data="edit_logistic_card"),
     )
 
     await callback.message.edit_text(
-        f"🚛 <b>Выберите новый тип транспорта</b>\n\n"
-        f"<i>Текущий:</i> <b>{vehicle_display.get(current_vehicle, current_vehicle)}</b>",
         reply_markup=keyboard,
         parse_mode="HTML",
     )
@@ -23385,42 +17468,31 @@ async def save_edit_vehicle(callback: types.CallbackQuery, state: FSMContext):
 
     # Извлекаем тип транспорта из callback_data
     try:
-        # Формат: edit_vtype_ТИП (где ТИП может содержать подчёркивания)
-        vehicle_type = callback.data.replace("edit_vtype_", "")
     except Exception as e:
         logging.error(f"Ошибка парсинга callback_data: {e}")
         await callback.answer("❌ Ошибка при обработке выбора", show_alert=True)
         return
 
-    # Проверяем наличие карточки
     if user_id not in logistics_cards:
         await callback.answer("❌ Ошибка: Карточка не найдена", show_alert=True)
         return
 
     try:
-        # Сохраняем старый тип для логирования
         old_vehicle = logistics_cards[user_id].get("vehicle_type", "не установлен")
 
-        # Обновляем тип транспорта
         logistics_cards[user_id]["vehicle_type"] = vehicle_type
         logistics_cards[user_id]["updated_at"] = datetime.now().strftime(
             "%d.%m.%Y %H:%M:%S"
         )
 
-        # Словари для отображения
         vehicle_names = {
-            "fura": "🚛 Фура",
-            "truck": "🚚 Грузовик",
             "wagon": "🚂 Ж/д вагон",
         }
 
-        # Уведомляем об успехе
         await callback.answer("✅ Тип транспорта обновлён", show_alert=False)
 
-        # Отображаем обновленную карточку
         await show_card_after_edit(callback.message, user_id)
 
-        # Логируем действие
         logging.info(
             f"Логист {user_id} обновил тип транспорта: "
             f"'{old_vehicle}' → '{vehicle_type}' ({vehicle_names.get(vehicle_type, 'Unknown')})"
@@ -23431,12 +17503,8 @@ async def save_edit_vehicle(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer(f"❌ Ошибка: {str(e)}", show_alert=True)
 
 
-# Редактирование грузоподъёмности
 # ============================================================================
-# 📦 ИНИЦИАЦИЯ РЕДАКТИРОВАНИЯ ГРУЗОПОДЪЁМНОСТИ
 # ============================================================================
-
-
 @dp.callback_query_handler(lambda c: c.data == "edit_card_capacity", state="*")
 async def edit_card_capacity(callback: types.CallbackQuery, state: FSMContext):
     """Начать редактирование грузоподъёмности"""
@@ -23444,19 +17512,9 @@ async def edit_card_capacity(callback: types.CallbackQuery, state: FSMContext):
 
     user_id = callback.from_user.id
 
-    # Получаем текущую грузоподъёмность
     current_capacity = "не установлена"
     if user_id in logistics_cards:
-        capacity_key = logistics_cards[user_id].get("capacity", "unknown")
-        capacity_display = {
-            "1_5": "1-5 тонн",
-            "5_10": "5-10 тонн",
-            "10_20": "10-20 тонн",
-            "20_plus": "20+ тонн",
-        }
-        current_capacity = capacity_display.get(capacity_key, "не установлена")
 
-    # Предлагаем быстрый выбор с кнопками
     keyboard = InlineKeyboardMarkup(row_width=2)
     keyboard.add(
         InlineKeyboardButton("📦 1-5 т", callback_data="edit_cap_1_5"),
@@ -23468,18 +17526,11 @@ async def edit_card_capacity(callback: types.CallbackQuery, state: FSMContext):
     )
 
     text = (
-        f"📦 <b>Редактирование грузоподъёмности</b>\n\n"
         f"<i>Текущее значение:</i> <b>{current_capacity}</b>\n\n"
-        f"<b>Выберите категорию или введите свое значение:</b>"
     )
 
     await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
     await callback.answer()
-
-
-# ============================================================================
-# 📦 ОБРАБОТЧИК ВВОДА И СОХРАНЕНИЯ ГРУЗОПОДЪЁМНОСТИ
-# ============================================================================
 
 
 @dp.message_handler(state=EditCardStates.capacity, content_types=["text"])
@@ -23488,101 +17539,67 @@ async def save_edit_capacity(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     capacity_text = message.text.strip()
 
-    # Проверяем наличие карточки
     if user_id not in logistics_cards:
         await message.answer(
-            "❌ <b>Карточка не найдена</b>\n\n" "Пожалуйста, создайте карточку заново",
             parse_mode="HTML",
         )
         await state.finish()
         return
 
     try:
-        # Парсим ввод: заменяем запятую на точку
         capacity_text = capacity_text.replace(",", ".").strip()
-
-        # Пытаемся конвертировать в float
         capacity = float(capacity_text)
 
-        # Валидируем значение
         if capacity <= 0:
             raise ValueError("Значение должно быть положительным")
-
         if capacity > 10000:
             raise ValueError("Значение слишком велико (максимум 10000 тонн)")
 
-        # Сохраняем старое значение для логирования
         old_capacity = logistics_cards[user_id].get("capacity", "не установлена")
 
-        # Обновляем грузоподъёмность
         logistics_cards[user_id]["capacity"] = capacity
         logistics_cards[user_id]["updated_at"] = datetime.now().strftime(
             "%d.%m.%Y %H:%M:%S"
         )
 
-        # Отправляем подтверждение с эмодзи
         await message.answer(
-            f"✅ <b>Грузоподъёмность обновлена</b>\n\n"
             f"📦 <b>Новое значение:</b> {capacity} тонн\n"
             f"📦 <b>Старое значение:</b> {old_capacity}",
             parse_mode="HTML",
         )
 
-        # Логируем действие
         logging.info(
             f"Логист {user_id} обновил грузоподъёмность: "
             f"'{old_capacity}' → '{capacity}' тонн"
         )
 
-        # Показываем обновленную карточку
         await show_card_after_edit(message, user_id)
-
         await state.finish()
 
     except ValueError as ve:
-        # Ошибка валидации
         error_msg = str(ve)
-
         await message.answer(
-            f"❌ <b>Ошибка валидации</b>\n\n"
             f"<i>{error_msg}</i>\n\n"
-            f"<b>Примеры корректного ввода:</b>\n"
-            f"• <code>15</code>\n"
-            f"• <code>25.5</code>\n"
-            f"• <code>20,75</code>",
             parse_mode="HTML",
         )
-
         logging.warning(
-            f"Логист {user_id} ввел некорректную грузоподъёмность: {capacity_text}"
         )
 
     except Exception as e:
-        # Непредвиденная ошибка
         logging.error(f"Ошибка при сохранении грузоподъёмности: {e}", exc_info=True)
-
         await message.answer(
-            f"❌ <b>Ошибка сохранения</b>\n\n"
-            f"Попробуйте ещё раз или введите число\n\n"
-            f"<i>Примеры: 15, 25.5, 20,75</i>",
             parse_mode="HTML",
         )
 
 
-# Редактирование регионов
 # ============================================================================
-# 📍 ИНИЦИАЦИЯ РЕДАКТИРОВАНИЯ РЕГИОНОВ
 # ============================================================================
-
-
 @dp.callback_query_handler(lambda c: c.data == "edit_card_regions", state="*")
 async def edit_card_regions(callback: types.CallbackQuery, state: FSMContext):
-    """Начать редактирование регионов доставки"""
     await state.finish()
 
     user_id = callback.from_user.id
 
-    # Получаем текущие регионы
     current_regions = "не установлены"
     if user_id in logistics_cards:
         regions_list = logistics_cards[user_id].get("regions", [])
@@ -23593,24 +17610,12 @@ async def edit_card_regions(callback: types.CallbackQuery, state: FSMContext):
     keyboard.add(InlineKeyboardButton("❌ Отмена", callback_data="edit_logistic_card"))
 
     text = (
-        f"📍 <b>Редактирование регионов доставки</b>\n\n"
         f"<i>Текущие регионы:</i> <b>{current_regions}</b>\n\n"
-        f"<b>Введите новые регионы работы</b>\n"
-        f"(перечислите через запятую)\n\n"
-        f"<b>Примеры:</b>\n"
-        f"• <code>Краснодарский край, Ростовская область</code>\n"
-        f"• <code>Московская область, Тверская область, Калужская область</code>\n"
-        f"• <code>Санкт-Петербург, Ленинградская область</code>"
     )
 
     await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
     await state.set_state(EditCardStates.regions)
     await callback.answer()
-
-
-# ============================================================================
-# 📝 ОБРАБОТЧИК ВВОДА И СОХРАНЕНИЯ РЕГИОНОВ
-# ============================================================================
 
 
 @dp.message_handler(state=EditCardStates.regions, content_types=["text"])
@@ -23619,78 +17624,50 @@ async def save_edit_regions(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     regions_text = message.text.strip()
 
-    # Проверяем наличие карточки
     if user_id not in logistics_cards:
         await message.answer(
-            "❌ <b>Карточка не найдена</b>\n\n" "Пожалуйста, создайте карточку заново",
             parse_mode="HTML",
         )
         await state.finish()
         return
 
     try:
-        # Парсим регионы (разделены запятыми)
-        regions_list = [region.strip() for region in regions_text.split(",")]
-
-        # Валидируем: убеждаемся что список не пуст
-        regions_list = [r for r in regions_list if r]  # Убираем пустые строки
 
         if not regions_list:
             await message.answer(
-                "❌ <b>Ошибка</b>\n\n" "Введите хотя бы один регион", parse_mode="HTML"
             )
             return
 
-        # Проверяем максимальное количество регионов
         if len(regions_list) > 20:
             await message.answer(
-                f"❌ <b>Слишком много регионов</b>\n\n"
-                f"Максимум: 20 регионов\n"
-                f"Вы указали: {len(regions_list)}",
                 parse_mode="HTML",
             )
             return
 
-        # Проверяем длину каждого региона
         for region in regions_list:
             if len(region) < 2:
                 await message.answer(
-                    f"❌ <b>Ошибка валидации</b>\n\n"
                     f"Название региона слишком короткое: <b>{region}</b>\n"
-                    f"Минимум: 2 символа",
                     parse_mode="HTML",
                 )
                 return
-
             if len(region) > 50:
                 await message.answer(
-                    f"❌ <b>Ошибка валидации</b>\n\n"
                     f"Название региона слишком длинное: <b>{region}</b>\n"
-                    f"Максимум: 50 символов",
                     parse_mode="HTML",
                 )
                 return
 
-        # Сохраняем старые регионы для логирования
         old_regions = logistics_cards[user_id].get("regions", [])
 
-        # Обновляем регионы
         logistics_cards[user_id]["regions"] = regions_list
         logistics_cards[user_id]["updated_at"] = datetime.now().strftime(
             "%d.%m.%Y %H:%M:%S"
         )
 
-        # Форматируем для отображения
         regions_display = "\n".join([f"• {r}" for r in regions_list])
-        old_regions_display = (
-            "\n".join([f"• {r}" for r in old_regions])
-            if old_regions
-            else "Не установлены"
-        )
 
-        # Формируем ответное сообщение
         text = (
-            f"✅ <b>Регионы обновлены</b>\n\n"
             f"<b>Новые регионы:</b>\n{regions_display}\n\n"
             f"<b>Количество регионов:</b> {len(regions_list)}\n\n"
             f"⏰ Обновлено: <i>{logistics_cards[user_id]['updated_at']}</i>"
@@ -23715,21 +17692,13 @@ async def save_edit_regions(message: types.Message, state: FSMContext):
 
     except Exception as e:
         logging.error(f"Ошибка при сохранении регионов: {e}", exc_info=True)
-
         await message.answer(
-            f"❌ <b>Ошибка при сохранении</b>\n\n"
-            f"<i>{str(e)}</i>\n\n"
-            f"Пожалуйста, попробуйте ещё раз",
             parse_mode="HTML",
         )
 
 
-# Редактирование цены
 # ============================================================================
-# 💰 ИНИЦИАЦИЯ РЕДАКТИРОВАНИЯ ЦЕНЫ ЗА КМ
 # ============================================================================
-
-
 @dp.callback_query_handler(lambda c: c.data == "edit_card_price", state="*")
 async def edit_card_price(callback: types.CallbackQuery, state: FSMContext):
     """Начать редактирование цены за км"""
@@ -23737,10 +17706,8 @@ async def edit_card_price(callback: types.CallbackQuery, state: FSMContext):
 
     user_id = callback.from_user.id
 
-    # Получаем текущую цену
     current_price = "не установлена"
     if user_id in logistics_cards:
-        price = logistics_cards[user_id].get("price_per_km", None)
         if price:
             current_price = f"{price} ₽/км"
 
@@ -23748,26 +17715,12 @@ async def edit_card_price(callback: types.CallbackQuery, state: FSMContext):
     keyboard.add(InlineKeyboardButton("❌ Отмена", callback_data="edit_logistic_card"))
 
     text = (
-        f"💰 <b>Редактирование цены доставки</b>\n\n"
         f"<i>Текущая цена:</i> <b>{current_price}</b>\n\n"
-        f"<b>Введите новую цену за км (₽/км)</b>\n\n"
-        f"<b>Примеры:</b>\n"
-        f"• <code>15</code> - целое число\n"
-        f"• <code>25.50</code> - с дробной частью\n"
-        f"• <code>30,99</code> - через запятую\n\n"
-        f"<b>Ограничения:</b>\n"
-        f"• Минимум: 0.01 ₽/км\n"
-        f"• Максимум: 10000 ₽/км"
     )
 
     await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
     await state.set_state(EditCardStates.price_per_km)
     await callback.answer()
-
-
-# ============================================================================
-# 💳 ОБРАБОТЧИК ВВОДА И СОХРАНЕНИЯ ЦЕНЫ
-# ============================================================================
 
 
 @dp.message_handler(state=EditCardStates.price_per_km, content_types=["text"])
@@ -23776,53 +17729,40 @@ async def save_edit_price(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     price_text = message.text.strip()
 
-    # Проверяем наличие карточки
     if user_id not in logistics_cards:
         await message.answer(
-            "❌ <b>Карточка не найдена</b>\n\n" "Пожалуйста, создайте карточку заново",
             parse_mode="HTML",
         )
         await state.finish()
         return
 
     try:
-        # Парсим цену: заменяем запятую на точку
         price_text = price_text.replace(",", ".").replace(" ", "").strip()
-
-        # Пытаемся конвертировать в float
         price = float(price_text)
 
-        # Валидируем значение
         if price < 0.01:
             await message.answer(
                 "❌ <b>Минимальная цена:</b> 0.01 ₽/км", parse_mode="HTML"
             )
             return
-
         if price > 10000:
             await message.answer(
                 "❌ <b>Максимальная цена:</b> 10000 ₽/км", parse_mode="HTML"
             )
             return
 
-        # Округляем до 2 знаков после запятой
         price = round(price, 2)
 
-        # Сохраняем старую цену для логирования
         old_price = logistics_cards[user_id].get("price_per_km", "не установлена")
 
-        # Обновляем цену
         logistics_cards[user_id]["price_per_km"] = price
         logistics_cards[user_id]["updated_at"] = datetime.now().strftime(
             "%d.%m.%Y %H:%M:%S"
         )
 
-        # Формируем ответное сообщение
         text = (
-            f"✅ <b>Цена обновлена</b>\n\n"
             f"💰 <b>Новая цена:</b> {price} ₽/км\n"
             f"💰 <b>Старая цена:</b> {old_price}\n\n"
-            f"📊 <b>Расчет за маршруты:</b>\n"
             f"• 100 км: {price * 100:.2f} ₽\n"
             f"• 500 км: {price * 500:.2f} ₽\n"
             f"• 1000 км: {price * 1000:.2f} ₽\n\n"
@@ -23840,13 +17780,10 @@ async def save_edit_price(message: types.Message, state: FSMContext):
         await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
 
         logging.info(
-            f"Логист {user_id} обновил цену за км: " f"'{old_price}' → '{price}' ₽/км"
         )
 
         await state.finish()
 
-    except ValueError as ve:
-        # Ошибка валидации
         await message.answer(
             "❌ <b>Ошибка валидации</b>\n\n"
             "Введите корректное число\n\n"
@@ -23857,24 +17794,15 @@ async def save_edit_price(message: types.Message, state: FSMContext):
             parse_mode="HTML",
         )
 
-        logging.warning(f"Логист {user_id} ввел некорректную цену: {price_text}")
-
     except Exception as e:
         logging.error(f"Ошибка при сохранении цены: {e}", exc_info=True)
-
         await message.answer(
-            f"❌ <b>Ошибка при сохранении</b>\n\n"
-            f"Попробуйте ещё раз или введите число",
             parse_mode="HTML",
         )
 
 
-# Редактирование описания
 # ============================================================================
-# 📝 ИНИЦИАЦИЯ РЕДАКТИРОВАНИЯ ОПИСАНИЯ
 # ============================================================================
-
-
 @dp.callback_query_handler(lambda c: c.data == "edit_card_description", state="*")
 async def edit_card_description(callback: types.CallbackQuery, state: FSMContext):
     """Начать редактирование описания компании"""
@@ -23882,10 +17810,8 @@ async def edit_card_description(callback: types.CallbackQuery, state: FSMContext
 
     user_id = callback.from_user.id
 
-    # Получаем текущее описание
     current_description = "не установлено"
     if user_id in logistics_cards:
-        desc = logistics_cards[user_id].get("description", "")
         if desc:
             current_description = desc[:100] + "..." if len(desc) > 100 else desc
 
@@ -23893,27 +17819,12 @@ async def edit_card_description(callback: types.CallbackQuery, state: FSMContext
     keyboard.add(InlineKeyboardButton("❌ Отмена", callback_data="edit_logistic_card"))
 
     text = (
-        f"📝 <b>Редактирование описания компании</b>\n\n"
-        f"<i>Текущее описание:</i>\n"
         f"<b>{current_description}</b>\n\n"
-        f"<b>Введите новое описание</b>\n\n"
-        f"<b>Советы:</b>\n"
-        f"✓ Опишите услуги и преимущества\n"
-        f"✓ Укажите опыт и достижения\n"
-        f"✓ Расскажите о ваших возможностях\n\n"
-        f"<b>Ограничения:</b>\n"
-        f"• Минимум: 10 символов\n"
-        f"• Максимум: 1000 символов"
     )
 
     await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
     await state.set_state(EditCardStates.description)
     await callback.answer()
-
-
-# ============================================================================
-# 📋 ОБРАБОТЧИК ВВОДА И СОХРАНЕНИЯ ОПИСАНИЯ
-# ============================================================================
 
 
 @dp.message_handler(state=EditCardStates.description, content_types=["text"])
@@ -23922,62 +17833,43 @@ async def save_edit_description(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     description_text = message.text.strip()
 
-    # Проверяем наличие карточки
     if user_id not in logistics_cards:
         await message.answer(
-            "❌ <b>Карточка не найдена</b>\n\n" "Пожалуйста, создайте карточку заново",
             parse_mode="HTML",
         )
         await state.finish()
         return
 
     try:
-        # Проверяем минимальную длину
         if len(description_text) < 10:
             await message.answer(
-                f"❌ <b>Описание слишком короткое</b>\n\n"
                 f"Введено: <b>{len(description_text)}</b> символов\n"
-                f"Требуется: минимум <b>10</b> символов",
                 parse_mode="HTML",
             )
             return
 
-        # Проверяем максимальную длину
         if len(description_text) > 1000:
             await message.answer(
-                f"❌ <b>Описание слишком длинное</b>\n\n"
                 f"Введено: <b>{len(description_text)}</b> символов\n"
-                f"Максимум: <b>1000</b> символов",
                 parse_mode="HTML",
             )
             return
 
-        # Проверяем на запрещённые символы
         forbidden_chars = ["<script", "<?php", "javascript:", "onclick", "onerror"]
-        description_lower = description_text.lower()
-
-        for forbidden in forbidden_chars:
-            if forbidden in description_lower:
                 await message.answer(
-                    "❌ <b>Описание содержит недопустимые символы</b>\n\n"
                     "Пожалуйста, используйте только текст",
                     parse_mode="HTML",
                 )
                 return
 
-        # Сохраняем старое описание для логирования
-        old_description = logistics_cards[user_id].get("description", "не установлено")
 
-        # Очищаем от лишних пробелов
         description_cleaned = " ".join(description_text.split())
 
-        # Обновляем описание
         logistics_cards[user_id]["description"] = description_cleaned
         logistics_cards[user_id]["updated_at"] = datetime.now().strftime(
             "%d.%m.%Y %H:%M:%S"
         )
 
-        # Обрезаем длинные описания для превью
         preview_old = (
             old_description[:80] + "..."
             if len(str(old_description)) > 80
@@ -23989,13 +17881,9 @@ async def save_edit_description(message: types.Message, state: FSMContext):
             else description_cleaned
         )
 
-        # Формируем ответное сообщение
         text = (
-            f"✅ <b>Описание обновлено</b>\n\n"
-            f"<b>📊 Статистика:</b>\n"
             f"📝 Символов: <b>{len(description_cleaned)}</b>\n"
             f"📄 Слов: <b>{len(description_cleaned.split())}</b>\n\n"
-            f"<b>Новое описание:</b>\n"
             f"<i>{preview_new}</i>\n\n"
             f"⏰ Обновлено: <i>{logistics_cards[user_id]['updated_at']}</i>"
         )
@@ -24011,39 +17899,25 @@ async def save_edit_description(message: types.Message, state: FSMContext):
         await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
 
         logging.info(
-            f"Логист {user_id} обновил описание: " f"'{preview_old}' → '{preview_new}'"
         )
 
         await state.finish()
 
     except Exception as e:
         logging.error(f"Ошибка при сохранении описания: {e}", exc_info=True)
-
         await message.answer(
-            f"❌ <b>Ошибка при сохранении</b>\n\n" f"Попробуйте ещё раз",
             parse_mode="HTML",
         )
 
 
-# Показать карточку после редактирования
 # ============================================================================
-# 🎫 ФУНКЦИЯ ОТОБРАЖЕНИЯ КАРТОЧКИ ЛОГИСТА - ЧИСТАЯ ВЕРСИЯ
 # ============================================================================
-
-
 async def show_card_after_edit(message: types.Message, user_id: int):
     """
-    Показать карточку логиста - краткая версия без лишних кнопок
-
-    Args:
-        message: Объект сообщения
-        user_id: ID пользователя
     """
-
     if user_id not in logistics_cards:
         keyboard = InlineKeyboardMarkup()
         keyboard.add(
-            InlineKeyboardButton("➕ Создать", callback_data="create_logistics_card")
         )
 
         await message.answer(
@@ -24053,31 +17927,20 @@ async def show_card_after_edit(message: types.Message, user_id: int):
 
     card = logistics_cards[user_id]
 
-    # Получаем данные
     vehicle_map = {
-        "fura": ("🚛", "Фура"),
-        "truck": ("🚚", "Грузовик"),
         "wagon": ("🚂", "Ж/д вагон"),
     }
 
-    vehicle_type = card.get("vehicle_type", "fura")
-    emoji, vehicle_name = vehicle_map.get(vehicle_type, ("❓", "Не указан"))
 
     capacity = card.get("capacity", 0)
-    capacity_text = f"{capacity} т" if capacity > 0 else "❓"
 
-    regions = ", ".join(card.get("regions", [])) if card.get("regions") else "❓"
 
-    price = card.get("price_per_km", 0)
     price_text = f"{price:.2f} ₽/км" if price > 0 else "❓"
 
-    description = card.get("description", "Не указано")
 
     text = (
-        f"🎫 <b>Карточка логиста</b>\n\n"
         f"{emoji} <b>{vehicle_name}</b>\n"
         f"📦 {capacity_text}\n"
-        f"📍 {regions}\n"
         f"💰 {price_text}\n\n"
         f"{description}\n\n"
         f"👁 Просмотров: {card.get('views', 0)}\n"
@@ -24096,49 +17959,34 @@ async def show_card_after_edit(message: types.Message, user_id: int):
         else:
             await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
     except Exception as e:
-        logging.error(f"Ошибка: {e}")
         await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
 
 
 # ============================================================================
 # 🔙 ОБРАБОТЧИК ВОЗВРАТА К КАРТОЧКЕ
 # ============================================================================
-
-
 @dp.callback_query_handler(lambda c: c.data == "back_to_card", state="*")
 async def back_to_card(callback: types.CallbackQuery, state: FSMContext):
     """Вернуться к карточке логиста"""
     user_id = callback.from_user.id
 
     try:
-        # Завершаем любое текущее состояние
         await state.finish()
-
-        # Показываем карточку
         await show_card_after_edit(callback.message, user_id)
-
-        # Отвечаем на callback без уведомления
         await callback.answer()
-
         logging.info(f"Логист {user_id} вернулся к карточке")
-
     except Exception as e:
         logging.error(f"Ошибка при возврате к карточке: {e}", exc_info=True)
-
         try:
             await callback.answer("❌ Ошибка", show_alert=True)
-        except:
-            pass
 
 
-# ========== ОБРАБОТЧИКИ ЭКСПЕДИТОРА ==========
 @dp.message_handler(lambda m: m.text == "📋 Создать предложение", state="*")
 async def expeditor_create_offer_handler(message: types.Message, state: FSMContext):
     """Начать создание предложения экспедитора"""
     await state.finish()
     user_id = message.from_user.id
 
-    if user_id not in users or users[user_id].get("role") != "expeditor":
         await message.answer("❌ Доступ запрещен.")
         return
 
@@ -24155,7 +18003,6 @@ async def expeditor_create_offer_handler(message: types.Message, state: FSMConte
 )
 async def set_service_type(callback: types.CallbackQuery, state: FSMContext):
     """Установить тип услуги"""
-    service_type = callback.data.split(":")[1]
     service_names = {
         "docs": "📄 Оформление документов",
         "customs": "🏢 Таможенное оформление",
@@ -24167,9 +18014,7 @@ async def set_service_type(callback: types.CallbackQuery, state: FSMContext):
     await ExpeditorOfferStates.ports.set()
 
     await callback.message.edit_text(
-        f"<b>🏢 Укажите порты обслуживания:</b>\n\n"
         f"Выбрана услуга: {service_names.get(service_type, service_type)}\n\n"
-        f"Введите порты через запятую:\n<code>Новороссийск, Ростов-на-Дону</code>",
         parse_mode="HTML",
     )
     await callback.answer()
@@ -24226,7 +18071,6 @@ async def set_expeditor_terms(message: types.Message, state: FSMContext):
     await ExpeditorOfferStates.confirm.set()
 
     data = await state.get_data()
-    text = f"<b>✅ Подтверждение предложения:</b>\n\n"
     text += f"📋 {data['service_type']}\n"
     text += f"🏢 {data['ports']}\n"
     text += f"💰 {data['price']:,.0f} ₽\n"
@@ -24248,13 +18092,11 @@ async def confirm_expeditor_offer(callback: types.CallbackQuery, state: FSMConte
     data = await state.get_data()
     user_id = callback.from_user.id
 
-    offer_id = len(expeditor_offers) + 1
     offer = {
         "id": offer_id,
         "expeditor_id": user_id,
         "service_type": data["service_type"],
         "ports": data["ports"],
-        "price": data["price"],
         "terms": data["terms"],
         "status": "active",
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -24267,8 +18109,6 @@ async def confirm_expeditor_offer(callback: types.CallbackQuery, state: FSMConte
         f"<b>✅ Предложение создано!</b>\n\nПредложение #{offer_id}\n"
         f"📋 {data['service_type']}\n"
         f"🏢 {data['ports']}\n"
-        f"💰 {data['price']:,.0f} ₽\n\n"
-        f"Ваше предложение будет отображаться экспортёрам.",
         parse_mode="HTML",
     )
     await state.finish()
@@ -24277,7 +18117,6 @@ async def confirm_expeditor_offer(callback: types.CallbackQuery, state: FSMConte
 
 @dp.message_handler(
     lambda m: m.text == "💼 Мои предложения"
-    and users.get(m.from_user.id, {}).get("role") == "expeditor",
     state="*",
 )
 async def expeditor_my_offers_handler(message: types.Message, state: FSMContext):
@@ -24288,7 +18127,6 @@ async def expeditor_my_offers_handler(message: types.Message, state: FSMContext)
     my_offers = {
         oid: o
         for oid, o in expeditor_offers.items()
-        if o.get("expeditor_id") == user_id
     }
 
     if not my_offers:
@@ -24298,7 +18136,6 @@ async def expeditor_my_offers_handler(message: types.Message, state: FSMContext)
         )
         return
 
-    active = sum(1 for o in my_offers.values() if o.get("status") == "active")
     text = f"<b>💼 Мои предложения</b>\n\nВсего: <b>{len(my_offers)}</b>\nАктивных: <b>{active}</b>\n\n"
 
     for idx, (offer_id, offer) in enumerate(list(my_offers.items())[:10], 1):
@@ -24328,20 +18165,14 @@ async def view_request_offers(callback: types.CallbackQuery, state: FSMContext):
     await state.finish()
 
     try:
-        request_id = int(callback.data.split("_")[-1])
     except (IndexError, ValueError):
         await callback.answer("❌ Ошибка получения ID заявки", show_alert=True)
         return
 
-    if request_id not in shipping_requests:
         await callback.answer("❌ Заявка не найдена", show_alert=True)
         return
-
-    request = shipping_requests[request_id]
     user_id = callback.from_user.id
 
-    # Проверяем права доступа
-    if request.get("exporter_id") != user_id:
         await callback.answer("❌ Это не ваша заявка", show_alert=True)
         return
 
@@ -24349,14 +18180,9 @@ async def view_request_offers(callback: types.CallbackQuery, state: FSMContext):
     offers = [
         (offer_id, offer)
         for offer_id, offer in logistic_offers.items()
-        if offer.get("request_id") == request_id
     ]
 
     if not offers:
-        text = f"📦 <b>ПРЕДЛОЖЕНИЯ ПО ЗАЯВКЕ #{request_id}</b>\n\n"
-        text += "❌ Пока нет предложений от логистов\n\n"
-        text += "<i>Логисты получили уведомление о вашей заявке.\n"
-        text += "Предложения появятся в ближайшее время.</i>"
 
         keyboard = InlineKeyboardMarkup()
         keyboard.add(
@@ -24372,25 +18198,14 @@ async def view_request_offers(callback: types.CallbackQuery, state: FSMContext):
 
     # Группируем по статусам
     by_status = {"pending": [], "accepted": [], "rejected": []}
-
     for offer_id, offer in offers:
-        status = offer.get("status", "pending")
         if status in by_status:
             by_status[status].append((offer_id, offer))
 
-    # Сортируем по цене (низкие первые)
     for status in by_status:
-        by_status[status].sort(key=lambda x: x[1].get("price", 999999))
 
-    # Информация о заявке
     pull_id = request.get("pull_id")
-    pull_info = pulls.get(pull_id, {})
 
-    text = f"📦 <b>ПРЕДЛОЖЕНИЯ ПО ЗАЯВКЕ #{request_id}</b>\n\n"
-    text += f"🌾 Культура: {pull_info.get('culture', 'Не указана')}\n"
-    text += f"📦 Объём: {request.get('volume', 0):.1f} т\n"
-    text += f"📍 Маршрут: {request.get('route_from', '')} → {request.get('route_to', '')}\n\n"
-    text += "━━━━━━━━━━━━━━━━━━━━\n\n"
 
     # Статистика
     total = len(offers)
@@ -24398,35 +18213,20 @@ async def view_request_offers(callback: types.CallbackQuery, state: FSMContext):
     accepted = len(by_status["accepted"])
     rejected = len(by_status["rejected"])
 
-    text += f"📊 <b>СТАТИСТИКА:</b>\n"
-    text += f"📋 Всего предложений: <b>{total}</b>\n"
-    text += f"🕐 Ожидают решения: <b>{pending}</b>\n"
-    text += f"✅ Принято: <b>{accepted}</b>\n"
-    text += f"❌ Отклонено: <b>{rejected}</b>\n\n"
 
     if pending > 0:
-        # Показываем лучшее предложение
         best_offer_id, best_offer = by_status["pending"][0]
-        text += f"💰 <b>ЛУЧШЕЕ ПРЕДЛОЖЕНИЕ:</b>\n"
         text += f"💵 Цена: <b>{best_offer.get('price', 0):,.0f} ₽</b>\n"
-        text += f"🚛 Транспорт: {best_offer.get('vehicle_type')}\n"
-        text += f"📅 Дата: {best_offer.get('delivery_date')}\n\n"
 
     text += "━━━━━━━━━━━━━━━━━━━━\n\n"
     text += "Выберите предложение для просмотра:"
 
     keyboard = InlineKeyboardMarkup(row_width=1)
 
-    # Показываем только ожидающие предложения
-    for offer_id, offer in by_status["pending"][:5]:
-        logist_id = offer.get("logist_id")
-        logist_info = users.get(logist_id, {})
-        logist_name = logist_info.get("company_name", f"Логист #{logist_id}")
 
         price = offer.get("price", 0)
         vehicle = offer.get("vehicle_type", "Не указан")
 
-        button_text = f"💰 {price:,.0f} ₽ | {vehicle[:15]} | {logist_name[:20]}"
 
         keyboard.add(
             InlineKeyboardButton(
@@ -24434,7 +18234,6 @@ async def view_request_offers(callback: types.CallbackQuery, state: FSMContext):
             )
         )
 
-    if len(by_status["pending"]) > 5:
         keyboard.add(
             InlineKeyboardButton(
                 f"➕ Показать ещё {len(by_status['pending']) - 5}",
@@ -24466,51 +18265,38 @@ async def view_request_offers(callback: types.CallbackQuery, state: FSMContext):
 @dp.callback_query_handler(
     lambda c: c.data.startswith("view_offer_details_"), state="*"
 )
-async def view_offer_details(callback: types.CallbackQuery, state: FSMContext):
     """Детальный просмотр предложения"""
     await state.finish()
 
     try:
-        offer_id = int(callback.data.split("_")[-1])
     except (IndexError, ValueError):
         await callback.answer("❌ Ошибка получения ID", show_alert=True)
         return
 
-    if offer_id not in logistic_offers:
         await callback.answer("❌ Предложение не найдено", show_alert=True)
         return
-
-    offer = logistic_offers[offer_id]
     request_id = offer.get("request_id")
-    request = shipping_requests.get(request_id, {})
 
     user_id = callback.from_user.id
 
     # Проверяем права
-    if request.get("exporter_id") != user_id:
         await callback.answer("❌ Нет доступа", show_alert=True)
         return
 
     # Информация о логисте
-    logist_id = offer.get("logist_id")
-    logist_info = users.get(logist_id, {})
     logist_name = logist_info.get("company_name", "Не указана")
     logist_phone = logist_info.get("phone", "Не указан")
 
     # Статистика логиста
     logist_offers = [
-        o for o in logistic_offers.values() if o.get("logist_id") == logist_id
     ]
     logist_deliveries = [
-        d for d in deliveries.values() if d.get("logist_id") == logist_id
     ]
-    completed = len([d for d in logist_deliveries if d.get("status") == "completed"])
     total_offers = len(logist_offers)
 
     text = f"📋 <b>ДЕТАЛИ ПРЕДЛОЖЕНИЯ #{offer_id}</b>\n\n"
 
     # Информация о предложении
-    text += f"<b>💰 ПРЕДЛОЖЕНИЕ:</b>\n"
     text += f"💵 Стоимость: <b>{offer.get('price', 0):,.0f} ₽</b>\n"
     text += f"🚛 Транспорт: <b>{offer.get('vehicle_type', 'Не указан')}</b>\n"
     text += f"📅 Дата доставки: <b>{offer.get('delivery_date', 'Не указана')}</b>\n"
@@ -24523,22 +18309,15 @@ async def view_offer_details(callback: types.CallbackQuery, state: FSMContext):
     text += "━━━━━━━━━━━━━━━━━━━━\n\n"
 
     # Информация о логисте
-    text += f"<b>🚚 ЛОГИСТИЧЕСКАЯ КОМПАНИЯ:</b>\n"
     text += f"🏢 Название: <b>{logist_name}</b>\n"
     text += f"📞 Телефон: {logist_phone}\n\n"
 
     # Статистика
-    text += f"<b>📊 СТАТИСТИКА:</b>\n"
     text += f"✅ Завершённых доставок: <b>{completed}</b>\n"
     text += f"📋 Всего предложений: <b>{total_offers}</b>\n"
 
     if completed > 0:
         # Средняя стоимость
-        completed_deliveries = [
-            logistic_offers.get(d.get("offer_id"), {}).get("price", 0)
-            for d in logist_deliveries
-            if d.get("status") == "completed"
-        ]
         if completed_deliveries:
             avg_price = sum(completed_deliveries) / len(completed_deliveries)
             text += f"💰 Средняя стоимость: <b>{avg_price:,.0f} ₽</b>\n"
@@ -24546,9 +18325,7 @@ async def view_offer_details(callback: types.CallbackQuery, state: FSMContext):
     text += "\n━━━━━━━━━━━━━━━━━━━━\n\n"
 
     # Статус предложения
-    status = offer.get("status", "pending")
 
-    if status == "pending":
         text += "⏳ <b>Ожидает вашего решения</b>"
     elif status == "accepted":
         text += "✅ <b>Предложение принято</b>"
@@ -24559,7 +18336,6 @@ async def view_offer_details(callback: types.CallbackQuery, state: FSMContext):
 
     keyboard = InlineKeyboardMarkup(row_width=2)
 
-    if status == "pending":
         keyboard.add(
             InlineKeyboardButton(
                 "✅ Принять", callback_data=f"accept_offer_{offer_id}"
@@ -24569,11 +18345,11 @@ async def view_offer_details(callback: types.CallbackQuery, state: FSMContext):
             ),
         )
 
-    keyboard.add(
-        InlineKeyboardButton(
-            "🔙 К предложениям", callback_data=f"view_request_offers_{request_id}"
+        keyboard.add(
+            InlineKeyboardButton(
+                "🔙 К предложениям", callback_data=f"view_request_offers_{request_id}"
+            )
         )
-    )
     keyboard.add(InlineKeyboardButton("🏠 Главное меню", callback_data="back_to_main"))
 
     await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
@@ -24586,19 +18362,14 @@ async def compare_offers(callback: types.CallbackQuery, state: FSMContext):
     await state.finish()
 
     try:
-        request_id = int(callback.data.split("_")[-1])
     except (IndexError, ValueError):
         await callback.answer("❌ Ошибка", show_alert=True)
         return
 
-    if request_id not in shipping_requests:
         await callback.answer("❌ Заявка не найдена", show_alert=True)
         return
-
-    request = shipping_requests[request_id]
     user_id = callback.from_user.id
 
-    if request.get("exporter_id") != user_id:
         await callback.answer("❌ Нет доступа", show_alert=True)
         return
 
@@ -24606,7 +18377,6 @@ async def compare_offers(callback: types.CallbackQuery, state: FSMContext):
     offers = [
         (offer_id, offer)
         for offer_id, offer in logistic_offers.items()
-        if offer.get("request_id") == request_id and offer.get("status") == "pending"
     ]
 
     if len(offers) < 2:
@@ -24618,15 +18388,12 @@ async def compare_offers(callback: types.CallbackQuery, state: FSMContext):
     # Сортируем по цене
     offers.sort(key=lambda x: x[1].get("price", 999999))
 
-    text = f"⚖️ <b>СРАВНЕНИЕ ПРЕДЛОЖЕНИЙ</b>\n\n"
     text += f"📦 Заявка #{request_id}\n"
     text += f"📊 Сравниваем {len(offers)} предложений\n\n"
     text += "━━━━━━━━━━━━━━━━━━━━\n\n"
 
     # Показываем топ-3
     for i, (offer_id, offer) in enumerate(offers[:3], 1):
-        logist_id = offer.get("logist_id")
-        logist_info = users.get(logist_id, {})
         logist_name = logist_info.get("company_name", f"Логист #{logist_id}")
 
         medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉"
@@ -24640,12 +18407,10 @@ async def compare_offers(callback: types.CallbackQuery, state: FSMContext):
         logist_deliveries = [
             d
             for d in deliveries.values()
-            if d.get("logist_id") == logist_id and d.get("status") == "completed"
         ]
         completed = len(logist_deliveries)
 
         text += f"✅ Доставок: {completed}\n"
-        text += f"\n"
 
     if len(offers) > 3:
         text += f"<i>... и ещё {len(offers) - 3} предложений</i>\n\n"
@@ -24657,7 +18422,6 @@ async def compare_offers(callback: types.CallbackQuery, state: FSMContext):
     avg_price = sum(prices) / len(prices)
 
     text += "━━━━━━━━━━━━━━━━━━━━\n\n"
-    text += f"📊 <b>АНАЛИЗ ЦЕН:</b>\n"
     text += f"💵 Минимальная: <b>{min_price:,.0f} ₽</b>\n"
     text += f"💰 Средняя: <b>{avg_price:,.0f} ₽</b>\n"
     text += f"💸 Максимальная: <b>{max_price:,.0f} ₽</b>\n"
@@ -24665,7 +18429,6 @@ async def compare_offers(callback: types.CallbackQuery, state: FSMContext):
 
     # Рекомендация
     best_offer_id, best_offer = offers[0]
-    text += f"💡 <b>РЕКОМЕНДАЦИЯ:</b>\n"
     text += f"Самое выгодное предложение #{best_offer_id}\n"
     text += f"Экономия: <b>{avg_price - min_price:,.0f} ₽</b>"
 
@@ -24719,39 +18482,27 @@ class RejectOfferStatesGroup(StatesGroup):
 
 @dp.callback_query_handler(lambda c: c.data.startswith("accept_offer_"), state="*")
 async def accept_offer_start(callback: types.CallbackQuery, state: FSMContext):
-    """Начало принятия предложения"""
     await state.finish()
 
     try:
-        offer_id = int(callback.data.split("_")[-1])
     except (IndexError, ValueError):
         await callback.answer("❌ Ошибка получения ID", show_alert=True)
         return
 
-    if offer_id not in logistic_offers:
         await callback.answer("❌ Предложение не найдено", show_alert=True)
         return
-
-    offer = logistic_offers[offer_id]
     request_id = offer.get("request_id")
-    request = shipping_requests.get(request_id, {})
-
     user_id = callback.from_user.id
 
-    # Проверки
-    if request.get("exporter_id") != user_id:
         await callback.answer("❌ Нет доступа", show_alert=True)
         return
 
-    if offer.get("status") != "pending":
         await callback.answer("❌ Предложение уже обработано", show_alert=True)
         return
 
-    # Проверяем, нет ли уже принятого предложения
     accepted_offers = [
         o
         for o in logistic_offers.values()
-        if o.get("request_id") == request_id and o.get("status") == "accepted"
     ]
 
     if accepted_offers:
@@ -24761,22 +18512,16 @@ async def accept_offer_start(callback: types.CallbackQuery, state: FSMContext):
         return
 
     # Информация о предложении
-    logist_id = offer.get("logist_id")
-    logist_info = users.get(logist_id, {})
     logist_name = logist_info.get("company_name", "Не указана")
 
     pull_id = request.get("pull_id")
-    pull_info = pulls.get(pull_id, {})
 
     text = f"✅ <b>ПРИНЯТИЕ ПРЕДЛОЖЕНИЯ #{offer_id}</b>\n\n"
     text += f"📦 <b>ЗАЯВКА #{request_id}</b>\n"
-    text += f"🌾 Культура: {pull_info.get('culture', 'Не указана')}\n"
     text += f"📦 Объём: {request.get('volume', 0):.1f} т\n"
-    text += f"📍 Маршрут: {request.get('route_from', '')} → {request.get('route_to', '')}\n\n"
 
     text += "━━━━━━━━━━━━━━━━━━━━\n\n"
 
-    text += f"<b>ПРЕДЛОЖЕНИЕ:</b>\n"
     text += f"🚚 Логист: <b>{logist_name}</b>\n"
     text += f"💰 Стоимость: <b>{offer.get('price', 0):,.0f} ₽</b>\n"
     text += f"🚛 Транспорт: {offer.get('vehicle_type')}\n"
@@ -24812,22 +18557,16 @@ async def accept_offer_confirmed(callback: types.CallbackQuery, state: FSMContex
     await state.finish()
 
     try:
-        offer_id = int(callback.data.split("_")[-1])
     except (IndexError, ValueError):
         await callback.answer("❌ Ошибка", show_alert=True)
         return
 
-    if offer_id not in logistic_offers:
         await callback.answer("❌ Предложение не найдено", show_alert=True)
         return
-
-    offer = logistic_offers[offer_id]
     request_id = offer.get("request_id")
-    request = shipping_requests.get(request_id, {})
 
     user_id = callback.from_user.id
 
-    if request.get("exporter_id") != user_id:
         await callback.answer("❌ Нет доступа", show_alert=True)
         return
 
@@ -24839,71 +18578,52 @@ async def accept_offer_confirmed(callback: types.CallbackQuery, state: FSMContex
     # Обновляем статус заявки
     request["status"] = "assigned"
     request["assigned_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    request["logist_id"] = offer.get("logist_id")
 
-    # Создаём доставку
-    delivery_id = len(deliveries) + 1
-    delivery = {
-        "id": delivery_id,
-        "request_id": request_id,
-        "offer_id": offer_id,
-        "exporter_id": user_id,
-        "logist_id": offer.get("logist_id"),
-        "pull_id": request.get("pull_id"),
-        "route_from": request.get("route_from"),
-        "route_to": request.get("route_to"),
-        "volume": request.get("volume"),
-        "price": offer.get("price"),
-        "vehicle_type": offer.get("vehicle_type"),
-        "delivery_date": offer.get("delivery_date"),
-        "status": "pending",
-        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    }
+        delivery = {
+            "id": delivery_id,
+            "request_id": request_id,
+            "offer_id": offer_id,
+            "pull_id": request.get("pull_id"),
+            "volume": request.get("volume"),
+            "price": offer.get("price"),
+            "vehicle_type": offer.get("vehicle_type"),
+            "delivery_date": offer.get("delivery_date"),
+            "status": "pending",
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        deliveries[delivery_id] = delivery
 
-    deliveries[delivery_id] = delivery
-
-    # Отклоняем остальные предложения
     rejected_count = 0
     for other_offer_id, other_offer in logistic_offers.items():
         if (
-            other_offer.get("request_id") == request_id
             and other_offer_id != offer_id
-            and other_offer.get("status") == "pending"
         ):
-
             other_offer["status"] = "rejected"
             other_offer["rejected_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             other_offer["rejection_reason"] = "Принято другое предложение"
             rejected_count += 1
 
             # Уведомляем логистов
-            other_logist_id = other_offer.get("logist_id")
             if other_logist_id:
                 asyncio.create_task(
                     notify_logistic_offer_rejected(
-                        other_offer_id, user_id, "Принято другое предложение"
                     )
                 )
 
     # Сохраняем данные
-    save_shipping_requests()
+        save_shipping_requests()
     save_logistic_offers()
     save_deliveries()
 
     # Уведомляем принятого логиста
-    logist_id = offer.get("logist_id")
     if logist_id:
-        asyncio.create_task(notify_logistic_offer_accepted(offer_id, user_id))
 
     # Сообщение пользователю
-    logist_info = users.get(logist_id, {})
     logist_name = logist_info.get("company_name", "Не указана")
 
-    text = f"🎉 <b>ПРЕДЛОЖЕНИЕ ПРИНЯТО!</b>\n\n"
     text += f"✅ Предложение #{offer_id} успешно принято\n"
     text += f"📦 Доставка #{delivery_id} создана\n\n"
     text += "━━━━━━━━━━━━━━━━━━━━\n\n"
-    text += f"<b>ДЕТАЛИ ДОСТАВКИ:</b>\n"
     text += f"🚚 Логист: {logist_name}\n"
     text += f"💰 Стоимость: {offer.get('price', 0):,.0f} ₽\n"
     text += f"🚛 Транспорт: {offer.get('vehicle_type')}\n"
@@ -24913,21 +18633,16 @@ async def accept_offer_confirmed(callback: types.CallbackQuery, state: FSMContex
         text += f"ℹ️ Отклонено предложений: {rejected_count}\n\n"
 
     text += "━━━━━━━━━━━━━━━━━━━━\n\n"
-    text += f"<b>СЛЕДУЮЩИЕ ШАГИ:</b>\n"
-    text += f"1. Логист получит уведомление\n"
-    text += f"2. Свяжитесь для уточнения деталей\n"
-    text += f"3. Отслеживайте доставку в разделе 'Мои доставки'"
 
     keyboard = InlineKeyboardMarkup()
     keyboard.add(
         InlineKeyboardButton(
-            "📦 Доставка #" + str(delivery_id),
             callback_data=f"view_delivery_{delivery_id}",
         )
     )
-    keyboard.add(
-        InlineKeyboardButton("📋 Мои доставки", callback_data="exporter_deliveries")
-    )
+        keyboard.add(
+            InlineKeyboardButton("📋 Мои доставки", callback_data="exporter_deliveries")
+        )
     keyboard.add(InlineKeyboardButton("🏠 Главное меню", callback_data="back_to_main"))
 
     await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
@@ -24944,33 +18659,24 @@ async def reject_offer_start(callback: types.CallbackQuery, state: FSMContext):
     await state.finish()
 
     try:
-        offer_id = int(callback.data.split("_")[-1])
     except (IndexError, ValueError):
         await callback.answer("❌ Ошибка получения ID", show_alert=True)
         return
 
-    if offer_id not in logistic_offers:
         await callback.answer("❌ Предложение не найдено", show_alert=True)
         return
-
-    offer = logistic_offers[offer_id]
     request_id = offer.get("request_id")
-    request = shipping_requests.get(request_id, {})
 
     user_id = callback.from_user.id
 
-    if request.get("exporter_id") != user_id:
         await callback.answer("❌ Нет доступа", show_alert=True)
         return
 
-    if offer.get("status") != "pending":
         await callback.answer("❌ Предложение уже обработано", show_alert=True)
         return
 
     await state.update_data(offer_id=offer_id)
 
-    logist_id = offer.get("logist_id")
-    logist_info = users.get(logist_id, {})
     logist_name = logist_info.get("company_name", "Не указана")
 
     text = f"❌ <b>ОТКЛОНЕНИЕ ПРЕДЛОЖЕНИЯ #{offer_id}</b>\n\n"
@@ -24989,10 +18695,6 @@ async def reject_offer_start(callback: types.CallbackQuery, state: FSMContext):
     keyboard = InlineKeyboardMarkup(row_width=1)
 
     reasons = [
-        ("Высокая цена", "reject_reason_Высокая цена"),
-        ("Несоответствие транспорта", "reject_reason_Несоответствие транспорта"),
-        ("Неподходящие сроки", "reject_reason_Неподходящие сроки"),
-        ("Принято другое предложение", "reject_reason_Принято другое предложение"),
     ]
 
     for reason_text, callback_data in reasons:
@@ -25042,10 +18744,6 @@ async def reject_offer_reason_selected(
         await callback.answer()
         return
 
-    if reason_key == "none":
-        reason = None
-    else:
-        reason = reason_key
 
     # Отклоняем предложение
     await reject_offer_execute(callback, state, offer_id, reason)
@@ -25065,16 +18763,6 @@ async def reject_offer_custom_reason(message: types.Message, state: FSMContext):
     data = await state.get_data()
     offer_id = data.get("offer_id")
 
-    # Создаём фейковый callback для вызова функции
-    class FakeCallback:
-        def __init__(self, user_id, message):
-            self.from_user = type("obj", (object,), {"id": user_id})
-            self.message = message
-
-        async def answer(self, text="", show_alert=False):
-            pass
-
-    fake_callback = FakeCallback(message.from_user.id, message)
 
     await reject_offer_execute(fake_callback, state, offer_id, reason)
 
@@ -25084,12 +18772,9 @@ async def reject_offer_execute(
 ):
     """Выполнение отклонения предложения"""
 
-    if offer_id not in logistic_offers:
         if hasattr(callback_or_fake, "answer"):
             await callback_or_fake.answer("❌ Предложение не найдено", show_alert=True)
         return
-
-    offer = logistic_offers[offer_id]
     request_id = offer.get("request_id")
 
     user_id = callback_or_fake.from_user.id
@@ -25104,12 +18789,9 @@ async def reject_offer_execute(
     save_logistic_offers()
 
     # Уведомляем логиста
-    logist_id = offer.get("logist_id")
     if logist_id:
-        asyncio.create_task(notify_logistic_offer_rejected(offer_id, user_id, reason))
 
     # Сообщение
-    text = f"❌ <b>ПРЕДЛОЖЕНИЕ ОТКЛОНЕНО</b>\n\n"
     text += f"✅ Предложение #{offer_id} отклонено\n"
     text += f"📋 Заявка #{request_id}\n\n"
 
@@ -25119,11 +18801,11 @@ async def reject_offer_execute(
     text += "ℹ️ Логист получил уведомление об отклонении"
 
     keyboard = InlineKeyboardMarkup()
-    keyboard.add(
-        InlineKeyboardButton(
-            "📋 Другие предложения", callback_data=f"view_request_offers_{request_id}"
+        keyboard.add(
+            InlineKeyboardButton(
+                "📋 Другие предложения", callback_data=f"view_request_offers_{request_id}"
+            )
         )
-    )
     keyboard.add(InlineKeyboardButton("🏠 Главное меню", callback_data="back_to_main"))
 
     if hasattr(callback_or_fake.message, "edit_text"):
@@ -25143,8 +18825,6 @@ async def reject_offer_execute(
 # ============================================================================
 # ЭКСПОРТЁР: УПРАВЛЕНИЕ ЗАЯВКАМИ НА ДОСТАВКУ
 # ============================================================================
-
-
 @dp.callback_query_handler(lambda c: c.data == "my_shipping_requests", state="*")
 async def show_my_shipping_requests(callback: types.CallbackQuery, state: FSMContext):
     """Список заявок экспортёра на доставку"""
@@ -25152,16 +18832,8 @@ async def show_my_shipping_requests(callback: types.CallbackQuery, state: FSMCon
 
     user_id = callback.from_user.id
 
-    # Получаем заявки пользователя
-    my_requests = [
-        (req_id, req)
-        for req_id, req in shipping_requests.items()
-        if req.get("exporter_id") == user_id
-    ]
 
     if not my_requests:
-        text = "📦 <b>МОИ ЗАЯВКИ НА ДОСТАВКУ</b>\n\n"
-        text += "❌ У вас пока нет заявок на доставку\n\n"
         text += "<i>Создайте заявку из раздела 'Мои пулы'</i>"
 
         keyboard = InlineKeyboardMarkup()
@@ -25185,20 +18857,14 @@ async def show_my_shipping_requests(callback: types.CallbackQuery, state: FSMCon
         "cancelled": [],
     }
 
-    for req_id, req in my_requests:
-        status = req.get("status", "active")
-        if status in by_status:
-            by_status[status].append((req_id, req))
 
     # Сортируем по дате (новые первые)
     for status in by_status:
         by_status[status].sort(key=lambda x: x[1].get("created_at", ""), reverse=True)
 
-    text = f"📦 <b>МОИ ЗАЯВКИ НА ДОСТАВКУ</b>\n\n"
     text += f"Всего заявок: <b>{len(my_requests)}</b>\n\n"
 
     # Статистика
-    active = len(by_status["active"])
     assigned = len(by_status["assigned"])
     in_progress = len(by_status["in_progress"])
     completed = len(by_status["completed"])
@@ -25221,10 +18887,7 @@ async def show_my_shipping_requests(callback: types.CallbackQuery, state: FSMCon
     ]:
         requests = by_status[status_key]
         if requests:
-            for req_id, req in requests[:5]:
                 pull_id = req.get("pull_id")
-                pull_info = pulls.get(pull_id, {})
-                culture = pull_info.get("culture", "Не указана")
                 volume = req.get("volume", 0)
 
                 # Подсчёт предложений
@@ -25232,20 +18895,16 @@ async def show_my_shipping_requests(callback: types.CallbackQuery, state: FSMCon
                     [
                         o
                         for o in logistic_offers.values()
-                        if o.get("request_id") == req_id
-                        and o.get("status") == "pending"
                     ]
                 )
 
-                button_text = f"{emoji} #{req_id} | {culture} {volume:.0f}т"
-                if offers_count > 0 and status_key == "active":
                     button_text += f" | 📬 {offers_count}"
 
-                keyboard.add(
-                    InlineKeyboardButton(
-                        button_text, callback_data=f"view_my_request_{req_id}"
+                    keyboard.add(
+                        InlineKeyboardButton(
+                            button_text, callback_data=f"view_my_request_{req_id}"
+                        )
                     )
-                )
 
     keyboard.add(
         InlineKeyboardButton("🔄 Обновить", callback_data="my_shipping_requests")
@@ -25261,31 +18920,21 @@ async def view_my_request_details(callback: types.CallbackQuery, state: FSMConte
     """Детальный просмотр своей заявки"""
     await state.finish()
     try:
-        request_id = int(callback.data.split("_")[-1])
     except (IndexError, ValueError):
         await callback.answer("❌ Ошибка получения ID", show_alert=True)
         return
 
-    if request_id not in shipping_requests:
         await callback.answer("❌ Заявка не найдена", show_alert=True)
         return
-
-    request = shipping_requests[request_id]
     user_id = callback.from_user.id
 
-    if request.get("exporter_id") != user_id:
         await callback.answer("❌ Это не ваша заявка", show_alert=True)
         return
 
     pull_id = request.get("pull_id")
-    pull_info = pulls.get(pull_id, {})
     text = f"📦 <b>ЗАЯВКА #{request_id}</b>\n\n"
     text += f"🌾 Культура: <b>{pull_info.get('culture', 'Не указана')}</b>\n"
     text += f"📦 Объём: <b>{request.get('volume', 0):.1f} т</b>\n"
-    text += f"📍 Откуда: {request.get('route_from', 'Не указано')}\n"
-    text += f"📍 Куда: {request.get('route_to', 'Не указано')}\n"
-    if request.get("desired_date"):
-        text += f"📅 Желаемая дата: {request.get('desired_date')}\n"
     if request.get("budget"):
         text += f"💰 Бюджет: {request.get('budget'):,.0f} ₽\n"
     if request.get("requirements"):
@@ -25293,30 +18942,21 @@ async def view_my_request_details(callback: types.CallbackQuery, state: FSMConte
     text += f"\n📅 Создана: {request.get('created_at', 'Не указано')}\n\n"
     text += "━━━━━━━━━━━━━━━━━━━━\n\n"
 
-    status = request.get("status", "active")
     status_icon = status_map.get(status, "⚪").split()[0]
     status_name = get_status_name(status)
     text += f"📊 Статус: <b>{status_icon} {status_name}</b>\n\n"
 
     all_offers = [
-        o for o in logistic_offers.values() if o.get("request_id") == request_id
     ]
-    pending_offers = [o for o in all_offers if o.get("status") == "pending"]
-    accepted_offers = [o for o in all_offers if o.get("status") == "accepted"]
 
-    text += f"📬 Предложений:\n"
     text += f"  • Ожидают решения: <b>{len(pending_offers)}</b>\n"
     text += f"  • Принято: <b>{len(accepted_offers)}</b>\n"
     text += f"  • Всего: <b>{len(all_offers)}</b>\n\n"
 
-    if request.get("logist_id"):
-        logist_info = users.get(request.get("logist_id"), {})
-        text += f"🚚 Логист: <b>{logist_info.get('company_name', 'Не указана')}</b>\n"
         if logist_info.get("phone"):
             text += f"📞 Телефон: {logist_info.get('phone')}\n"
 
     keyboard = InlineKeyboardMarkup(row_width=2)
-    if status == "active":
         if len(pending_offers) > 0:
             keyboard.add(
                 InlineKeyboardButton(
@@ -25326,13 +18966,11 @@ async def view_my_request_details(callback: types.CallbackQuery, state: FSMConte
             )
         keyboard.add(
             InlineKeyboardButton(
-                "✏️ Редактировать", callback_data=f"edit_request_{request_id}"
             ),
             InlineKeyboardButton(
                 "❌ Отменить", callback_data=f"cancel_request_{request_id}"
             ),
         )
-    elif status == "assigned":
         keyboard.add(
             InlineKeyboardButton(
                 "📦 Доставка", callback_data=f"view_delivery_by_request_{request_id}"
@@ -25365,43 +19003,30 @@ async def cancel_request_confirm(callback: types.CallbackQuery, state: FSMContex
     await state.finish()
 
     try:
-        request_id = int(callback.data.split("_")[-1])
     except (IndexError, ValueError):
         await callback.answer("❌ Ошибка", show_alert=True)
         return
 
-    if request_id not in shipping_requests:
         await callback.answer("❌ Заявка не найдена", show_alert=True)
         return
-
-    request = shipping_requests[request_id]
     user_id = callback.from_user.id
 
-    if request.get("exporter_id") != user_id:
         await callback.answer("❌ Нет доступа", show_alert=True)
         return
 
-    if request.get("status") != "active":
-        await callback.answer(
-            "❌ Можно отменить только активные заявки", show_alert=True
-        )
         return
 
     # Подсчёт предложений
     pending_offers = [
         o
         for o in logistic_offers.values()
-        if o.get("request_id") == request_id and o.get("status") == "pending"
     ]
 
     text = f"❓ <b>ОТМЕНА ЗАЯВКИ #{request_id}</b>\n\n"
-    text += f"Вы уверены, что хотите отменить заявку?\n\n"
 
     if len(pending_offers) > 0:
         text += f"⚠️ У вас есть <b>{len(pending_offers)}</b> ожидающих предложений!\n"
-        text += f"Все предложения будут автоматически отклонены.\n\n"
 
-    text += f"<i>Это действие нельзя будет отменить</i>"
 
     keyboard = InlineKeyboardMarkup(row_width=2)
     keyboard.add(
@@ -25423,19 +19048,14 @@ async def cancel_request_confirmed(callback: types.CallbackQuery, state: FSMCont
     await state.finish()
 
     try:
-        request_id = int(callback.data.split("_")[-1])
     except (IndexError, ValueError):
         await callback.answer("❌ Ошибка", show_alert=True)
         return
 
-    if request_id not in shipping_requests:
         await callback.answer("❌ Заявка не найдена", show_alert=True)
         return
-
-    request = shipping_requests[request_id]
     user_id = callback.from_user.id
 
-    if request.get("exporter_id") != user_id:
         await callback.answer("❌ Нет доступа", show_alert=True)
         return
 
@@ -25443,33 +19063,23 @@ async def cancel_request_confirmed(callback: types.CallbackQuery, state: FSMCont
     request["status"] = "cancelled"
     request["cancelled_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # Отклоняем все ожидающие предложения
     cancelled_offers = 0
     for offer_id, offer in logistic_offers.items():
-        if offer.get("request_id") == request_id and offer.get("status") == "pending":
             offer["status"] = "rejected"
-            offer["rejected_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             offer["rejection_reason"] = "Заявка отменена заказчиком"
             cancelled_offers += 1
 
-            # Уведомляем логиста
-            logist_id = offer.get("logist_id")
-            if logist_id:
-                asyncio.create_task(
-                    notify_logistic_request_cancelled(
-                        request_id, "Заказчик отменил заявку"
-                    )
-                )
+        asyncio.create_task(
+        )
+            )
 
     save_shipping_requests()
     save_logistic_offers()
 
     text = f"✅ <b>ЗАЯВКА #{request_id} ОТМЕНЕНА</b>\n\n"
-    text += f"Заявка успешно отменена.\n"
 
     if cancelled_offers > 0:
         text += f"\n📬 Отклонено предложений: {cancelled_offers}\n"
-        text += f"Логисты получили уведомления.\n"
 
     keyboard = InlineKeyboardMarkup()
     keyboard.add(
@@ -25486,8 +19096,6 @@ async def cancel_request_confirmed(callback: types.CallbackQuery, state: FSMCont
 # ============================================================================
 # ЭКСПОРТЁР: ПРОСМОТР ДОСТАВОК
 # ============================================================================
-
-
 @dp.callback_query_handler(lambda c: c.data == "exporter_deliveries", state="*")
 async def show_exporter_deliveries(callback: types.CallbackQuery, state: FSMContext):
     """Список доставок экспортёра"""
@@ -25495,12 +19103,6 @@ async def show_exporter_deliveries(callback: types.CallbackQuery, state: FSMCont
 
     user_id = callback.from_user.id
 
-    # Получаем доставки пользователя
-    my_deliveries = [
-        (deliv_id, deliv)
-        for deliv_id, deliv in deliveries.items()
-        if deliv.get("exporter_id") == user_id
-    ]
 
     if not my_deliveries:
         text = "📦 <b>МОИ ДОСТАВКИ</b>\n\n"
@@ -25523,11 +19125,8 @@ async def show_exporter_deliveries(callback: types.CallbackQuery, state: FSMCont
     by_status = {"pending": [], "in_progress": [], "completed": [], "cancelled": []}
 
     for deliv_id, deliv in my_deliveries:
-        status = deliv.get("status", "pending")
-        if status in by_status:
-            by_status[status].append((deliv_id, deliv))
+        by_status[status].append((deliv_id, deliv))
 
-    text = f"📦 <b>МОИ ДОСТАВКИ</b>\n\n"
     text += f"Всего доставок: <b>{len(my_deliveries)}</b>\n\n"
 
     pending = len(by_status["pending"])
@@ -25575,55 +19174,19 @@ async def show_exporter_deliveries(callback: types.CallbackQuery, state: FSMCont
     lambda c: c.data.startswith("view_delivery_by_request_"), state="*"
 )
 async def view_delivery_by_request(callback: types.CallbackQuery, state: FSMContext):
-    """Просмотр доставки по ID заявки"""
     await state.finish()
 
     try:
-        request_id = int(callback.data.split("_")[-1])
     except (IndexError, ValueError):
-        await callback.answer("❌ Ошибка", show_alert=True)
         return
 
-    # Находим доставку по request_id
-    delivery = None
     delivery_id = None
     for deliv_id, deliv in deliveries.items():
-        if deliv.get("request_id") == request_id:
-            delivery = deliv
-            delivery_id = deliv_id
-            break
+        delivery_id = deliv_id
+        break
 
-    if not delivery:
-        await callback.answer("❌ Доставка не найдена", show_alert=True)
         return
 
-    # Перенаправляем на просмотр доставки
-    await bot.answer_callback_query(callback.id)
-    await bot.edit_message_text(
-        chat_id=callback.message.chat.id,
-        message_id=callback.message.message_id,
-        text="🔄 Загрузка...",
-        parse_mode="HTML",
-    )
-
-    # Создаём новый callback для view_delivery
-    new_callback = types.CallbackQuery(
-        id=callback.id,
-        from_user=callback.from_user,
-        message=callback.message,
-        chat_instance=callback.chat_instance,
-        data=f"view_delivery_{delivery_id}",
-    )
-
-    # Вызываем обработчик (нужно будет добавить view_delivery если его нет)
-    # Временно просто показываем ID
-    text = f"📦 Доставка #{delivery_id}\n\nПодробная информация скоро будет доступна"
-    keyboard = InlineKeyboardMarkup()
-    keyboard.add(
-        InlineKeyboardButton("🔙 Назад", callback_data=f"view_my_request_{request_id}")
-    )
-
-    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
 
 
 # ============================================================================
@@ -25674,24 +19237,18 @@ async def rate_logistic_start(callback: types.CallbackQuery, state: FSMContext):
     await state.finish()
 
     try:
-        delivery_id = int(callback.data.split("_")[-1])
     except (IndexError, ValueError):
         await callback.answer("❌ Ошибка получения ID", show_alert=True)
         return
 
-    if delivery_id not in deliveries:
         await callback.answer("❌ Доставка не найдена", show_alert=True)
         return
-
-    delivery = deliveries[delivery_id]
     user_id = callback.from_user.id
 
     # Проверки
-    if delivery.get("exporter_id") != user_id:
         await callback.answer("❌ Нет доступа", show_alert=True)
         return
 
-    if delivery.get("status") != "completed":
         await callback.answer(
             "❌ Можно оценить только завершённую доставку", show_alert=True
         )
@@ -25703,11 +19260,8 @@ async def rate_logistic_start(callback: types.CallbackQuery, state: FSMContext):
 
     await state.update_data(delivery_id=delivery_id)
 
-    logist_id = delivery.get("logist_id")
-    logist_info = users.get(logist_id, {})
     logist_name = logist_info.get("company_name", "Не указана")
 
-    text = f"⭐ <b>ОЦЕНКА ЛОГИСТА</b>\n\n"
     text += f"🚚 Логист: <b>{logist_name}</b>\n"
     text += f"📦 Доставка #{delivery_id}\n\n"
     text += "━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -25753,9 +19307,6 @@ async def rate_logistic_rating_selected(
 
     await state.update_data(rating=rating)
 
-    data = await state.get_data()
-    delivery_id = data.get("delivery_id")
-
     stars = "⭐" * rating
 
     text = f"{stars} <b>ОЦЕНКА: {rating}/5</b>\n\n"
@@ -25796,16 +19347,6 @@ async def rate_logistic_review_entered(message: types.Message, state: FSMContext
         )
         return
 
-    # Создаём фейковый callback
-    class FakeCallback:
-        def __init__(self, user_id, message):
-            self.from_user = type("obj", (object,), {"id": user_id})
-            self.message = message
-
-        async def answer(self, text="", show_alert=False):
-            pass
-
-    fake_callback = FakeCallback(message.from_user.id, message)
     await rate_logistic_save(fake_callback, state, review)
 
 
@@ -25817,14 +19358,9 @@ async def rate_logistic_save(callback_or_fake, state: FSMContext, review: str = 
     rating = data.get("rating")
 
     user_id = callback_or_fake.from_user.id
-
-    if delivery_id not in deliveries:
         if hasattr(callback_or_fake, "answer"):
             await callback_or_fake.answer("❌ Доставка не найдена", show_alert=True)
         return
-
-    delivery = deliveries[delivery_id]
-    logist_id = delivery.get("logist_id")
 
     # Сохраняем оценку в доставке
     delivery["rated"] = True
@@ -25844,7 +19380,6 @@ async def rate_logistic_save(callback_or_fake, state: FSMContext, review: str = 
         logistic_ratings[logist_id]["reviews"].append(
             {
                 "delivery_id": delivery_id,
-                "exporter_id": user_id,
                 "rating": rating,
                 "review": review,
                 "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -25860,12 +19395,10 @@ async def rate_logistic_save(callback_or_fake, state: FSMContext, review: str = 
     save_deliveries()
     save_logistic_ratings()
 
-    logist_info = users.get(logist_id, {})
     logist_name = logist_info.get("company_name", "Не указана")
 
     stars = "⭐" * rating
 
-    text = f"✅ <b>СПАСИБО ЗА ОЦЕНКУ!</b>\n\n"
     text += f"{stars} <b>{rating}/5</b>\n\n"
     text += f"🚚 Логист: {logist_name}\n"
     text += f"📦 Доставка #{delivery_id}\n\n"
@@ -25889,7 +19422,6 @@ async def rate_logistic_save(callback_or_fake, state: FSMContext, review: str = 
             await callback_or_fake.message.edit_text(
                 text, reply_markup=keyboard, parse_mode="HTML"
             )
-        except:
             await callback_or_fake.message.answer(
                 text, reply_markup=keyboard, parse_mode="HTML"
             )
@@ -25916,20 +19448,15 @@ async def view_logistic_profile(callback: types.CallbackQuery, state: FSMContext
         await callback.answer("❌ Ошибка", show_alert=True)
         return
 
-    if logist_id not in users:
         await callback.answer("❌ Логист не найден", show_alert=True)
         return
 
-    logist_info = users[logist_id]
-
-    text = f"🚚 <b>ПРОФИЛЬ ЛОГИСТА</b>\n\n"
     text += f"🏢 Компания: <b>{logist_info.get('company_name', 'Не указана')}</b>\n"
     text += f"📞 Телефон: {logist_info.get('phone', 'Не указан')}\n"
 
     if logist_info.get("email"):
         text += f"📧 Email: {logist_info.get('email')}\n"
 
-    text += f"\n━━━━━━━━━━━━━━━━━━━━\n\n"
 
     # Рейтинг
     if logist_id in logistic_ratings:
@@ -25937,24 +19464,17 @@ async def view_logistic_profile(callback: types.CallbackQuery, state: FSMContext
         avg_rating = rating_data["total_rating"] / rating_data["count"]
         stars = "⭐" * int(round(avg_rating))
 
-        text += f"<b>📊 РЕЙТИНГ:</b>\n"
         text += f"{stars} <b>{avg_rating:.1f}/5</b>\n"
         text += f"📋 Оценок: {rating_data['count']}\n\n"
     else:
-        text += f"<b>📊 РЕЙТИНГ:</b>\n"
-        text += f"Пока нет оценок\n\n"
 
     # Статистика доставок
     logist_deliveries = [
-        d for d in deliveries.values() if d.get("logist_id") == logist_id
     ]
 
-    completed = len([d for d in logist_deliveries if d.get("status") == "completed"])
     in_progress = len(
-        [d for d in logist_deliveries if d.get("status") == "in_progress"]
     )
 
-    text += f"<b>📦 СТАТИСТИКА:</b>\n"
     text += f"✅ Завершено доставок: {completed}\n"
     text += f"🚚 В процессе: {in_progress}\n"
     text += f"📋 Всего: {len(logist_deliveries)}\n\n"
@@ -25962,7 +19482,6 @@ async def view_logistic_profile(callback: types.CallbackQuery, state: FSMContext
     # Последние отзывы
     if logist_id in logistic_ratings and logistic_ratings[logist_id]["reviews"]:
         text += "━━━━━━━━━━━━━━━━━━━━\n\n"
-        text += f"<b>💬 ПОСЛЕДНИЕ ОТЗЫВЫ:</b>\n\n"
 
         reviews = logistic_ratings[logist_id]["reviews"][-3:]  # Последние 3
         for r in reversed(reviews):
@@ -25990,15 +19509,8 @@ async def show_expeditor_my_offers(callback: types.CallbackQuery, state: FSMCont
 
     user_id = callback.from_user.id
 
-    # Получаем предложения пользователя
-    my_offers = [
-        (offer_id, offer)
-        for offer_id, offer in expeditor_offers.items()
-        if offer.get("expeditor_id") == user_id
-    ]
 
     if not my_offers:
-        text = "📋 <b>МОИ ПРЕДЛОЖЕНИЯ УСЛУГ</b>\n\n"
         text += "❌ У вас пока нет предложений\n\n"
         text += "<i>Создайте предложение в разделе 'Создать предложение'</i>"
 
@@ -26017,14 +19529,11 @@ async def show_expeditor_my_offers(callback: types.CallbackQuery, state: FSMCont
         return
 
     # Группируем по статусам
-    by_status = {"active": [], "selected": [], "cancelled": []}
 
     for offer_id, offer in my_offers:
-        status = offer.get("status", "active")
         if status in by_status:
             by_status[status].append((offer_id, offer))
 
-    text = f"📋 <b>МОИ ПРЕДЛОЖЕНИЯ УСЛУГ</b>\n\n"
     text += f"Всего предложений: <b>{len(my_offers)}</b>\n\n"
 
     active = len(by_status["active"])
@@ -26046,7 +19555,6 @@ async def show_expeditor_my_offers(callback: types.CallbackQuery, state: FSMCont
         if offers:
             for offer_id, offer in offers[:5]:
                 service = offer.get("service_type", "Услуга")
-                ports = offer.get("ports", "Не указаны")
                 price = offer.get("price", 0)
 
                 button_text = f"{emoji} #{offer_id} | {service[:20]} | {price:,.0f}₽"
@@ -26072,7 +19580,6 @@ async def show_expeditor_my_offers(callback: types.CallbackQuery, state: FSMCont
 
 
 @dp.callback_query_handler(
-    lambda c: c.data.startswith("view_expeditor_offer_"), state="*"
 )
 async def view_expeditor_offer_details(
     callback: types.CallbackQuery, state: FSMContext
@@ -26081,19 +19588,14 @@ async def view_expeditor_offer_details(
     await state.finish()
 
     try:
-        offer_id = int(callback.data.split("_")[-1])
     except (IndexError, ValueError):
         await callback.answer("❌ Ошибка получения ID", show_alert=True)
         return
 
-    if offer_id not in expeditor_offers:
         await callback.answer("❌ Предложение не найдено", show_alert=True)
         return
-
-    offer = expeditor_offers[offer_id]
     user_id = callback.from_user.id
 
-    if offer.get("expeditor_id") != user_id:
         await callback.answer("❌ Это не ваше предложение", show_alert=True)
         return
 
@@ -26110,7 +19612,6 @@ async def view_expeditor_offer_details(
     text += "━━━━━━━━━━━━━━━━━━━━\n\n"
 
     # Статус
-    status = offer.get("status", "active")
 
     if status == "active":
         text += "📊 Статус: <b>🆕 Активно</b>\n"
@@ -26118,7 +19619,6 @@ async def view_expeditor_offer_details(
     elif status == "selected":
         text += "📊 Статус: <b>✅ Выбрано экспортёром</b>\n"
         if offer.get("exporter_id"):
-            exporter_info = users.get(offer.get("exporter_id"), {})
             text += (
                 f"\n🏢 Экспортёр: {exporter_info.get('company_name', 'Не указано')}\n"
             )
@@ -26147,346 +19647,6 @@ async def view_expeditor_offer_details(
     await callback.answer()
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# РЕДАКТИРОВАНИЕ КАРТОЧКИ ЭКСПЕДИТОРА
-# ═══════════════════════════════════════════════════════════════════════════
-@dp.callback_query_handler(lambda c: c.data == "edit_expeditor_card", state="*")
-async def edit_expeditor_card_callback(
-    callback: types.CallbackQuery, state: FSMContext
-):
-    """Редактирование карточки экспедитора"""
-    await state.finish()
-
-    user_id = callback.from_user.id
-
-    # ════════════════════════════════════════════════════════════════
-    # ЛОГИРОВАНИЕ ДЛЯ ДИАГНОСТИКИ
-    # ════════════════════════════════════════════════════════════════
-
-    logging.info(f"🔧 РЕДАКТИРОВАНИЕ КАРТОЧКИ")
-    logging.info(f"   USER ID: {user_id}")
-    logging.info(f"   expeditor_offers: {list(expeditor_offers.keys())}")
-    logging.info(
-        f"   expeditor_cards: {list(expeditor_cards.keys()) if 'expeditor_cards' in globals() else 'НЕТ'}"
-    )
-
-    # ════════════════════════════════════════════════════════════════
-    # ПОИСК В expeditor_offers
-    # ════════════════════════════════════════════════════════════════
-
-    offer_id = None
-    offer = None
-
-    for oid, off in expeditor_offers.items():
-        logging.info(
-            f"   Проверка карточки #{oid}: expeditor_id={off.get('expeditor_id')}"
-        )
-        if off.get("expeditor_id") == user_id:
-            offer_id = oid
-            offer = off
-            logging.info(f"   ✅ НАЙДЕНА карточка #{oid}")
-            break
-
-    # ════════════════════════════════════════════════════════════════
-    # ЕСЛИ НЕ НАЙДЕНО В expeditor_offers - ИЩЕМ В expeditor_cards
-    # ════════════════════════════════════════════════════════════════
-
-    if not offer_id and "expeditor_cards" in globals():
-        logging.info("   ⚠️ Не найдено в expeditor_offers, ищем в expeditor_cards")
-        for cid, card in expeditor_cards.items():
-            logging.info(f"   Проверка card #{cid}: user_id={card.get('user_id')}")
-            if card.get("user_id") == user_id:
-                offer_id = cid
-                offer = card
-                logging.info(f"   ✅ НАЙДЕНА карточка в expeditor_cards #{cid}")
-                break
-
-    # ════════════════════════════════════════════════════════════════
-    # ПРОВЕРКА
-    # ════════════════════════════════════════════════════════════════
-
-    if not offer_id or not offer:
-        logging.error(f"❌ КАРТОЧКА НЕ НАЙДЕНА для user_id={user_id}")
-        await callback.answer("❌ У вас нет карточки", show_alert=True)
-        return
-
-    # ════════════════════════════════════════════════════════════════
-    # ПРОВЕРКА СТАТУСА
-    # ════════════════════════════════════════════════════════════════
-
-    status = offer.get("status", "active")
-    logging.info(f"   Статус карточки: {status}")
-
-    if status != "active":
-        await callback.answer(
-            "❌ Можно редактировать только активные карточки", show_alert=True
-        )
-        return
-
-    # ════════════════════════════════════════════════════════════════
-    # КРАСИВОЕ МЕНЮ
-    # ════════════════════════════════════════════════════════════════
-
-    text = "✏️ <b>Редактирование карточки</b>\n"
-    text += "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-
-    # Получаем значения с поддержкой разных структур данных
-    service_type = offer.get("service_type", offer.get("transport_type", "Не указан"))
-    price = offer.get("price", offer.get("price_per_km", 0))
-    capacity = offer.get("capacity", offer.get("cargo_capacity", "Не указана"))
-    regions = offer.get("ports", offer.get("regions", "Не указаны"))
-    description = offer.get("description", offer.get("notes", ""))
-
-    # Форматируем текст
-    text += f"🚛 <b>Тип транспорта</b>\n"
-    text += f"   <code>{service_type}</code>\n\n"
-
-    text += f"💰 <b>Цена за км</b>\n"
-    text += f"   <code>{price:,.2f} ₽/км</code>\n\n"
-
-    text += f"📦 <b>Грузоподъёмность</b>\n"
-    text += f"   <code>{capacity} т</code>\n\n"
-
-    text += f"🗺 <b>Регионы работы</b>\n"
-    text += f"   <code>{regions}</code>\n\n"
-
-    text += f"📝 <b>Описание</b>\n"
-    if description:
-        # Обрезаем длинное описание
-        desc_preview = (
-            description[:50] + "..." if len(description) > 50 else description
-        )
-        text += f"   <code>{desc_preview}</code>\n"
-    else:
-        text += f"   <i>Не указано</i>\n"
-
-    text += "\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-    text += "<i>👇 Выберите параметр для изменения</i>"
-
-    # ════════════════════════════════════════════════════════════════
-    # КЛАВИАТУРА
-    # ════════════════════════════════════════════════════════════════
-
-    keyboard = InlineKeyboardMarkup(row_width=2)
-    keyboard.add(
-        InlineKeyboardButton(
-            "🚛 Транспорт", callback_data=f"edit_exp_field_service_type_{offer_id}"
-        ),
-        InlineKeyboardButton(
-            "💰 Цена", callback_data=f"edit_exp_field_price_{offer_id}"
-        ),
-    )
-    keyboard.add(
-        InlineKeyboardButton(
-            "📦 Грузоподъёмность", callback_data=f"edit_exp_field_capacity_{offer_id}"
-        ),
-        InlineKeyboardButton(
-            "🗺 Регионы", callback_data=f"edit_exp_field_ports_{offer_id}"
-        ),
-    )
-    keyboard.add(
-        InlineKeyboardButton(
-            "📝 Описание", callback_data=f"edit_exp_field_description_{offer_id}"
-        )
-    )
-    keyboard.add(
-        InlineKeyboardButton("◀️ К карточке", callback_data="expeditor_my_card")
-    )
-
-    # ════════════════════════════════════════════════════════════════
-    # ОТПРАВКА
-    # ════════════════════════════════════════════════════════════════
-
-    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
-    await callback.answer()
-
-    logging.info("✅ МЕНЮ РЕДАКТИРОВАНИЯ ОТПРАВЛЕНО")
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# СОСТОЯНИЯ ДЛЯ РЕДАКТИРОВАНИЯ
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-class ExpeditatorEditStates(StatesGroup):
-    waiting_value = State()
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# ОБРАБОТКА НОВОГО ЗНАЧЕНИЯ
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-@dp.message_handler(state=ExpeditatorEditStates.waiting_value)
-async def process_expeditor_edit_value(message: types.Message, state: FSMContext):
-    """Сохранение нового значения"""
-    data = await state.get_data()
-    offer_id = data.get("edit_offer_id")
-    field_name = data.get("edit_field")
-    new_value = message.text.strip()
-
-    # Отмена
-    if new_value == "/cancel":
-        keyboard = InlineKeyboardMarkup()
-        keyboard.add(
-            InlineKeyboardButton(
-                "◀️ К карточке", callback_data=f"view_expeditor_offer_{offer_id}"
-            )
-        )
-        await message.answer("❌ Редактирование отменено", reply_markup=keyboard)
-        await state.finish()
-        return
-
-    if offer_id not in expeditor_offers:
-        await message.answer("❌ Карточка не найдена")
-        await state.finish()
-        return
-
-    # Валидация для цены
-    if field_name == "price":
-        try:
-            new_value = float(new_value.replace(",", ".").replace(" ", ""))
-            if new_value <= 0:
-                raise ValueError
-        except ValueError:
-            await message.answer(
-                "❌ Неверный формат цены. Введите число (например: 15000)"
-            )
-            return
-
-    # Пропуск для описания
-    if field_name == "description" and message.text == "/skip":
-        new_value = ""
-
-    # Сохраняем изменение
-    expeditor_offers[offer_id][field_name] = new_value
-    save_expeditor_offers()
-
-    field_names = {
-        "service_type": "Тип услуги",
-        "price": "Цена",
-        "terms": "Сроки",
-        "ports": "Порты",
-        "description": "Описание",
-    }
-
-    display_value = f"{new_value:,} ₽" if field_name == "price" else new_value
-
-    text = f"✅ <b>{field_names.get(field_name, 'Поле')} успешно изменено!</b>\n\n"
-    text += f"Новое значение:\n<code>{display_value}</code>"
-
-    keyboard = InlineKeyboardMarkup()
-    keyboard.add(
-        InlineKeyboardButton(
-            "📋 Просмотреть карточку", callback_data=f"view_expeditor_offer_{offer_id}"
-        )
-    )
-    keyboard.add(
-        InlineKeyboardButton(
-            "✏️ Изменить ещё", callback_data=f"edit_expeditor_offer_{offer_id}"
-        )
-    )
-    keyboard.add(
-        InlineKeyboardButton("◀️ К моим карточкам", callback_data="expeditor_my_offers")
-    )
-
-    await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
-    await state.finish()
-
-    logging.info(
-        f"✅ Экспедитор {message.from_user.id} изменил {field_name} в карточке #{offer_id}"
-    )
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# ОТМЕНА КАРТОЧКИ ЭКСПЕДИТОРА
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-@dp.callback_query_handler(
-    lambda c: c.data.startswith("cancel_expeditor_offer_"), state="*"
-)
-async def cancel_expeditor_offer_callback(
-    callback: types.CallbackQuery, state: FSMContext
-):
-    """Отмена/удаление карточки экспедитора"""
-    await state.finish()
-
-    try:
-        offer_id = int(callback.data.split("_")[-1])
-    except (IndexError, ValueError):
-        await callback.answer("❌ Ошибка получения ID", show_alert=True)
-        return
-
-    if offer_id not in expeditor_offers:
-        await callback.answer("❌ Карточка не найдена", show_alert=True)
-        return
-
-    offer = expeditor_offers[offer_id]
-    user_id = callback.from_user.id
-
-    if offer.get("expeditor_id") != user_id:
-        await callback.answer("❌ Это не ваша карточка", show_alert=True)
-        return
-
-    # Подтверждение
-    text = f"❓ <b>Удалить карточку #{offer_id}?</b>\n\n"
-    text += f"Услуга: {offer.get('service_type', 'Н/Д')}\n"
-    text += f"Цена: {offer.get('price', 0):,} ₽\n\n"
-    text += "⚠️ Это действие нельзя отменить!"
-
-    keyboard = InlineKeyboardMarkup(row_width=2)
-    keyboard.add(
-        InlineKeyboardButton(
-            "✅ Да, удалить", callback_data=f"confirm_cancel_expeditor_{offer_id}"
-        ),
-        InlineKeyboardButton(
-            "❌ Отмена", callback_data=f"view_expeditor_offer_{offer_id}"
-        ),
-    )
-
-    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
-    await callback.answer()
-
-
-@dp.callback_query_handler(
-    lambda c: c.data.startswith("confirm_cancel_expeditor_"), state="*"
-)
-async def confirm_cancel_expeditor_callback(
-    callback: types.CallbackQuery, state: FSMContext
-):
-    """Подтверждение удаления карточки"""
-    await state.finish()
-
-    try:
-        offer_id = int(callback.data.split("_")[-1])
-    except (IndexError, ValueError):
-        await callback.answer("❌ Ошибка", show_alert=True)
-        return
-
-    if offer_id not in expeditor_offers:
-        await callback.answer("❌ Карточка не найдена", show_alert=True)
-        return
-
-    # Удаляем карточку
-    del expeditor_offers[offer_id]
-    save_expeditor_offers()
-
-    text = "✅ <b>Карточка успешно удалена!</b>\n\n"
-    text += f"Карточка #{offer_id} больше не видна экспортёрам."
-
-    keyboard = InlineKeyboardMarkup()
-    keyboard.add(
-        InlineKeyboardButton("◀️ К моим карточкам", callback_data="expeditor_my_offers")
-    )
-    keyboard.add(InlineKeyboardButton("🏠 Главное меню", callback_data="back_to_main"))
-
-    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
-    await callback.answer("✅ Карточка удалена", show_alert=True)
-
-    logging.info(f"✅ Экспедитор {callback.from_user.id} удалил карточку #{offer_id}")
-
-
 @dp.callback_query_handler(
     lambda c: c.data.startswith("cancel_expeditor_offer_"), state="*"
 )
@@ -26495,23 +19655,17 @@ async def cancel_expeditor_offer(callback: types.CallbackQuery, state: FSMContex
     await state.finish()
 
     try:
-        offer_id = int(callback.data.split("_")[-1])
     except (IndexError, ValueError):
         await callback.answer("❌ Ошибка", show_alert=True)
         return
 
-    if offer_id not in expeditor_offers:
         await callback.answer("❌ Предложение не найдено", show_alert=True)
         return
-
-    offer = expeditor_offers[offer_id]
     user_id = callback.from_user.id
 
-    if offer.get("expeditor_id") != user_id:
         await callback.answer("❌ Нет доступа", show_alert=True)
         return
 
-    if offer.get("status") != "active":
         await callback.answer(
             "❌ Можно отменить только активные предложения", show_alert=True
         )
@@ -26551,7 +19705,6 @@ async def show_expeditor_available_pulls(
     my_offers = [
         offer
         for offer in expeditor_offers.values()
-        if offer.get("expeditor_id") == user_id and offer.get("status") == "active"
     ]
 
     # Собираем порты из предложений
@@ -26570,7 +19723,6 @@ async def show_expeditor_available_pulls(
         if not isinstance(pull, dict):  # ✅ ДОБАВЛЕНО
             continue
 
-        if pull.get("status") != "filled":
             continue
 
         pull_port = pull.get("port", "").lower()
@@ -26582,26 +19734,19 @@ async def show_expeditor_available_pulls(
     if not suitable_pulls:
         text = "🚢 <b>ДОСТУПНЫЕ ПУЛЫ</b>\n\n"
 
-        if not my_offers:
-            text += "❌ Сначала создайте предложение услуг\n\n"
-            text += "<i>Укажите порты, в которых вы работаете</i>"
-
-            keyboard = InlineKeyboardMarkup()
+        keyboard = InlineKeyboardMarkup()
             keyboard.add(
                 InlineKeyboardButton(
                     "➕ Создать предложение", callback_data="create_expeditor_offer"
                 )
             )
         else:
-            text += "❌ Нет подходящих пулов по вашим портам\n\n"
-            text += f"Ваши порты: <i>{', '.join(my_ports)}</i>"
 
-            keyboard = InlineKeyboardMarkup()
-            keyboard.add(
-                InlineKeyboardButton(
-                    "🔄 Обновить", callback_data="expeditor_available_pulls"
-                )
+        keyboard.add(
+            InlineKeyboardButton(
+                "🔄 Обновить", callback_data="expeditor_available_pulls"
             )
+        )
 
         keyboard.add(
             InlineKeyboardButton("🔙 Главное меню", callback_data="back_to_main")
@@ -26614,7 +19759,6 @@ async def show_expeditor_available_pulls(
     # Сортируем по дате (новые первые)
     suitable_pulls.sort(key=lambda x: x[1].get("created_at", ""), reverse=True)
 
-    text = f"🚢 <b>ДОСТУПНЫЕ ПУЛЫ</b>\n\n"
     text += f"Найдено пулов: <b>{len(suitable_pulls)}</b>\n"
 
     if my_ports:
@@ -26668,14 +19812,6 @@ async def view_pull_for_expeditor(callback: types.CallbackQuery, state: FSMConte
         await callback.answer("❌ Ошибка получения ID", show_alert=True)
         return
 
-    # ✅ ИСПРАВЛЕНО: Получаем пулы из правильного места
-    all_pulls = pulls.get("pulls", {})
-
-    if pull_id not in all_pulls:
-        await callback.answer("❌ Пул не найден", show_alert=True)
-        return
-
-    pull = all_pulls.get(pull_id) or all_pulls.get(str(pull_id))
 
     if not pull:
         await callback.answer("❌ Пул не найден", show_alert=True)
@@ -26690,8 +19826,6 @@ async def view_pull_for_expeditor(callback: types.CallbackQuery, state: FSMConte
     # Информация об экспортёре
     exporter_id = pull.get("exporter_id")
     if exporter_id:
-        exporter_info = users.get(exporter_id, {})
-        text += f"<b>🏢 ЭКСПОРТЁР:</b>\n"
         text += f"Компания: {exporter_info.get('company_name', 'Не указана')}\n"
         text += f"Телефон: {exporter_info.get('phone', 'Не указан')}\n"
         if exporter_info.get("email"):
@@ -26723,16 +19857,8 @@ async def show_expeditor_statistics(callback: types.CallbackQuery, state: FSMCon
 
     user_id = callback.from_user.id
 
-    # Собираем статистику
-    my_offers = [
-        offer
-        for offer in expeditor_offers.values()
-        if offer.get("expeditor_id") == user_id
-    ]
 
     total_offers = len(my_offers)
-    active_offers = len([o for o in my_offers if o.get("status") == "active"])
-    selected_offers = len([o for o in my_offers if o.get("status") == "selected"])
 
     # Подсчёт пулов по портам
     ports_dict = {}
@@ -26743,8 +19869,6 @@ async def show_expeditor_statistics(callback: types.CallbackQuery, state: FSMCon
                 port = port.strip()
                 ports_dict[port] = ports_dict.get(port, 0) + 1
 
-    text = f"📊 <b>МОЯ СТАТИСТИКА</b>\n\n"
-    text += f"<b>ПРЕДЛОЖЕНИЯ:</b>\n"
     text += f"📋 Всего предложений: <b>{total_offers}</b>\n"
     text += f"🆕 Активных: <b>{active_offers}</b>\n"
     text += f"✅ Выбрано: <b>{selected_offers}</b>\n\n"
@@ -26754,7 +19878,6 @@ async def show_expeditor_statistics(callback: types.CallbackQuery, state: FSMCon
         text += f"📈 Процент успеха: <b>{success_rate:.1f}%</b>\n\n"
 
     if ports_dict:
-        text += f"<b>ПОРТЫ:</b>\n"
         for port, count in sorted(ports_dict.items(), key=lambda x: x[1], reverse=True)[
             :5
         ]:
@@ -26765,7 +19888,6 @@ async def show_expeditor_statistics(callback: types.CallbackQuery, state: FSMCon
     prices = [o.get("price", 0) for o in my_offers if o.get("price")]
     if prices:
         avg_price = sum(prices) / len(prices)
-        text += f"<b>ЦЕНООБРАЗОВАНИЕ:</b>\n"
         text += f"💰 Средняя цена: <b>{avg_price:,.0f} ₽</b>\n"
         text += f"💵 Мин. цена: {min(prices):,.0f} ₽\n"
         text += f"💸 Макс. цена: {max(prices):,.0f} ₽\n"
@@ -26802,7 +19924,6 @@ async def show_user_deals(message: types.Message, state: FSMContext):
     await state.finish()
 
     user_id = message.from_user.id
-    user_data = users.get(user_id, {})
     user_role = user_data.get("role", "unknown")
     user_name = user_data.get("name", "Пользователь")
 
@@ -26816,23 +19937,18 @@ async def show_user_deals(message: types.Message, state: FSMContext):
         # 👨‍🌾 ФЕРМЕР
         # ============================================================================
         if user_role == "farmer":
-            user_batches = batches.get(user_id, [])
 
             # Нормализуем статусы - приводим к нижнему регистру
             active = len(
                 [
                     d
                     for d in user_batches
-                    if (d.get("status") or "").lower()
-                    in ["active", "pending", "активна", "", "none"]
                 ]
             )
             reserved = len(
                 [
                     d
                     for d in user_batches
-                    if (d.get("status") or "").lower()
-                    in ["reserved", "зарезервирована"]
                     or d.get("reserved_volume", 0) > 0
                 ]
             )
@@ -26840,8 +19956,6 @@ async def show_user_deals(message: types.Message, state: FSMContext):
                 [
                     d
                     for d in user_batches
-                    if (d.get("status") or "").lower()
-                    in ["sold", "проданные", "продано"]
                     or d.get("sold")
                 ]
             )
@@ -26849,8 +19963,6 @@ async def show_user_deals(message: types.Message, state: FSMContext):
                 [
                     d
                     for d in user_batches
-                    if (d.get("status") or "").lower()
-                    in ["canceled", "отменено", "cancelled"]
                 ]
             )
             matches = len([d for d in user_batches if len(d.get("matches", [])) > 0])
@@ -26862,8 +19974,6 @@ async def show_user_deals(message: types.Message, state: FSMContext):
             )
 
             text = (
-                f"<b>👨‍🌾 МОИ ПАРТИИ</b>\n\n"
-                f"<b>👨‍🌾 Фермер</b>\n"
                 f"👤 {user_name}\n"
                 f"📊 Всего: <b>{total}</b>\n"
                 f"📦 Объём: {total_volume:,.0f}т\n"
@@ -26873,7 +19983,6 @@ async def show_user_deals(message: types.Message, state: FSMContext):
                 f"💰 Проданные: {sold}\n"
                 f"❌ Снятые с продажи: {canceled}\n"
                 f"🎯 С совпадениями: {matches}\n\n"
-                f"<b>Выберите статус:</b>"
             )
 
             # ТОЛЬКО кнопки если COUNT > 0
@@ -26915,7 +20024,6 @@ async def show_user_deals(message: types.Message, state: FSMContext):
 
             if total == 0:
                 text = (
-                    f"👨‍🌾 <b>МОИ ПАРТИИ</b>\n\n"
                     f"👤 {user_name}\n"
                     "📭 <b>Партий не найдено</b>\n\n"
                     "💡 <b>Подсказка:</b> Создайте новую партию через '➕ Добавить партию'"
@@ -26927,58 +20035,39 @@ async def show_user_deals(message: types.Message, state: FSMContext):
         elif user_role == "exporter":
             # ✅ ИСПРАВЛЕНО: Получаем пулы из правильного места
             all_pulls_dict = pulls.get("pulls", {})
-            all_pulls = {
-                k: v
-                for k, v in all_pulls_dict.items()
-                if isinstance(v, dict) and v.get("exporter_id") == user_id
-            }
 
             active = len(
                 [
                     d
-                    for d in all_pulls.values()
-                    if (d.get("status") or "").lower() in ["active", "none", ""]
                 ]
             )
             filled = len(
                 [
                     d
-                    for d in all_pulls.values()
-                    if (d.get("status") or "").lower() == "filled"
                 ]
             )
             closed = len(
                 [
                     d
-                    for d in all_pulls.values()
-                    if (d.get("status") or "").lower() == "closed"
                 ]
             )
             completed = len(
                 [
                     d
-                    for d in all_pulls.values()
-                    if (d.get("status") or "").lower() == "completed"
                 ]
             )
             cancelled = len(
                 [
                     d
-                    for d in all_pulls.values()
-                    if (d.get("status") or "").lower() in ["cancelled", "canceled"]
                 ]
             )
 
-            total_volume = sum([p.get("target_volume", 0) for p in all_pulls.values()])
             total_price = sum(
                 [
-                    p.get("target_volume", 0) * p.get("price", 0)
-                    for p in all_pulls.values()
                 ]
             )
 
             text = (
-                f"📤 <b>МОИ ПУЛЫ</b>\n\n"
                 f"👤 {user_name}\n"
                 f"📊 Всего: <b>{len(all_pulls)}</b>\n"
                 f"📦 Объём: {total_volume:,.0f}т\n"
@@ -26988,7 +20077,6 @@ async def show_user_deals(message: types.Message, state: FSMContext):
                 f"💰 Закрытые: {closed}\n"
                 f"❌ Отмененные: {cancelled}\n"
                 f"🎯 Завершенные: {completed}\n\n"
-                f"<b>Выберите статус:</b>"
             )
 
             # ТОЛЬКО кнопки если COUNT > 0
@@ -27030,7 +20118,6 @@ async def show_user_deals(message: types.Message, state: FSMContext):
 
             if len(all_pulls) == 0:
                 text = (
-                    f"📤 <b>МОИ ПУЛЫ</b>\n\n"
                     f"👤 {user_name}\n"
                     "📭 <b>Пулов не найдено</b>\n\n"
                     "💡 <b>Подсказка:</b> Создайте новый пул через '➕ Создать пул'"
@@ -27039,40 +20126,25 @@ async def show_user_deals(message: types.Message, state: FSMContext):
         # ============================================================================
         # 🚚 ЛОГИСТ
         # ============================================================================
-        elif user_role == "logist":
-            all_orders = {
-                k: v
-                for k, v in shipping_requests.items()
-                if v.get("logist_id") == user_id
-            }
 
             pending = len(
                 [
                     d
-                    for d in all_orders.values()
-                    if (d.get("status") or "").lower() in ["pending", "new", "none", ""]
                 ]
             )
             in_progress = len(
                 [
                     d
-                    for d in all_orders.values()
-                    if (d.get("status") or "").lower() == "in_progress"
                 ]
             )
             completed = len(
                 [
                     d
-                    for d in all_orders.values()
-                    if (d.get("status") or "").lower() == "completed"
                 ]
             )
 
-            total_volume = sum([o.get("volume", 0) for o in all_orders.values()])
-            total_price = sum([o.get("price", 0) for o in all_orders.values()])
 
             text = (
-                f"🚚 <b>МОИ ДОСТАВКИ</b>\n\n"
                 f"👤 {user_name}\n"
                 f"📊 Всего: <b>{len(all_orders)}</b>\n"
                 f"📦 Объём: {total_volume:,.0f}т\n"
@@ -27080,7 +20152,6 @@ async def show_user_deals(message: types.Message, state: FSMContext):
                 f"⏳ Ожидающие: {pending}\n"
                 f"🚗 В пути: {in_progress}\n"
                 f"✅ Доставлено: {completed}\n\n"
-                f"<b>Выберите статус:</b>"
             )
 
             # ТОЛЬКО кнопки если COUNT > 0
@@ -27108,7 +20179,6 @@ async def show_user_deals(message: types.Message, state: FSMContext):
 
             if len(all_orders) == 0:
                 text = (
-                    f"🚚 <b>МОИ ДОСТАВКИ</b>\n\n"
                     f"👤 {user_name}\n"
                     "📭 <b>Доставок не найдено</b>"
                 )
@@ -27116,48 +20186,32 @@ async def show_user_deals(message: types.Message, state: FSMContext):
         # ============================================================================
         # ✈️ ЭКСПЕДИТОР
         # ============================================================================
-        elif user_role == "expeditor":
-            all_offers = {
-                k: v
-                for k, v in expeditor_offers.items()
-                if v.get("expeditor_id") == user_id
-            }
+                    }
 
             active = len(
                 [
                     d
-                    for d in all_offers.values()
-                    if (d.get("status") or "").lower() in ["active", "open", "none", ""]
                 ]
             )
             in_progress = len(
                 [
                     d
-                    for d in all_offers.values()
-                    if (d.get("status") or "").lower() == "in_progress"
                 ]
             )
             delivered = len(
                 [
                     d
-                    for d in all_offers.values()
-                    if (d.get("status") or "").lower() == "delivered"
                 ]
             )
 
-            total_volume = sum([o.get("volume", 0) for o in all_offers.values()])
-            total_price = sum([o.get("price", 0) for o in all_offers.values()])
 
             text = (
-                f"✈️ <b>МОИ МАРШРУТЫ</b>\n\n"
                 f"👤 {user_name}\n"
-                f"📊 Всего: <b>{len(all_offers)}</b>\n"
                 f"📦 Объём: {total_volume:,.0f}т\n"
                 f"💰 Сумма: {total_price:,.0f}₽\n\n"
                 f"🟢 Активные: {active}\n"
                 f"⏳ В пути: {in_progress}\n"
                 f"✅ Доставлено: {delivered}\n\n"
-                f"<b>Выберите статус:</b>"
             )
 
             # ТОЛЬКО кнопки если COUNT > 0
@@ -27179,13 +20233,10 @@ async def show_user_deals(message: types.Message, state: FSMContext):
                 keyboard.add(
                     InlineKeyboardButton(
                         f"✅ Доставлено ({delivered})",
-                        callback_data="deals_status:expeditor:delivered",
                     )
                 )
 
-            if len(all_offers) == 0:
                 text = (
-                    f"✈️ <b>МОИ МАРШРУТЫ</b>\n\n"
                     f"👤 {user_name}\n"
                     "📭 <b>Маршрутов не найдено</b>"
                 )
@@ -27202,9 +20253,7 @@ async def show_user_deals(message: types.Message, state: FSMContext):
 
 
 @dp.callback_query_handler(
-    lambda q: q.data in ("back_to_main", "back_to_menu", "main_menu")
 )
-async def back_to_main_handler(callback: types.CallbackQuery, state: FSMContext = None):
     """✅ Возврат в главное меню для ВСЕХ кнопок назад"""
     user_id = callback.from_user.id
     current_time = time.time()
@@ -27223,19 +20272,14 @@ async def back_to_main_handler(callback: types.CallbackQuery, state: FSMContext 
         if state:
             try:
                 await state.finish()
-            except:
-                pass
 
-        user_data = users.get(user_id, {})
         role = user_data.get("role", "unknown").lower()
 
         logging.info(f"⬅️ Возврат в главное меню: role={role}, user_id={user_id}")
 
         # ✅ ВСЕГДА ИНИЦИАЛИЗИРУЕМ VARIABLES В НАЧАЛЕ!
-        text = f"<b>📊 Главное меню</b>\n\n"
         text += f"👤 Роль: <b>{role}</b>\n"
         text += f"👤 Пользователь: {user_data.get('name', 'Unknown')}\n\n"
-        text += f"Выберите действие:"
 
         keyboard = InlineKeyboardMarkup(row_width=1)
         keyboard.add(InlineKeyboardButton("📋 Мои сделки", callback_data="my_deals"))
@@ -27247,18 +20291,15 @@ async def back_to_main_handler(callback: types.CallbackQuery, state: FSMContext 
             await callback.message.edit_text(
                 text, reply_markup=keyboard, parse_mode="HTML"
             )
-            logging.info(f"✅ Главное меню отредактировано успешно")
         except Exception as e:
             error_str = str(e).lower()
             if "not modified" in error_str:
-                logging.info(f"⚠️ Сообщение уже содержит то же содержимое")
             else:
                 logging.warning(f"⚠️ edit_text ошибка: {error_str}")
                 try:
                     await callback.message.answer(
                         text, reply_markup=keyboard, parse_mode="HTML"
                     )
-                    logging.info(f"✅ Новое сообщение отправлено")
                 except Exception as e2:
                     logging.error(f"❌ answer ошибка: {e2}")
 
@@ -27274,8 +20315,6 @@ async def back_to_main_handler(callback: types.CallbackQuery, state: FSMContext 
                 reply_markup=recovery_kb,
                 parse_mode="HTML",
             )
-        except:
-            pass
 
 
 # ============================================================================
@@ -27283,22 +20322,17 @@ async def back_to_main_handler(callback: types.CallbackQuery, state: FSMContext 
 # ============================================================================
 @dp.callback_query_handler(lambda q: q.data.startswith("deals_status:"))
 async def filter_deals_by_status(callback: types.CallbackQuery):
-    """✅ Фильтрует сделки по статусам - ИСПРАВЛЕНО"""
     await callback.answer()
 
     try:
         parts = callback.data.split(":")
-        role = parts[1]
         status = parts[2]
         user_id = callback.from_user.id
 
         logging.info(f"📊 Фильтр: role={role}, status={status}, user_id={user_id}")
 
         filtered_items = []
-        search_status = status.lower()
         logging.info(f"   🔍 Ищу статус: '{search_status}'")
-        if search_status == "all":
-            search_status = "active"
 
         # ✅ ЭМОДЗИ КУЛЬТУР
         culture_emoji = {
@@ -27314,34 +20348,9 @@ async def filter_deals_by_status(callback: types.CallbackQuery):
         # 👨‍🌾 ФЕРМЕР - БАТЧИ
         # ════════════════════════════════════════════════════════════════════
         if role == "farmer":
-            # ✅ ИСПОЛЬЗУЕМ status_map ДЛЯ ПРЕОБРАЗОВАНИЯ
-            status_map = {
-                "active": "✅ Активна",
-                "in_progress": "🔄 В работе",
-                "completed": "✅ Завершено",
-                "canceled": "❌ Отменено",
-                "reserved": "🔒 Зарезервирована",
-                "sold": "💰 Продана",
-                "filled": "📥 Заполнен",
-                "closed": "🔒 Закрыт",
-                "cancelled": "❌ Отменён",
-                "open": "📂 Открыт",
-                "pending": "⏳ Ожидание",
-                "delivered": "🚚 Доставлен",
             }
 
-            # ✅ ИЗВЛЕКАЕМ ЧИСТЫЙ СТАТУС (без эмодзи)
-            status_with_emoji = status_map.get(search_status, search_status)
-            # Убираем эмодзи: '🔒 Зарезервирована' → 'Зарезервирована'
-            clean_status = (
-                status_with_emoji.split()[-1]
-                if " " in status_with_emoji
-                else status_with_emoji
-            )
-
-            user_batches = batches.get(user_id, [])
             logging.info(f"   📦 Батчей у фермера: {len(user_batches)}")
-            logging.info(f"   🔍 Ищу статус: '{search_status}' → '{clean_status}'")
 
             for idx, batch in enumerate(user_batches):
                 batch_status = batch.get("status", "Активна")
@@ -27349,11 +20358,6 @@ async def filter_deals_by_status(callback: types.CallbackQuery):
                     f"      Батч #{idx}: '{batch.get('culture', 'N/A')}' → статус='{batch_status}'"
                 )
 
-                # ✅ ИСПРАВЛЕНО: Сравниваем с чистым статусом
-                if (
-                    batch_status == clean_status
-                    or batch_status.lower() == search_status
-                ):
                     filtered_items.append(
                         {
                             "index": idx,
@@ -27361,10 +20365,8 @@ async def filter_deals_by_status(callback: types.CallbackQuery):
                             "volume": batch.get("volume", 0),
                             "price": batch.get("price", 0),
                             "status": batch_status,
-                            "id": batch.get("id", f"batch_{idx}"),
                         }
                     )
-                    logging.info(f"         ✅ ДОБАВЛЕНА в результаты!")
 
             logging.info(
                 f"   ✅ Всего найдено батчей: {len(filtered_items)} из {len(user_batches)}"
@@ -27382,29 +20384,21 @@ async def filter_deals_by_status(callback: types.CallbackQuery):
                     continue
 
                 if (
-                    pull.get("creator_id") == user_id
-                    or pull.get("exporter_id") == user_id
-                ):
                     pull_count += 1
-                    pull_status = pull.get("status", "Открыт")
 
                     logging.info(
                         f"      Пул #{pull.get('id')}: '{pull.get('culture', 'N/A')}' → статус='{pull_status}'"
                     )
 
-                    if search_status == "all" or pull_status.lower() == search_status:
                         filtered_items.append(
                             {
                                 "index": pull.get("id"),
                                 "culture": pull.get("culture", "N/A"),
                                 "volume": pull.get("current_volume", 0),
                                 "target": pull.get("target_volume", 0),
-                                "price": pull.get("price_per_ton", 0),
                                 "status": pull_status,
-                                "id": pull.get("id"),
                             }
                         )
-                        logging.info(f"         ✅ ДОБАВЛЕН в результаты!")
 
             logging.info(
                 f"   ✅ Всего найдено пулов: {len(filtered_items)} из {pull_count}"
@@ -27413,30 +20407,17 @@ async def filter_deals_by_status(callback: types.CallbackQuery):
         # ════════════════════════════════════════════════════════════════════
         # 🚚 ЛОГИСТ - ДОСТАВКИ
         # ════════════════════════════════════════════════════════════════════
-        elif role == "logist":
             ship_count = 0
-            for shipping_id, shipping in shipping_requests.items():
-                if shipping.get("logist_id") == user_id:
                     ship_count += 1
-                    ship_status = shipping.get("status", "Открыт")
 
                     logging.info(
-                        f"      Доставка #{shipping.get('id')}: {shipping.get('from')}→{shipping.get('to')} → статус='{ship_status}'"
                     )
 
-                    if ship_status.lower() == search_status:
                         filtered_items.append(
                             {
-                                "index": shipping.get("id"),
-                                "from": shipping.get("from", "N/A"),
-                                "to": shipping.get("to", "N/A"),
-                                "volume": shipping.get("volume", 0),
-                                "price": shipping.get("price", 0),
                                 "status": ship_status,
-                                "id": shipping.get("id"),
                             }
                         )
-                        logging.info(f"         ✅ ДОБАВЛЕНА в результаты!")
 
             logging.info(
                 f"   ✅ Всего найдено доставок: {len(filtered_items)} из {ship_count}"
@@ -27445,10 +20426,8 @@ async def filter_deals_by_status(callback: types.CallbackQuery):
         # ════════════════════════════════════════════════════════════════════
         # ✈️ ЭКСПЕДИТОР - МАРШРУТЫ
         # ════════════════════════════════════════════════════════════════════
-        elif role == "expeditor":
             offer_count = 0
             for offer_id, offer in expeditor_offers.items():
-                if offer.get("expeditor_id") == user_id:
                     offer_count += 1
                     offer_status = offer.get("status", "Открыт")
 
@@ -27456,22 +20435,16 @@ async def filter_deals_by_status(callback: types.CallbackQuery):
                         f"      Маршрут #{offer.get('id')}: {offer.get('from_port')}→{offer.get('to_port')} → статус='{offer_status}'"
                     )
 
-                    if offer_status.lower() == search_status:
                         filtered_items.append(
                             {
                                 "index": offer.get("id"),
-                                "from": offer.get("from_port", "N/A"),
-                                "to": offer.get("to_port", "N/A"),
                                 "volume": offer.get("max_volume", 0),
                                 "price": offer.get("price", 0),
                                 "status": offer_status,
-                                "id": offer.get("id"),
-                            }
-                        )
-                        logging.info(f"         ✅ ДОБАВЛЕН в результаты!")
+                    }
+                )
 
             logging.info(
-                f"   ✅ Всего найдено маршрутов: {len(filtered_items)} из {offer_count}"
             )
 
         # ════════════════════════════════════════════════════════════════════
@@ -27482,7 +20455,6 @@ async def filter_deals_by_status(callback: types.CallbackQuery):
             "filled": "ЗАПОЛНЕННЫЕ",
             "closed": "ЗАКРЫТЫЕ",
             "cancelled": "ОТМЕНЕННЫЕ",
-            "canceled": "ОТМЕНЕННЫЕ",
             "completed": "ЗАВЕРШЕННЫЕ",
         }
 
@@ -27502,7 +20474,6 @@ async def filter_deals_by_status(callback: types.CallbackQuery):
 
         if filtered_items:
             for item in filtered_items:
-                callback_data = f"deal_detail:{role}:{item['id']}"
 
                 if role == "farmer":
                     culture = item.get("culture", "").lower()
@@ -27515,9 +20486,7 @@ async def filter_deals_by_status(callback: types.CallbackQuery):
                     progress = 0
                     if item["target"] > 0:
                         progress = (item["volume"] / item["target"]) * 100
-                    button_text = f"{emoji} {item['culture']} ({progress:.0f}%)"
 
-                elif role in ["logist", "expeditor"]:
                     button_text = f"🚚 {item['from']} → {item['to']}"
 
                 keyboard.add(
@@ -27534,277 +20503,12 @@ async def filter_deals_by_status(callback: types.CallbackQuery):
         await callback.answer(f"❌ Ошибка: {str(e)[:50]}", show_alert=True)
 
 
-@dp.callback_query_handler(lambda q: q.data.startswith("deals_status:"))
-async def back_to_deals_status_handler(callback: types.CallbackQuery):
-    try:
-        user_id = callback.from_user.id
-        parts = callback.data.split(":")
-        role = parts[1]
-        status = parts[2]
-
-        logging.info(f"📊 Фильтр: role={role}, status={status}, user_id={user_id}")
-
-        text = ""
-        keyboard = InlineKeyboardMarkup()
-
-        # ФЕРМЕР - МОИ ПАРТИИ
-        if role == "farmer":
-            user_batches = batches.get(user_id, [])
-
-            if status == "all":
-                deals = user_batches
-            else:
-                deals = [b for b in user_batches if b.get("status") == status]
-
-            logging.info(f"   ✅ Найдено партий: {len(deals)}")
-
-            if not deals:
-                text = f"📭 <b>Нет партий</b>\n\n"
-                text += "📝 Создайте новую партию!"
-                keyboard.add(
-                    InlineKeyboardButton(
-                        "➕ Создать партию", callback_data="create_batch"
-                    )
-                )
-            else:
-                title = (
-                    f"<b>🌾 Мои Партии ({len(deals)})</b>"
-                    if status == "all"
-                    else f"<b>🌾 Партии - {status.upper()} ({len(deals)})</b>"
-                )
-                text = title + "\n\n"
-                for idx, batch in enumerate(deals):
-                    culture = batch.get("culture", "Не указана")
-                    volume = batch.get("volume", 0)
-                    batch_status = batch.get("status", "неизвестно")
-                    text += (
-                        f"{idx + 1}. <b>{culture}</b>\n"
-                        f"   📦 {volume} т | 🔵 {batch_status}\n\n"
-                    )
-
-                for idx, batch in enumerate(deals):
-                    keyboard.add(
-                        InlineKeyboardButton(
-                            f"📦 {batch.get('culture', 'Партия')} - {batch.get('volume', 0)}т",
-                            callback_data=f"deal_detail:farmer:{idx}:{status}",
-                        )
-                    )
-
-        # ЭКСПОРТЕР - МОИ ПУЛЫ
-        elif role == "exporter":
-            pulls_dict = pulls.get("pulls", {})
-            user_pulls = [
-                p for p in pulls_dict.values() if p.get("creator_id") == user_id
-            ]
-
-            if status == "all":
-                deals = user_pulls
-            else:
-                deals = [p for p in user_pulls if p.get("status") == status]
-
-            logging.info(f"   ✅ Найдено пулов: {len(deals)}")
-
-            if not deals:
-                text = f"📭 <b>Нет пулов</b>\n\n"
-                text += "📝 Создайте новый пулл!"
-                keyboard.add(
-                    InlineKeyboardButton("➕ Создать пулл", callback_data="create_pull")
-                )
-            else:
-                title = (
-                    f"<b>📤 Мои Пулы ({len(deals)})</b>"
-                    if status == "all"
-                    else f"<b>📤 Пулы - {status.upper()} ({len(deals)})</b>"
-                )
-                text = title + "\n\n"
-                for pull in deals:
-                    culture = pull.get("culture", "Не указана")
-                    current_vol = pull.get("current_volume", 0)
-                    target_vol = pull.get("target_volume", 0)
-                    pull_status = pull.get("status", "неизвестно")
-                    farmer_count = len(pull.get("farmer_ids", []))
-
-                    text += (
-                        f"<b>🌾 {culture}</b>\n"
-                        f"📦 {current_vol}/{target_vol} т | 👥 {farmer_count} фермеров\n"
-                        f"🔵 {pull_status}\n\n"
-                    )
-
-                for pull in deals:
-                    pull_id = pull.get("id")
-                    keyboard.add(
-                        InlineKeyboardButton(
-                            f"📤 {pull.get('culture', 'Пул')} - {pull.get('current_volume', 0)}/{pull.get('target_volume', 0)}т",
-                            callback_data=f"deal_detail:exporter:{pull_id}:{status}",
-                        )
-                    )
-
-        # ЛОГИСТ - МОИ ДОСТАВКИ
-        elif role == "logist":
-            user_shippings = [
-                s for s in shipping_requests.values() if s.get("logist_id") == user_id
-            ]
-
-            if status == "all":
-                deals = user_shippings
-            else:
-                deals = [s for s in user_shippings if s.get("status") == status]
-
-            logging.info(f"   ✅ Найдено доставок: {len(deals)}")
-
-            if not deals:
-                text = f"📭 <b>Нет доставок</b>\n\n"
-                text += "📝 Ожидайте новые заявки!"
-                keyboard.add(
-                    InlineKeyboardButton(
-                        "🔄 Обновить", callback_data="view_shipping_requests"
-                    )
-                )
-            else:
-                title = (
-                    f"<b>🚚 Мои Доставки ({len(deals)})</b>"
-                    if status == "all"
-                    else f"<b>🚚 Доставки - {status.upper()} ({len(deals)})</b>"
-                )
-                text = title + "\n\n"
-                for shipping in deals:
-                    from_city = shipping.get("from", "—")
-                    to_city = shipping.get("to", "—")
-                    volume = shipping.get("volume", 0)
-                    ship_status = shipping.get("status", "неизвестно")
-
-                    text += (
-                        f"<b>📤 {from_city} → 📥 {to_city}</b>\n"
-                        f"📦 {volume} т | 🔵 {ship_status}\n\n"
-                    )
-
-                for shipping in deals:
-                    shipping_id = shipping.get("id")
-                    keyboard.add(
-                        InlineKeyboardButton(
-                            f"🚚 {shipping.get('from', 'От')} → {shipping.get('to', 'В')}",
-                            callback_data=f"deal_detail:logist:{shipping_id}:{status}",
-                        )
-                    )
-
-        # ЭКСПЕДИТОР - МОИ МАРШРУТЫ
-        elif role == "expeditor":
-            user_offers = [
-                o for o in expeditor_offers.values() if o.get("expeditor_id") == user_id
-            ]
-
-            if status == "all":
-                deals = user_offers
-            else:
-                deals = [o for o in user_offers if o.get("status") == status]
-
-            logging.info(f"   ✅ Найдено маршрутов: {len(deals)}")
-
-            if not deals:
-                text = f"📭 <b>Нет маршрутов</b>\n\n"
-                text += "📝 Ожидайте новые предложения!"
-                keyboard.add(
-                    InlineKeyboardButton(
-                        "🔄 Обновить", callback_data="view_expeditor_offers"
-                    )
-                )
-            else:
-                title = (
-                    f"<b>✈️ Мои Маршруты ({len(deals)})</b>"
-                    if status == "all"
-                    else f"<b>✈️ Маршруты - {status.upper()} ({len(deals)})</b>"
-                )
-                text = title + "\n\n"
-                for offer in deals:
-                    from_port = offer.get("from_port", "—")
-                    to_port = offer.get("to_port", "—")
-                    max_vol = offer.get("max_volume", 0)
-                    offer_status = offer.get("status", "неизвестно")
-
-                    text += (
-                        f"<b>⛴️ {from_port} → 🏝️ {to_port}</b>\n"
-                        f"📦 {max_vol} т | 🔵 {offer_status}\n\n"
-                    )
-
-                for offer in deals:
-                    offer_id = offer.get("id")
-                    keyboard.add(
-                        InlineKeyboardButton(
-                            f"✈️ {offer.get('from_port', 'От')} → {offer.get('to_port', 'В')}",
-                            callback_data=f"deal_detail:expeditor:{offer_id}:{status}",
-                        )
-                    )
-
-        else:
-            text = "❌ <b>Неизвестная роль!</b>"
-
-        # Кнопка "В главное меню"
-        keyboard.add(
-            InlineKeyboardButton("📊 Главное меню", callback_data="back_to_main")
-        )
-
-        try:
-            await callback.message.edit_text(
-                text, reply_markup=keyboard, parse_mode="HTML"
-            )
-            logging.info(f"   ✅ Список сделок показан для {role}")
-        except Exception as edit_error:
-            logging.error(f"   ❌ Ошибка edit_text: {edit_error}")
-            try:
-                await callback.message.answer(
-                    text, reply_markup=keyboard, parse_mode="HTML"
-                )
-            except Exception as answer_error:
-                logging.error(f"   ❌ Ошибка answer: {answer_error}")
-                await callback.answer("❌ Ошибка при загрузке списка", show_alert=True)
-
-    except Exception as e:
-        logging.error(f"❌ ОШИБКА в back_to_deals_status: {e}", exc_info=True)
-        try:
-            keyboard = InlineKeyboardMarkup()
-            keyboard.add(
-                InlineKeyboardButton("📊 Главное меню", callback_data="main_menu")
-            )
-            await callback.message.edit_text(
-                f"❌ <b>Ошибка при загрузке списка:</b>\n<code>{str(e)[:100]}</code>",
-                reply_markup=keyboard,
-                parse_mode="HTML",
-            )
-        except:
-            await callback.answer(
-                f"❌ Критическая ошибка: {str(e)[:50]}", show_alert=True
-            )
-
-
 # ============================================================================
 # ОБРАБОТЧИК ДЕТАЛЕЙ СДЕЛКИ - ПОЛНАЯ ИНФОРМАЦИЯ ОБО ВСЕЙ ЦЕПОЧКЕ
 # ============================================================================
 # ============================================================================
 # 🏠 ГЛАВНОЕ МЕНЮ - обработчик
 # ============================================================================
-@dp.callback_query_handler(lambda q: q.data in ("main_menu", "back_to_main"))
-async def go_main_menu(callback: types.CallbackQuery):
-    """Возврат в главное меню"""
-    await callback.answer()
-
-    user_id = callback.from_user.id
-
-    if user_id not in users:
-        await callback.answer("❌ Вы не зарегистрированы", show_alert=True)
-        return
-
-    user_role = users[user_id].get("role", "unknown").lower()
-
-    text = f"<b>📊 Главное меню</b>\n\n"
-    text += f"👤 Роль: <b>{user_role}</b>\n"
-    text += f"👤 Пользователь: {users[user_id].get('name', 'Unknown')}\n\n"
-    text += f"Выберите действие из кнопок ниже:"
-    try:
-        await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
-    except:
-        await callback.message.answer(text, reply_markup=keyboard, parse_mode="HTML")
-
-    logging.info(f"✅ Главное меню показано для {user_role}")
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -27829,8 +20533,6 @@ def get_safe_float(value, default=0):
 def get_pull_by_batch_v3(batch_id):
     """✅ ОКОНЧАТЕЛЬНАЯ ВЕРСИЯ: Поиск пула по batch_id"""
     try:
-        global pulls
-
         # Нормализуем batch_id к int
         try:
             search_batch_id = int(batch_id)
@@ -27842,12 +20544,9 @@ def get_pull_by_batch_v3(batch_id):
             f"🔍 Ищу пул для batch_id={search_batch_id} (type={type(search_batch_id).__name__})"
         )
 
-        # ✅ ГЛАВНЫЙ ИСТОЧНИК: pullparticipants
-        pullparticipants = pulls.get("pullparticipants", {})
         logging.info(f"📋 pullparticipants.keys() = {list(pullparticipants.keys())}")
 
         if not pullparticipants:
-            logging.warning(f"⚠️ pullparticipants пуста!")
             return None, None
 
         # Ищем через ВСЕ пулы
@@ -27879,7 +20578,6 @@ def get_pull_by_batch_v3(batch_id):
                 )
 
                 # ✅ КЛЮЧЕВОЕ СРАВНЕНИЕ
-                if participant_batch_id == search_batch_id:
                     logging.info(
                         f"         🎯 МАТЧ! {participant_batch_id} == {search_batch_id}"
                     )
@@ -27893,9 +20591,6 @@ def get_pull_by_batch_v3(batch_id):
                     # Пул может быть с ключом str или int
                     pull = (
                         pulls_dict.get(pull_id)
-                        or pulls_dict.get(
-                            int(pull_id) if str(pull_id).isdigit() else none
-                        )
                         or pulls_dict.get(
                             int(pull_id)
                             if isinstance(pull_id, str) and pull_id.isdigit()
@@ -27928,12 +20623,6 @@ def get_batches_by_pull(pull_id):
     """Находит все партии пула"""
     try:
         pulls_dict = pulls.get("pulls", {})
-        if isinstance(pulls_dict.get(pull_id), dict):
-            return pulls_dict[pull_id].get("batch_ids", []) or pulls_dict[pull_id].get(
-                "batches", []
-            )
-    except:
-        pass
     return []
 
 
@@ -27941,12 +20630,6 @@ def get_farmers_by_pull(pull_id):
     """Находит всех фермеров пула"""
     try:
         pulls_dict = pulls.get("pulls", {})
-        if isinstance(pulls_dict.get(pull_id), dict):
-            return pulls_dict[pull_id].get("farmer_ids", []) or pulls_dict[pull_id].get(
-                "participants", []
-            )
-    except:
-        pass
     return []
 
 
@@ -27954,10 +20637,7 @@ def get_logistics_for_pull(pull_id):
     """Находит логистику для пула"""
     try:
         for logistic_id, logistic in logistics_requests.items():
-            if logistic.get("pull_id") == pull_id:
                 return logistic, logistic_id
-    except:
-        pass
     return None, None
 
 
@@ -27966,28 +20646,20 @@ def get_expeditors_data(logistics_id=None):
     expeditors_list = []
     try:
         for exp_id, expeditor in expeditor_cards.items():
-            if logistics_id is None or expeditor.get("logistics_id") == logistics_id:
                 expeditors_list.append((expeditor, exp_id))
-    except:
-        pass
     return expeditors_list
 
 
 # ════════════════════════════════════════════════════════════════════════════════════
 # ГЛАВНАЯ ФУНКЦИЯ - ДЛЯ ВСЕХ РОЛЕЙ
 # ════════════════════════════════════════════════════════════════════════════════════
-
-
 @dp.callback_query_handler(lambda q: q.data.startswith("deal_detail:"))
 async def show_deal_detail(callback: types.CallbackQuery):
     """✅ ФИНАЛЬНЫЙ ОБРАБОТЧИК: Показывает партию/пул/логистику со ВСЕМИ УЧАСТНИКАМИ"""
     await callback.answer()
 
     try:
-        global batches, pulls, users, logistics_requests, expeditor_cards
-
         parts = callback.data.split(":")
-        role = parts[1]
         item_id = parts[2]
         user_id = callback.from_user.id
 
@@ -27996,89 +20668,11 @@ async def show_deal_detail(callback: types.CallbackQuery):
         text = ""
         keyboard = InlineKeyboardMarkup()
 
-        # ════════════════════════════════════════════════════════════════════
-        # ВЛОЖЕННЫЕ ФУНКЦИИ
-        # ════════════════════════════════════════════════════════════════════
-
-        def get_safe_float(val, default=0):
-            """Безопасно конвертирует в float"""
-            try:
-                if val is None or val == "—":
-                    return default
-                return float(val)
-            except:
-                return default
-
-        def get_pull_by_batch_v3(batch_id):
-            """✅ ИСПРАВЛЕННАЯ: Получает пул по batch_id из pullparticipants"""
-            try:
-                search_batch_id = int(batch_id)
-            except (ValueError, TypeError):
-                logging.error(f"❌ Невозможно преобразовать batch_id={batch_id}")
-                return None, None
-
-            try:
-                # ✅ ГЛАВНЫЙ ИСТОЧНИК: pullparticipants
-                pullparticipants = pulls.get("pullparticipants", {})
-                logging.info(
-                    f"🔍 pullparticipants.keys() = {list(pullparticipants.keys())}"
-                )
-
-                # Ищем в pullparticipants
-                for pull_id_str, participants_list in pullparticipants.items():
-                    if not isinstance(participants_list, list):
-                        logging.warning(
-                            f"⚠️ pull_id={pull_id_str} participants НЕ список!"
-                        )
-                        continue
-
-                    for participant in participants_list:
-                        if not isinstance(participant, dict):
-                            continue
-
-                        participant_batch_id = participant.get("batch_id")
-                        logging.info(
-                            f"   👤 Проверяю batch_id={participant_batch_id} == {search_batch_id}"
-                        )
-
-                        if participant_batch_id == search_batch_id:
-                            logging.info(f"   ✅ МАТЧ НАЙДЕН в pull_id={pull_id_str}")
-
-                            # Достаём сам пул
-                            pulls_dict = pulls.get("pulls", {})
-                            pull = pulls_dict.get(pull_id_str) or pulls_dict.get(
-                                int(pull_id_str)
-                                if isinstance(pull_id_str, str)
-                                and pull_id_str.isdigit()
-                                else None
-                            )
-
-                            if pull:
-                                logging.info(
-                                    f"   ✅✅ ПУЛА НАЙДЕН! pull_id={pull_id_str}"
-                                )
-                                return pull, str(pull_id_str)
-                            else:
-                                logging.warning(f"   ⚠️ Пул НЕ найден в pulls['pulls']!")
-
-                logging.warning(
-                    f"❌ batch_id={search_batch_id} не найдена НИ В ОДНОМ пуле"
-                )
-                return None, None
-
-            except Exception as e:
-                logging.error(f"❌ get_pull_by_batch_v3 ошибка: {e}", exc_info=True)
-                return None, None
-
         def get_batch_participants_in_pull(pull_id):
             """Получает всех фермеров и их партии в пуле"""
             try:
-                pullparticipants = pulls.get("pullparticipants", {})
-                participants = pullparticipants.get(str(pull_id), [])
-
                 if isinstance(participants, list):
                     return participants
-
                 return []
             except Exception as e:
                 logging.error(f"❌ get_batch_participants_in_pull: {e}")
@@ -28089,10 +20683,7 @@ async def show_deal_detail(callback: types.CallbackQuery):
             try:
                 for logistic_id, logistic in logistics_requests.items():
                     pull_ref = logistic.get("pull_id")
-                    if pull_ref == pull_id or str(pull_ref) == str(pull_id):
                         return logistic, logistic_id
-            except:
-                pass
             return None, None
 
         def get_expeditors_by_logistics(logistics_id):
@@ -28100,27 +20691,18 @@ async def show_deal_detail(callback: types.CallbackQuery):
             expeditors_list = []
             try:
                 for exp_id, expeditor in expeditor_cards.items():
-                    if str(expeditor.get("logistics_id")) == str(logistics_id):
                         expeditors_list.append((expeditor, exp_id))
-            except:
-                pass
             return expeditors_list
 
         # ════════════════════════════════════════════════════════════════════
         # 👨‍🌾 ФЕРМЕР - ПАРТИЯ + ПУЛ + УЧАСТНИКИ
         # ════════════════════════════════════════════════════════════════════
         if role == "farmer":
-            user_batches = batches.get(user_id, [])
             try:
-                batch_id = int(item_id)  # ✅ item_id теперь это ID партии
 
-                # ✅ Ищем партию по ID, а не по индексу
                 batch = None
-                batch_idx = None
                 for idx, b in enumerate(user_batches):
-                    if b.get("id") == batch_id:
                         batch = b
-                        batch_idx = idx
                         break
 
                 if not batch:
@@ -28128,9 +20710,6 @@ async def show_deal_detail(callback: types.CallbackQuery):
                 else:
                     logging.info(f"📊 Фермер просматривает: batch_id={batch_id}")
 
-                    # ═══════════════════════════════════════════════════════
-                    # ПАРТИЯ
-                    # ═══════════════════════════════════════════════════════
                     volume = get_safe_float(batch.get("volume"), 0)
                     price_per_ton = get_safe_float(
                         batch.get("price"), 0
@@ -28145,9 +20724,6 @@ async def show_deal_detail(callback: types.CallbackQuery):
                     if impurity and impurity != "—":
                         impurity = f"{get_safe_float(impurity):.1f}%"
 
-                    text = f"<b>📋 ПАРТИЯ И ВСЕ УЧАСТНИКИ</b>\n\n"
-                    text += f"<b>🌾 ПАРТИЯ</b>\n"
-                    text += f"━━━━━━━━━━━━━━━━━━━━━━\n"
                     text += (
                         f"🌱 Культура: <b>{batch.get('culture', 'Не указана')}</b>\n"
                     )
@@ -28159,113 +20735,49 @@ async def show_deal_detail(callback: types.CallbackQuery):
                     text += f"⭐ Класс: <b>{batch.get('quality_class', '—')}</b>\n"
                     text += f"📅 Дата: <b>{batch.get('created_at', 'N/A')}</b>\n"
 
-                    # ФАЙЛЫ
                     files = batch.get("files", [])
                     if files:
                         text += f"\n<b>📄 ФАЙЛЫ ({len(files)})</b>\n"
-                        text += f"━━━━━━━━━━━━━━━━━━━━━━\n"
                         for f_item in files:
                             size_kb = f_item.get("size", 0) / 1024
                             text += (
                                 f"📎 {f_item.get('name', 'Файл')} ({size_kb:.1f} KB)\n"
                             )
                     else:
-                        text += f"\n<b>📄 ФАЙЛЫ</b>\n"
-                        text += f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                        text += f"❌ Нет файлов\n"
 
-                    # РАСЧЁТ СТОИМОСТИ
-                    base_cost = volume * price_per_ton
-                    quality_multiplier = 1.0
-                    quality_class = batch.get("quality_class", "")
-                    if "1" in quality_class or "2" in quality_class:
-                        quality_multiplier = 1.1
-                    elif "4" in quality_class or "5" in quality_class:
-                        quality_multiplier = 0.9
 
-                    humidity_val = get_safe_float(batch.get("humidity"), 13)
-                    humidity_cost = 0
-                    if humidity_val < 10 or humidity_val > 15:
-                        humidity_cost = base_cost * 0.05
-
-                    impurity_val = get_safe_float(batch.get("impurity"), 1)
-                    impurity_cost = 0
-                    if impurity_val > 2:
-                        impurity_cost = base_cost * 0.1
-
-                    storage_cost = base_cost * 0.02
-                    total_cost = (
-                        (base_cost * quality_multiplier)
-                        - humidity_cost
-                        - impurity_cost
-                        + storage_cost
-                    )
-
-                    text += f"\n<b>💰 РАСЧЁТ СТОИМОСТИ</b>\n"
-                    text += f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                    text += f"Базовая: <b>{base_cost:,.0f} ₽</b>\n"
-                    text += f"×{quality_multiplier} (качество): <b>{base_cost * quality_multiplier:,.0f} ₽</b>\n"
-                    text += f"–{humidity_cost:,.0f} (влажность)\n"
-                    text += f"–{impurity_cost:,.0f} (примеси)\n"
-                    text += f"+{storage_cost:,.0f} (хранение)\n"
-                    text += f"<b>ИТОГО: {total_cost:,.0f} ₽</b>\n"
-
-                    # ═══════════════════════════════════════════════════════
-                    # ФЕРМЕР
-                    # ═══════════════════════════════════════════════════════
-                    text += f"\n<b>👨‍🌾 ВЫ (ФЕРМЕР)</b>\n"
-                    text += f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                    farmer = users.get(user_id, {})
                     text += f"👤 Имя: <b>{farmer.get('name', 'Не указано')}</b>\n"
                     text += f"☎️ Телефон: <b>{farmer.get('phone', '—')}</b>\n"
                     text += f"📍 Регион: <b>{farmer.get('region', '—')}</b>\n"
 
-                    # ═══════════════════════════════════════════════════════
-                    # ✅ ПОИСК ПУЛ ПО ПАРТИИ
-                    # ═══════════════════════════════════════════════════════
                     pull, pull_id = get_pull_by_batch_v3(batch_id)
                     if pull and pull_id:
-                        logging.info(f"✅ Пул найден для партии!")
 
-                        # ПУЛ
-                        text += f"\n<b>📤 ПУЛ (#{pull_id})</b>\n"
-                        text += f"━━━━━━━━━━━━━━━━━━━━━━\n"
                         text += f"🌾 Культура: <b>{pull.get('culture', '—')}</b>\n"
-                        text += f"📦 Объём: <b>{pull.get('current_volume', 0):,.1f}/{pull.get('target_volume', 0):,.1f} т</b>\n"
                         text += f"🏗️ Порт: <b>{pull.get('port', '—')}</b>\n"
                         text += (
                             f"💰 Цена/т: <b>{pull.get('price_per_ton', 0):,.1f} ₽</b>\n"
                         )
 
-                        # ЭКСПОРТЕР
                         exporter_id = pull.get("exporter_id") or pull.get("creator_id")
                         if exporter_id and exporter_id in users:
-                            exporter = users[exporter_id]
-                            text += f"\n<b>📤 ЭКСПОРТЕР</b>\n"
-                            text += f"━━━━━━━━━━━━━━━━━━━━━━\n"
                             text += (
                                 f"👤 Имя: <b>{exporter.get('name', 'Не указано')}</b>\n"
                             )
                             text += f"☎️ Телефон: <b>{exporter.get('phone', '—')}</b>\n"
                             text += f"📍 Регион: <b>{exporter.get('region', '—')}</b>\n"
 
-                        # ВСЕ ФЕРМЕРЫ В ПУЛЕ
                         participants = get_batch_participants_in_pull(pull_id)
                         if participants:
                             text += (
                                 f"\n<b>👨‍🌾 ФЕРМЕРЫ В ПУЛЕ ({len(participants)})</b>\n"
                             )
-                            text += f"━━━━━━━━━━━━━━━━━━━━━━\n"
                             for idx_p, p in enumerate(participants, 1):
                                 text += f"{idx_p}. <b>{p.get('farmer_name', 'Unknown')}</b>\n"
                                 text += f"   📦 {p.get('volume', 0):,.1f} т\n"
 
-                        # ЛОГИСТ
                         logistics, logistics_id = get_logistics_by_pull(pull_id)
                         if logistics and logistics.get("logist_id") in users:
-                            logist = users[logistics["logist_id"]]
-                            text += f"\n<b>🚚 ЛОГИСТ</b>\n"
-                            text += f"━━━━━━━━━━━━━━━━━━━━━━\n"
                             text += (
                                 f"👤 Имя: <b>{logist.get('name', 'Не указано')}</b>\n"
                             )
@@ -28277,26 +20789,22 @@ async def show_deal_detail(callback: types.CallbackQuery):
                                 f"📥 Куда: <b>{logistics.get('route_to', '—')}</b>\n"
                             )
 
-                            # ЭКСПЕДИТОРЫ
                             expeditors_list = get_expeditors_by_logistics(logistics_id)
                             if expeditors_list:
                                 text += (
                                     f"\n<b>✈️ ЭКСПЕДИТОРЫ ({len(expeditors_list)})</b>\n"
                                 )
-                                text += f"━━━━━━━━━━━━━━━━━━━━━━\n"
                                 for idx_exp, (expeditor, exp_id) in enumerate(
                                     expeditors_list, 1
                                 ):
                                     exp_user_id = expeditor.get("user_id")
                                     if exp_user_id and exp_user_id in users:
-                                        expeditor_user = users[exp_user_id]
                                         text += f"{idx_exp}. <b>{expeditor_user.get('name', 'Не указано')}</b>\n"
                                         text += (
                                             f"   ☎️ {expeditor_user.get('phone', '—')}\n"
                                         )
                                         text += f"   🚢 {expeditor.get('vehicle_type', '—')}\n"
-                    else:
-                        text += f"\n<b>❌ Партия не добавлена в пул</b>\n"
+                        else:
 
             except (ValueError, IndexError) as e:
                 logging.error(f"❌ Ошибка фермер: {e}")
@@ -28315,94 +20823,62 @@ async def show_deal_detail(callback: types.CallbackQuery):
 
                 if not pull:
                     text = "❌ <b>Пул не найден</b>"
-                else:
-                    target_volume = get_safe_float(pull.get("target_volume"), 0)
-                    current_volume = get_safe_float(pull.get("current_volume"), 0)
-                    price_per_ton = get_safe_float(
-                        pull.get("price_per_ton"), 0
-                    ) or get_safe_float(pull.get("price"), 0)
-                    progress = (
-                        (current_volume / target_volume * 100)
-                        if target_volume > 0
-                        else 0
-                    )
-                    total_price = current_volume * price_per_ton
-
-                    # ПУЛ
-                    text = f"<b>📋 ПУЛ И ВСЕ УЧАСТНИКИ</b>\n\n"
-                    text += f"<b>📤 ПУЛ (#{pull_id})</b>\n"
-                    text += f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                    text += f"🌾 Культура: <b>{pull.get('culture', 'Не указана')}</b>\n"
-                    text += f"🎯 Объём: <b>{current_volume:,.1f}/{target_volume:,.1f} т ({progress:.0f}%)</b>\n"
-                    text += f"💰 Цена/т: <b>{price_per_ton:,.1f} ₽</b>\n"
-                    text += f"💵 Сумма: <b>{total_price:,.0f} ₽</b>\n"
-                    text += f"🏗️ Порт: <b>{pull.get('port', 'Не указан')}</b>\n"
-
-                    # ЭКСПОРТЕР
-                    exporter_id = pull.get("exporter_id") or pull.get("creator_id")
-                    exporter = users.get(exporter_id, {})
-
-                    text += f"\n<b>📤 ВЫ (ЭКСПОРТЕР)</b>\n"
-                    text += f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                    text += f"👤 Имя: <b>{exporter.get('name', 'Не указано')}</b>\n"
-                    text += f"☎️ Телефон: <b>{exporter.get('phone', '—')}</b>\n"
-                    text += f"📍 Регион: <b>{exporter.get('region', '—')}</b>\n"
-
-                    # ВСЕ ФЕРМЕРЫ И ИХ ПАРТИИ
-                    participants = get_batch_participants_in_pull(pull_id)
-                    if participants:
-                        text += (
-                            f"\n<b>👨‍🌾 ФЕРМЕРЫ И ИХ ПАРТИИ ({len(participants)})</b>\n"
+                    else:
+                        target_volume = get_safe_float(pull.get("target_volume"), 0)
+                        current_volume = get_safe_float(pull.get("current_volume"), 0)
+                        price_per_ton = get_safe_float(
+                            pull.get("price_per_ton"), 0
+                        ) or get_safe_float(pull.get("price"), 0)
+                        progress = (
+                            (current_volume / target_volume * 100)
+                            if target_volume > 0
+                            else 0
                         )
-                        text += f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                        for idx_p, p in enumerate(participants, 1):
-                            farmer_id = p.get("farmer_id")
-                            farmer_name = p.get("farmer_name", "Unknown")
-                            volume = p.get("volume", 0)
+                        total_price = current_volume * price_per_ton
 
-                            text += f"{idx_p}. <b>{farmer_name}</b>\n"
-                            text += f"   📦 Партия: {volume:,.1f} т\n"
-                            text += f"   ⭐ Класс: {p.get('quality_class', '—')}\n"
+                        text += f"💰 Цена/т: <b>{price_per_ton:,.1f} ₽</b>\n"
+                        text += f"💵 Сумма: <b>{total_price:,.0f} ₽</b>\n"
+                        text += f"🏗️ Порт: <b>{pull.get('port', 'Не указан')}</b>\n"
 
-                            if farmer_id and farmer_id in users:
-                                farmer = users[farmer_id]
-                                text += f"   ☎️ {farmer.get('phone', '—')}\n"
-                    else:
-                        text += f"\n<b>👨‍🌾 ФЕРМЕРЫ</b>\n"
-                        text += f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                        text += f"❌ Фермеры не добавлены\n"
+                        exporter_id = pull.get("exporter_id") or pull.get("creator_id")
 
-                    # ЛОГИСТ
-                    logistics, logistics_id = get_logistics_by_pull(pull_id)
-                    if logistics and logistics.get("logist_id") in users:
-                        logist = users[logistics["logist_id"]]
-                        text += f"\n<b>🚚 ЛОГИСТ</b>\n"
-                        text += f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                        text += f"👤 Имя: <b>{logist.get('name', 'Не указано')}</b>\n"
-                        text += f"☎️ Телефон: <b>{logist.get('phone', '—')}</b>\n"
-                        text += f"📤 От: <b>{logistics.get('route_from', '—')}</b>\n"
-                        text += f"📥 Куда: <b>{logistics.get('route_to', '—')}</b>\n"
+                        text += f"☎️ Телефон: <b>{exporter.get('phone', '—')}</b>\n"
+                        text += f"📍 Регион: <b>{exporter.get('region', '—')}</b>\n"
 
-                        # ЭКСПЕДИТОРЫ
-                        expeditors_list = get_expeditors_by_logistics(logistics_id)
-                        if expeditors_list:
-                            text += f"\n<b>✈️ ЭКСПЕДИТОРЫ ({len(expeditors_list)})</b>\n"
-                            text += f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                            for idx_e, (expeditor, exp_id) in enumerate(
-                                expeditors_list, 1
-                            ):
-                                exp_user_id = expeditor.get("user_id")
-                                if exp_user_id and exp_user_id in users:
-                                    exp_user = users[exp_user_id]
-                                    text += f"{idx_e}. <b>{exp_user.get('name', 'Не указано')}</b>\n"
-                                    text += f"   ☎️ {exp_user.get('phone', '—')}\n"
-                                    text += (
-                                        f"   🚢 {expeditor.get('vehicle_type', '—')}\n"
-                                    )
-                    else:
-                        text += f"\n<b>🚚 ЛОГИСТ</b>\n"
-                        text += f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                        text += f"❌ Логист не назначен\n"
+                        participants = get_batch_participants_in_pull(pull_id)
+                        if participants:
+                            text += (
+                                f"\n<b>👨‍🌾 ФЕРМЕРЫ И ИХ ПАРТИИ ({len(participants)})</b>\n"
+                            )
+                            for idx_p, p in enumerate(participants, 1):
+                                farmer_id = p.get("farmer_id")
+                                farmer_name = p.get("farmer_name", "Unknown")
+                                volume = p.get("volume", 0)
+
+                                text += f"{idx_p}. <b>{farmer_name}</b>\n"
+                                text += f"   📦 Партия: {volume:,.1f} т\n"
+                                text += f"   ⭐ Класс: {p.get('quality_class', '—')}\n"
+
+                                if farmer_id and farmer_id in users:
+                                    text += f"   ☎️ {farmer.get('phone', '—')}\n"
+                        else:
+
+                        logistics, logistics_id = get_logistics_by_pull(pull_id)
+                        if logistics and logistics.get("logist_id") in users:
+                            text += f"☎️ Телефон: <b>{logist.get('phone', '—')}</b>\n"
+
+                            expeditors_list = get_expeditors_by_logistics(logistics_id)
+                            if expeditors_list:
+                                for idx_e, (expeditor, exp_id) in enumerate(
+                                    expeditors_list, 1
+                                ):
+                                    exp_user_id = expeditor.get("user_id")
+                                    if exp_user_id and exp_user_id in users:
+                                        text += f"{idx_e}. <b>{exp_user.get('name', 'Не указано')}</b>\n"
+                                        text += (
+                                            f"   🚢 {expeditor.get('vehicle_type', '—')}\n"
+                                        )
+                        else:
 
             except (ValueError, KeyError) as e:
                 logging.error(f"❌ Ошибка exporter: {e}")
@@ -28411,23 +20887,18 @@ async def show_deal_detail(callback: types.CallbackQuery):
         else:
             text = "❌ <b>Неизвестная роль!</b>"
 
-        # ✅ КНОПКА НАЗАД
         keyboard.add(
-            InlineKeyboardButton("⬅️ Назад", callback_data=f"deals_status:{role}:all")
-        )
+            )
         try:
             await callback.message.edit_text(
                 text, reply_markup=keyboard, parse_mode="HTML"
             )
-            logging.info(f"   ✅ Детали показаны успешно")
         except MessageNotModified:
             pass
-        except:
             try:
                 await callback.message.answer(
                     text, reply_markup=keyboard, parse_mode="HTML"
                 )
-            except:
                 await callback.answer("❌ Ошибка при загрузке", show_alert=True)
 
     except Exception as e:
@@ -28440,15 +20911,12 @@ async def show_deal_detail(callback: types.CallbackQuery):
                 reply_markup=keyboard,
                 parse_mode="HTML",
             )
-        except:
             await callback.answer(f"❌ {str(e)[:50]}", show_alert=True)
 
 
 # ============================================================================
 # СМЕНА СТАТУСОВ: ФЕРМЕР
 # ============================================================================
-
-
 @dp.callback_query_handler(lambda q: q.data.startswith("change_farmer_status:"))
 async def change_farmer_batch_status(callback: types.CallbackQuery):
     """✅ Фермер меняет статус партии"""
@@ -28459,27 +20927,16 @@ async def change_farmer_batch_status(callback: types.CallbackQuery):
         new_status = parts[2]
         user_id = callback.from_user.id
 
-        user_batches = batches.get(user_id, [])
 
         try:
-            batch_idx = int(deal_id)
-            if batch_idx >= len(user_batches):
-                await callback.answer("❌ Батч не найден", show_alert=True)
-                return
-
-            batch = user_batches[batch_idx]
-        except (ValueError, IndexError):
-            await callback.answer("❌ Ошибка ID батча", show_alert=True)
+            await callback.answer("❌ Батч не найден", show_alert=True)
             return
 
-        old_status = batch.get("status", "active")
 
         valid = {
-            "active": ["in_progress", "canceled"],
             "in_progress": ["completed", "active"],
             "completed": [],
             "canceled": ["active"],
-            None: ["in_progress"],
         }
 
         if new_status not in valid.get(old_status, []):
@@ -28499,8 +20956,6 @@ async def change_farmer_batch_status(callback: types.CallbackQuery):
         )
 
         await callback.message.edit_text(
-            f"✅ <b>ПАРТИЯ ОБНОВЛЕНА</b>\n\n"
-            f"🌾 {batch.get('crop', '?')}\n"
             f"📦 {batch.get('volume', 0)}т\n"
             f"⏱️ {old_status} → <b>{new_status}</b>",
             parse_mode="HTML",
@@ -28517,60 +20972,11 @@ async def change_farmer_batch_status(callback: types.CallbackQuery):
 
 @dp.callback_query_handler(lambda q: q.data.startswith("change_exporter_status:"))
 async def change_exporter_pool_status(callback: types.CallbackQuery):
-    """✅ Экспортер меняет статус пула"""
-    await callback.answer()
     try:
         parts = callback.data.split(":")
-        pool_id = parts[1]
-        new_status = parts[2]
-        user_id = callback.from_user.id
-
-        # ✅ ИСПРАВЛЕНО: Получаем пулы из правильного места
-        all_pulls = pulls.get("pulls", {})
-        pool = (
-            all_pulls.get(pool_id)
-            or all_pulls.get(str(pool_id))
-            or all_pulls.get(int(pool_id) if str(pool_id).isdigit() else None)
-        )
-
-        if not pool or pool.get("exporter_id") != user_id:
-            await callback.answer("❌ Пул не найден", show_alert=True)
+            return
             return
 
-        old_status = pool.get("status", "open")
-
-        valid = {
-            "open": ["collecting"],
-            "collecting": ["filled", "open"],
-            "filled": ["shipped", "collecting"],
-            "shipped": ["completed"],
-            "active": ["collecting"],
-            None: ["collecting"],
-        }
-
-        if new_status not in valid.get(old_status, []):
-            await callback.answer(
-                f"❌ Переход {old_status} → {new_status} не допущен", show_alert=True
-            )
-            return
-
-        pool["status"] = new_status
-        pool["status_changed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        pool["status_changed_by"] = user_id
-
-        save_pulls_to_pickle()
-
-        logging.info(
-            f"✅ Экспортер {user_id}: пул {pool_id} {old_status} → {new_status}"
-        )
-
-        await callback.message.edit_text(
-            f"✅ <b>ПУЛ ОБНОВЛЕН</b>\n\n"
-            f"📤 {pool.get('culture', '?')}\n"
-            f"📦 {pool.get('current_volume', 0)}/{pool.get('target_volume', 0)}т\n"
-            f"⏱️ {old_status} → <b>{new_status}</b>",
-            parse_mode="HTML",
-        )
     except Exception as e:
         logging.error(f"❌ ОШИБКА: {e}", exc_info=True)
         await callback.answer(f"❌ Ошибка: {str(e)}", show_alert=True)
@@ -28579,31 +20985,19 @@ async def change_exporter_pool_status(callback: types.CallbackQuery):
 # ============================================================================
 # СМЕНА СТАТУСОВ: ЛОГИСТ
 # ============================================================================
-
-
 @dp.callback_query_handler(lambda q: q.data.startswith("change_logist_status:"))
 async def change_logist_delivery_status(callback: types.CallbackQuery):
-    """✅ Логист меняет статус доставки"""
-    await callback.answer()
     try:
         parts = callback.data.split(":")
-        delivery_id = parts[1]
         new_status = parts[2]
         user_id = callback.from_user.id
 
-        delivery = shipping_requests.get(delivery_id)
-        if not delivery or delivery.get("logist_id") != user_id:
             await callback.answer("❌ Доставка не найдена", show_alert=True)
             return
 
-        old_status = delivery.get("status", "pending")
-
         valid = {
-            "pending": ["in_progress"],
             "in_progress": ["completed", "pending"],
             "completed": [],
-            "new": ["in_progress"],
-            None: ["in_progress"],
         }
 
         if new_status not in valid.get(old_status, []):
@@ -28616,16 +21010,11 @@ async def change_logist_delivery_status(callback: types.CallbackQuery):
         delivery["status_changed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         delivery["status_changed_by"] = user_id
 
-        save_shipping_requests_to_pickle()
 
         logging.info(
-            f"✅ Логист {user_id}: доставка {delivery_id} {old_status} → {new_status}"
         )
 
         await callback.message.edit_text(
-            f"✅ <b>ДОСТАВКА ОБНОВЛЕНА</b>\n\n"
-            f"📍 {delivery.get('from', '?')} → {delivery.get('to', '?')}\n"
-            f"📦 {delivery.get('weight', 0)}т\n"
             f"⏱️ {old_status} → <b>{new_status}</b>",
             parse_mode="HTML",
         )
@@ -28642,25 +21031,17 @@ async def change_logist_delivery_status(callback: types.CallbackQuery):
 @dp.callback_query_handler(lambda q: q.data.startswith("change_expeditor_status:"))
 async def change_expeditor_freight_status(callback: types.CallbackQuery):
     """✅ Экспедитор меняет статус маршрута + ЗАКРЫВАЕТ СДЕЛКИ"""
-    await callback.answer()
     try:
         parts = callback.data.split(":")
-        freight_id = parts[1]
         new_status = parts[2]
         user_id = callback.from_user.id
 
-        freight = expeditor_offers.get(freight_id)
-        if not freight or freight.get("expeditor_id") != user_id:
             await callback.answer("❌ Маршрут не найден", show_alert=True)
             return
 
-        old_status = freight.get("status", "active")
 
         valid = {
             "active": ["in_progress"],
-            "in_progress": ["delivered"],
-            "delivered": [],
-            None: ["in_progress"],
         }
 
         if new_status not in valid.get(old_status, []):
@@ -28669,74 +21050,33 @@ async def change_expeditor_freight_status(callback: types.CallbackQuery):
             )
             return
 
-        freight["status"] = new_status
-        freight["status_changed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        freight["status_changed_by"] = user_id
 
-        # ✅ ЕСЛИ СТАТУС "delivered" - ЗАКРЫТЬ ВСЕ СДЕЛКИ
-        if new_status == "delivered":
             logging.info(
-                f"🎉 Экспедитор {user_id}: маршрут {freight_id} ДОСТАВЛЕН - закрытие всех сделок..."
             )
 
-            # ✅ ИСПРАВЛЕНО: Закрыть все пулы со статусом shipped
-            all_pulls = pulls.get("pulls", {})
+                all_pulls = pulls.get("pulls", {})
 
-            for pull_id, pull in all_pulls.items():
-                if not isinstance(pull, dict):
-                    continue
+                                continue
 
-                if pull.get("status") == "shipped":
-                    pull["status"] = "completed"
-                    pull["completed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    logging.info(f"   ✅ Пул {pull_id} завершен")
 
-            # Закрыть все батчи через participants
-            for farmer_id, farmer_batches in batches.items():
-                for batch in farmer_batches:
-                    if batch.get("status") == "in_progress":
-                        batch["status"] = "completed"
-                        batch["completed_at"] = datetime.now().strftime(
-                            "%Y-%m-%d %H:%M:%S"
                         )
-                        logging.info(f"   ✅ Батч фермера {farmer_id} завершен")
 
-            # Закрыть все доставки со статусом in_progress
-            for delivery_id, delivery in shipping_requests.items():
-                if delivery.get("status") == "in_progress":
                     delivery["status"] = "completed"
-                    delivery["completed_at"] = datetime.now().strftime(
-                        "%Y-%m-%d %H:%M:%S"
                     )
-                    logging.info(f"   ✅ Доставка {delivery_id} завершена")
 
-            # Сохранить все изменения
-            save_expeditor_offers_to_pickle()
-            save_pulls_to_pickle()
-            save_batches_to_pickle()
-            save_shipping_requests_to_pickle()
+                save_pulls_to_pickle()
 
-            logging.info(f"🎉 ВСЕ СДЕЛКИ ЗАКРЫТЫ И СОХРАНЕНЫ!")
-
-            await callback.message.edit_text(
-                f"✅ <b>МАРШРУТ ОБНОВЛЕН</b>\n\n"
-                f"✈️ {freight.get('from_port', '?')} → {freight.get('to_port', '?')}\n"
-                f"⏱️ {old_status} → <b>{new_status}</b>\n\n"
-                f"🎉 <b>ВСЕ СДЕЛКИ ЗАВЕРШЕНЫ!</b>",
-                parse_mode="HTML",
-            )
+                await callback.message.edit_text(
+                    f"⏱️ {old_status} → <b>{new_status}</b>\n\n"
+                    parse_mode="HTML",
+                )
         else:
-            save_expeditor_offers_to_pickle()
-
-            await callback.message.edit_text(
-                f"✅ <b>МАРШРУТ ОБНОВЛЕН</b>\n\n"
-                f"✈️ {freight.get('from_port', '?')} → {freight.get('to_port', '?')}\n"
-                f"⏱️ {old_status} → <b>{new_status}</b>",
-                parse_mode="HTML",
-            )
+                await callback.message.edit_text(
+                        f"⏱️ {old_status} → <b>{new_status}</b>",
+                        parse_mode="HTML",
+                    )
 
         logging.info(
-            f"✅ Экспедитор {user_id}: маршрут {freight_id} {old_status} → {new_status}"
         )
 
     except Exception as e:
@@ -28746,9 +21086,6 @@ async def change_expeditor_freight_status(callback: types.CallbackQuery):
 
 @dp.callback_query_handler(lambda q: q.data.startswith("change_pull_status:"))
 async def change_pull_status(callback: types.CallbackQuery):
-    """Показать меню смены статуса пула"""
-    await callback.answer()
-
     try:
         parts = callback.data.split(":")
         pull_id = int(parts[1])
@@ -28762,29 +21099,22 @@ async def change_pull_status(callback: types.CallbackQuery):
             return
 
         creator_id = pull.get("creator_id") or pull.get("exporter_id")
-        if creator_id != user_id:
             await callback.answer(
                 "❌ Вы не можете менять статус этого пула", show_alert=True
             )
             return
 
-        current_status = str(pull.get("status", "active")).lower()
         text = (
-            f"<b>🔄 Смена статуса пула</b>\n\n"
             f"<b>Пул:</b> #{pull_id}\n"
             f"🌾 <b>Культура:</b> {pull.get('culture', '?')}\n"
             f"<b>Текущий статус:</b> {status_map.get(current_status, current_status)}\n\n"
-            f"<b>Выберите новый статус:</b>"
         )
 
         keyboard = InlineKeyboardMarkup(row_width=1)
-        for status, label in status_map.items():
-            if status != current_status:
-                keyboard.add(
-                    InlineKeyboardButton(
-                        label, callback_data=f"confirm_pull_status:{pull_id}:{status}"
-                    )
+            keyboard.add(
+                InlineKeyboardButton(
                 )
+            )
 
         keyboard.add(
             InlineKeyboardButton("🔙 Назад", callback_data=f"view_pull:{pull_id}")
@@ -28801,12 +21131,9 @@ async def change_pull_status(callback: types.CallbackQuery):
 @dp.callback_query_handler(lambda q: q.data.startswith("confirm_pull_status:"))
 async def confirm_pull_status(callback: types.CallbackQuery):
     """Применить новый статус к пулу, уведомить ВСЕХ присоединившихся фермеров и ВСЕХ логистов"""
-    await callback.answer()
-
     try:
         parts = callback.data.split(":")
         pull_id = int(parts[1])
-        new_status = parts[2].lower()
         user_id = callback.from_user.id
 
         all_pulls = pulls.get("pulls", {})
@@ -28817,23 +21144,16 @@ async def confirm_pull_status(callback: types.CallbackQuery):
             return
 
         creator_id = pull.get("creator_id") or pull.get("exporter_id")
-        if creator_id != user_id:
             await callback.answer(
                 "❌ Вы не можете менять статус этого пула", show_alert=True
             )
             return
 
-        old_status = str(pull.get("status", "active")).lower()
 
-        # Валидации статусов
-        if new_status == "active":
-            if pull.get("current_volume", 0) > 0:
-                await callback.answer(
-                    "⚠️ Нельзя открыть пул с партиями!", show_alert=True
-                )
-                return
+            await callback.answer(
+            )
+            return
 
-        elif new_status == "filled":
             current = pull.get("current_volume", 0)
             target = pull.get("target_volume", 0)
             if current < target:
@@ -28847,21 +21167,13 @@ async def confirm_pull_status(callback: types.CallbackQuery):
         pull["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         save_pulls_to_pickle()
 
-        # ВСЕ логисты по ролям
-        logist_ids = [uid for uid, u in users.items() if u.get("role") == "logistic"]
-        # ВСЕ фермеры-участники через pullparticipants
-        farmer_ids = [
             p.get("farmer_id")
-            for p in pullparticipants.get(pull_id, [])
             if p.get("farmer_id")
-        ]
-        all_notify_ids = set(farmer_ids) | set(logist_ids)
         logging.info(
             f"[CONFIRM_PULL_STATUS] pull_id={pull_id} logist_ids={logist_ids} farmer_ids={farmer_ids} all_notify_ids={list(all_notify_ids)}"
         )
 
         notification_text = (
-            f"<b>✅ Статус пула изменился!</b>\n\n"
             f"📤 Пул: <b>#{pull_id}</b>\n"
             f"🌾 Культура: <b>{pull.get('culture', 'Не указана')}</b>\n"
             f"📊 Объём: <b>{pull.get('current_volume', 0):,.1f} т</b>\n"
@@ -28879,7 +21191,6 @@ async def confirm_pull_status(callback: types.CallbackQuery):
 
         sent_count = 0
         failed_ids = []
-        for notify_id in all_notify_ids:
             try:
                 await bot.send_message(
                     notify_id,
@@ -28906,7 +21217,6 @@ async def confirm_pull_status(callback: types.CallbackQuery):
         )
 
         confirmation_text = (
-            f"<b>✅ Статус пула изменён!</b>\n\n"
             f"📤 Пул: <b>#{pull_id}</b>\n"
             f"🌾 Культура: <b>{pull.get('culture', 'Не указана')}</b>\n"
             f"🔄 Было: <b>{status_map.get(old_status, old_status)}</b>\n"
@@ -28940,9 +21250,6 @@ if __name__ == "__main__":
         os.makedirs("logs", exist_ok=True)
     except Exception as e:
         logging.error(f"❌ Ошибка создания директорий: {e}")
-
-    # ✅ executor ТОЛЬКО ЗДЕСЬ! ОДИН РАЗ!
-    from aiogram import executor
 
     executor.start_polling(
         dp, skip_updates=True, on_startup=on_startup, on_shutdown=on_shutdown

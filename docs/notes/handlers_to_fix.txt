@@ -1,0 +1,412 @@
+1838:@dp.callback_query_handler(
+1978:@dp.callback_query_handler(lambda c: c.data.startswith("expeditor_take:"), state="*")
+2188:@dp.message_handler(commands=["reset"], state="*")
+2231:@dp.callback_query_handler(lambda c: c.data.startswith("confirm_reset:"), state="*")
+2547:@dp.callback_query_handler(lambda c: c.data == "cancel_reset", state="*")
+4376:@dp.message_handler(commands=["start"], state="*")
+4619:@dp.callback_query_handler(lambda c: c.data == "backtoadmin", state="*")
+4658:@dp.message_handler(commands=["admin"], state="*")
+4692:@dp.callback_query_handler(lambda c: c.data == "adminstat", state="*")
+4772:@dp.callback_query_handler(lambda c: c.data == "adminanalytics", state="*")
+4839:@dp.callback_query_handler(lambda c: c.data == "adminexport", state="*")
+5179:@dp.callback_query_handler(lambda c: c.data == "adminusers", state="*")
+5232:@dp.callback_query_handler(lambda c: c.data.startswith("adminusers:page:"), state="*")
+5284:@dp.callback_query_handler(lambda c: c.data.startswith("adminuser:view:"), state="*")
+5338:@dp.callback_query_handler(lambda c: c.data == "adminbroadcast", state="*")
+5399:@dp.message_handler(state=BroadcastStates.waiting_message, content_types=ContentType.TEXT)
+5479:@dp.callback_query_handler(lambda c: c.data == "adminprices", state="*")
+5885:@dp.callback_query_handler(lambda c: c.data == "exportusers", state="*")
+5963:@dp.callback_query_handler(lambda c: c.data == "exportpulls", state="*")
+6017:@dp.callback_query_handler(lambda c: c.data == "exportbatches", state="*")
+6077:@dp.callback_query_handler(lambda c: c.data == "exportlogistics", state="*")
+6131:@dp.callback_query_handler(lambda c: c.data == "exportexpeditors", state="*")
+6225:@dp.callback_query_handler(lambda c: c.data == "exportrequests", state="*")
+6432:@dp.callback_query_handler(lambda c: c.data == "exportfull", state="*")
+6760:@dp.callback_query_handler(lambda c: c.data.startswith("export"), state="*")
+6950:@dp.message_handler(lambda m: m.text == "📝 Зарегистрироваться", state="*")
+6977:@dp.callback_query_handler(lambda c: c.data == "start_registration", state="*")
+7025:@dp.message_handler(state=RegistrationStatesGroup.name)
+7064:@dp.message_handler(state=RegistrationStatesGroup.phone)
+7098:@dp.message_handler(state=RegistrationStatesGroup.email)
+7135:@dp.message_handler(state=RegistrationStatesGroup.inn)
+7179:@dp.message_handler(state=RegistrationStatesGroup.ogrn)
+7215:@dp.callback_query_handler(
+7255:@dp.message_handler(state=RegistrationStatesGroup.company_details)
+7302:@dp.callback_query_handler(
+7352:@dp.callback_query_handler(lambda c: c.data.startswith("join_pool:"), state="*")
+7569:@dp.callback_query_handler(lambda c: c.data.startswith("quickbatch:"), state="*")
+7620:@dp.message_handler(state=QuickBatchStatesGroup.volume)
+7667:@dp.message_handler(state=QuickBatchStatesGroup.price)
+7695:@dp.callback_query_handler(
+7714:@dp.message_handler(state=QuickBatchStatesGroup.quality)
+7727:@dp.message_handler(state=QuickBatchStatesGroup.moisture)
+7740:@dp.message_handler(state=QuickBatchStatesGroup.impurity)
+7922:@dp.callback_query_handler(
+7967:@dp.callback_query_handler(
+8132:@dp.callback_query_handler(lambda c: c.data.startswith("viewparticipants:"), state="*")
+8232:@dp.callback_query_handler(
+8330:@dp.message_handler(lambda m: m.text == "📊 Статистика бота", state="*")
+8418:@dp.message_handler(lambda m: m.text == "📊 Аналитика", state="*")
+8489:@dp.message_handler(lambda m: m.text == "📂 Экспорт данных", state="*")
+8545:@dp.message_handler(lambda m: m.text == "🔍 Найти совпадения", state="*")
+8578:@dp.message_handler(lambda m: m.text == "◀️ Назад", state="*")
+8606:@dp.message_handler(commands=["match"], state="*")
+8639:@dp.message_handler(lambda m: m.text == "👤 Профиль", state="*")
+8684:@dp.callback_query_handler(lambda c: c.data.startswith("edit_profile:"), state="*")
+8786:@dp.callback_query_handler(
+8889:@dp.message_handler(state=EditProfileStates.new_value)
+9035:@dp.message_handler(lambda m: m.text == "📈 Цены на зерно", state="*")
+9062:@dp.message_handler(lambda m: m.text == "📰 Новости рынка", state="*")
+9092:@dp.callback_query_handler(lambda c: c.data == "view_news", state="*")
+10688:@dp.message_handler(
+10803:@dp.callback_query_handler(lambda c: c.data.startswith("farmer_view_offer:"), state="*")
+10922:@dp.callback_query_handler(
+11056:@dp.callback_query_handler(
+11154:@dp.message_handler(lambda message: message.text == "📋 История предложений", state="*")
+11242:@dp.callback_query_handler(lambda c: c.data == "farmer_back_to_offers", state="*")
+11260:@dp.callback_query_handler(lambda c: c.data.startswith("view_deal:"), state="*")
+11316:@dp.message_handler(lambda m: m.text == "🔍 Поиск экспортёров", state="*")
+11395:@dp.callback_query_handler(lambda c: c.data.startswith("findexporters:"), state="*")
+11553:@dp.message_handler(lambda m: m.text == "➕ Добавить партию", state="*")
+11585:@dp.callback_query_handler(
+11750:@dp.callback_query_handler(lambda c: c.data.startswith("contact_farmer:"))
+11858:@dp.callback_query_handler(
+11892:@dp.callback_query_handler(
+11921:@dp.message_handler(state=AddBatchStates.volume)
+11956:@dp.message_handler(state=AddBatchStates.price)
+11989:@dp.message_handler(state=AddBatchStates.humidity)
+12022:@dp.message_handler(state=AddBatchStates.impurity)
+12062:@dp.callback_query_handler(
+12091:@dp.message_handler(state=AddBatchStates.readiness_date)
+12286:@dp.callback_query_handler(lambda c: c.data.startswith("view_matches:"), state="*")
+12378:@dp.message_handler(lambda m: m.text == "🔧 Мои партии", state="*")
+12495:@dp.message_handler(lambda m: m.text == "🎯 Пулы", state="*")
+12586:@dp.message_handler(state=JoinPoolStatesGroup.volume)
+12710:@dp.callback_query_handler(lambda c: c.data == "refresh_prices", state="*")
+12724:@dp.callback_query_handler(lambda c: c.data == "refresh_news", state="*")
+12747:@dp.callback_query_handler(
+12751:@dp.callback_query_handler(lambda c: c.data == "auto_match_all", state="*")
+12807:@dp.message_handler(lambda m: m.text == "➕ Создать пул", state="*")
+12842:@dp.callback_query_handler(
+12899:@dp.message_handler(state=CreatePoolStatesGroup.volume)
+12935:@dp.message_handler(state=CreatePoolStatesGroup.price)
+12972:@dp.callback_query_handler(
+13034:@dp.message_handler(state=CreatePoolStatesGroup.moisture)
+13069:@dp.message_handler(state=CreatePoolStatesGroup.nature)
+13104:@dp.message_handler(state=CreatePoolStatesGroup.impurity)
+13139:@dp.message_handler(state=CreatePoolStatesGroup.weed)
+13173:@dp.message_handler(state=CreatePoolStatesGroup.documents)
+13218:@dp.callback_query_handler(
+13359:@dp.callback_query_handler(lambda c: c.data == "back_to_pools_list", state="*")
+13421:@dp.callback_query_handler(lambda c: c.data.startswith("view_pool_matches:"), state="*")
+13489:@dp.callback_query_handler(lambda c: c.data == "back_to_my_pools", state="*")
+13573:@dp.message_handler(lambda m: m.text == "📋 Мои пулы", state="*")
+13644:@dp.callback_query_handler(lambda c: c.data.startswith("view_pool:"), state="*")
+13796:@dp.message_handler(lambda m: m.text == "🔍 Найти партии", state="*")
+13825:@dp.callback_query_handler(lambda c: c.data.startswith("search_by:"), state="*")
+14002:@dp.callback_query_handler(lambda c: c.data.startswith("view_batch:"), state="*")
+14193:@dp.callback_query_handler(lambda c: c.data == "back_to_search", state="*")
+14220:@dp.callback_query_handler(
+14290:@dp.callback_query_handler(lambda c: c.data.startswith("add_batch_to_pool:"), state="*")
+14374:@dp.callback_query_handler(lambda c: c.data.startswith("confirm_add_batch:"), state="*")
+14562:@dp.message_handler(lambda m: m.text == "🚚 Создать заявку на доставку", state="*")
+14611:@dp.callback_query_handler(
+14675:@dp.message_handler(state=FarmerShippingRequestStates.route_to_region)
+14739:@dp.callback_query_handler(
+14786:@dp.callback_query_handler(
+14835:@dp.callback_query_handler(
+14873:@dp.message_handler(state=FarmerShippingRequestStates.entering_price)
+14958:@dp.callback_query_handler(text="farmer_confirm_logistics_request", state="*")
+15160:@dp.callback_query_handler(
+15247:@dp.callback_query_handler(
+15412:@dp.callback_query_handler(
+15491:@dp.callback_query_handler(
+15597:@dp.callback_query_handler(
+15677:@dp.callback_query_handler(text="farmer_my_requests_menu", state="*")
+15751:@dp.message_handler(text="📬 МОИ ЗАЯВКИ", state="*")
+15819:@dp.callback_query_handler(
+15950:@dp.callback_query_handler(lambda c: c.data.startswith("edit_request:"), state="*")
+15999:@dp.callback_query_handler(lambda c: c.data.startswith("edit_req_field:"), state="*")
+16019:@dp.callback_query_handler(
+16050:@dp.callback_query_handler(
+16064:@dp.message_handler(state=EditRequestStates.waiting_for_custom_value)
+16093:@dp.message_handler(state=EditRequestStates.waiting_for_number)
+16133:@dp.callback_query_handler(
+16149:@dp.callback_query_handler(lambda c: c.data.startswith("delete_request:"), state="*")
+16227:@dp.callback_query_handler(
+16350:@dp.callback_query_handler(
+16460:@dp.callback_query_handler(
+16560:@dp.callback_query_handler(text="farmer_confirm_request", state="*")
+16612:@dp.callback_query_handler(text="farmer_cancel_request", state="*")
+16631:@dp.callback_query_handler(text="farmer_main_menu", state="*")
+16652:@dp.callback_query_handler(
+16764:@dp.callback_query_handler(
+16885:@dp.callback_query_handler(
+17020:@dp.callback_query_handler(
+17091:@dp.callback_query_handler(
+17201:@dp.callback_query_handler(
+17296:@dp.callback_query_handler(lambda c: c.data.startswith("exp_offer_start:"), state="*")
+17351:@dp.message_handler(state=ExpeditorOfferForPoolStates.enter_terms)
+17376:@dp.message_handler(state=ExpeditorOfferForPoolStates.enter_price)
+17488:@dp.callback_query_handler(
+17559:@dp.callback_query_handler(
+17637:@dp.callback_query_handler(
+17783:@dp.message_handler(state=SearchBatchesStatesGroup.enter_min_volume)
+17820:@dp.message_handler(state=SearchBatchesStatesGroup.enter_max_volume)
+17853:@dp.message_handler(state=SearchBatchesStatesGroup.enter_min_price)
+17884:@dp.message_handler(state=SearchBatchesStatesGroup.enter_max_price)
+17927:@dp.callback_query_handler(
+17954:@dp.callback_query_handler(
+18073:@dp.callback_query_handler(lambda c: c.data.startswith("attach_files:"), state="*")
+18105:@dp.message_handler(
+18176:@dp.message_handler(commands=["done"], state=AttachFilesStatesGroup.upload_files)
+18227:@dp.callback_query_handler(lambda c: c.data.startswith("view_files:"), state="*")
+18290:@dp.callback_query_handler(lambda c: c.data == "back_to_pools", state="*")
+18452:@dp.message_handler(commands=["stats"], state="*")
+18453:@dp.message_handler(commands=["help"], state="*")
+18579:@dp.message_handler(commands=["cancel"], state="*")
+18596:@dp.callback_query_handler(lambda c: c.data.startswith("edit_batch:"), state="*")
+18640:@dp.callback_query_handler(lambda c: c.data.startswith("edit_field:"), state="*")
+18708:@dp.callback_query_handler(
+18769:@dp.callback_query_handler(
+18831:@dp.callback_query_handler(
+18893:@dp.message_handler(state=EditBatchStates.new_value)
+19012:@dp.callback_query_handler(lambda c: c.data == "back_to_deals", state="*")
+19061:@dp.callback_query_handler(lambda c: c.data == "edit_cancel", state="*")
+19167:@dp.callback_query_handler(lambda c: c.data.startswith("delete_batch:"), state="*")
+19212:@dp.callback_query_handler(
+19347:@dp.callback_query_handler(lambda c: c.data.startswith("editfield_crop_"), state="*")
+19400:@dp.callback_query_handler(lambda c: c.data.startswith("setcrop_"), state="*")
+19447:@dp.callback_query_handler(lambda c: c.data.startswith("editpull_"), state="*")
+19492:@dp.callback_query_handler(lambda c: c.data.startswith("edit_pull_field:"), state="*")
+19548:@dp.callback_query_handler(
+19594:@dp.callback_query_handler(
+19660:@dp.message_handler(state=EditPoolStatesGroup.edit_volume)
+19666:@dp.message_handler(state=EditPoolStatesGroup.edit_price)
+19672:@dp.message_handler(state=EditPoolStatesGroup.edit_moisture)
+19678:@dp.message_handler(state=EditPoolStatesGroup.edit_nature)
+19684:@dp.message_handler(state=EditPoolStatesGroup.edit_impurity)
+19690:@dp.message_handler(state=EditPoolStatesGroup.edit_weed)
+19850:@dp.callback_query_handler(lambda c: c.data.startswith("completepool_"), state="*")
+19952:@dp.callback_query_handler(lambda c: c.data.startswith("confirmcompletepool_"), state="*")
+20060:@dp.callback_query_handler(lambda c: c.data.startswith("deletepull_"), state="*")
+20113:@dp.callback_query_handler(lambda c: c.data.startswith("confirmdeletepull_"), state="*")
+20259:@dp.callback_query_handler(lambda c: c.data == "canceldeletepull", state="*")
+20321:@dp.callback_query_handler(lambda c: c.data.startswith("close_pull:"), state="*")
+20380:@dp.callback_query_handler(lambda c: c.data.startswith("confirmclosepull_"), state="*")
+20490:@dp.callback_query_handler(lambda c: c.data == "cancel_delete_pull", state="*")
+20500:@dp.callback_query_handler(lambda c: c.data == "get_partner_contacts", state="*")
+20551:@dp.callback_query_handler(lambda c: c.data.startswith("complete_deal:"), state="*")
+20590:@dp.callback_query_handler(
+20628:@dp.callback_query_handler(lambda c: c.data.startswith("cancel_deal:"), state="*")
+20687:@dp.callback_query_handler(
+20713:@dp.callback_query_handler(
+20749:@dp.callback_query_handler(lambda c: c.data.startswith("logistics:"), state="*")
+20814:@dp.callback_query_handler(lambda c: c.data.startswith("pool_participants_storage:"), state="*")
+20921:@dp.callback_query_handler(lambda c: c.data.startswith("pull_logistics:"), state="*")
+21002:@dp.callback_query_handler(lambda c: c.data.startswith("create_shipping:"), state="*")
+21050:@dp.callback_query_handler(lambda c: c.data == "view_logistics_contacts", state="*")
+21097:@dp.message_handler(
+21171:@dp.message_handler(lambda m: m.text == "🚚 Активные заявки", state="*")
+21366:@dp.callback_query_handler(
+21420:@dp.message_handler(state=ExpeditorOfferForRequestStates.enter_terms)
+21442:@dp.message_handler(state=ExpeditorOfferForRequestStates.enter_price)
+21561:@dp.callback_query_handler(
+21640:@dp.callback_query_handler(
+21745:@dp.callback_query_handler(
+21800:@dp.message_handler(state=LogisticOfferForExporterRequestStates.enter_terms)
+21819:@dp.message_handler(state=LogisticOfferForExporterRequestStates.enter_price)
+21940:@dp.callback_query_handler(
+22001:@dp.callback_query_handler(
+22063:@dp.callback_query_handler(
+22151:@dp.message_handler(lambda m: m.text == "💳 Моя карточка", state="*")
+22249:@dp.callback_query_handler(lambda c: c.data == "delete_expeditor_card", state="*")
+22267:@dp.callback_query_handler(lambda c: c.data == "expeditor_my_card", state="*")
+22338:@dp.callback_query_handler(lambda c: c.data.startswith("view_request:"), state="*")
+22580:@dp.message_handler(lambda m: m.text == "🚛 База экспедиторов", state="*")
+22642:@dp.message_handler(lambda m: m.text == "🚚 Доступные заявки", state="*")
+22693:@dp.callback_query_handler(lambda c: c.data.startswith("exp_view_req:"), state="*")
+22793:@dp.callback_query_handler(lambda c: c.data.startswith("exp_accept:"), state="*")
+22857:@dp.callback_query_handler(lambda c: c.data == "back_to_exp_requests", state="*")
+22910:@dp.message_handler(
+23073:@dp.callback_query_handler(lambda c: c.data.startswith("exp_delivery:"), state="*")
+23153:@dp.callback_query_handler(lambda c: c.data.startswith("exp_complete:"), state="*")
+23346:@dp.message_handler(lambda m: m.text == "✔️ История доставок", state="*")
+23391:@dp.callback_query_handler(lambda c: c.data.startswith("view_expeditor:"), state="*")
+23491:@dp.callback_query_handler(lambda c: c.data == "back_to_expeditors", state="*")
+23552:@dp.callback_query_handler(
+23626:@dp.callback_query_handler(
+23700:@dp.callback_query_handler(lambda c: c.data.startswith("select_logist:"), state="*")
+23855:@dp.message_handler(lambda m: m.text == "➕ Создать заявку на перевозку", state="*")
+23886:@dp.message_handler(state=LogisticStatesGroup.route_from)
+23914:@dp.message_handler(state=LogisticStatesGroup.route_to)
+23943:@dp.message_handler(state=LogisticStatesGroup.volume)
+23980:@dp.message_handler(state=LogisticStatesGroup.desired_price)
+24017:@dp.message_handler(state=LogisticStatesGroup.price)
+24051:@dp.message_handler(state=LogisticStatesGroup.vehicle_type)
+24080:@dp.message_handler(lambda m: m.text == "/skip", state=LogisticStatesGroup.notes)
+24081:@dp.message_handler(state=LogisticStatesGroup.notes)
+24190:@dp.callback_query_handler(text="logistic_requests_list", state="*")
+24291:@dp.callback_query_handler(text="logist_main_menu", state="*")
+24314:@dp.callback_query_handler(lambda c: c.data.startswith("make_offer:"), state="*")
+24426:@dp.callback_query_handler(
+24490:@dp.message_handler(state=LogisticOfferStatesGroup.price)
+24560:@dp.message_handler(state=LogisticOfferStatesGroup.delivery_date)
+24612:@dp.callback_query_handler(
+24635:@dp.message_handler(state=LogisticOfferStatesGroup.additional_info)
+24736:@dp.callback_query_handler(
+24914:@dp.message_handler(
+25012:@dp.callback_query_handler(lambda c: c.data == "my_offers")
+25110:@dp.callback_query_handler(lambda c: c.data.startswith("view_my_offer_"), state="*")
+25239:@dp.callback_query_handler(lambda c: c.data.startswith("cancel_my_offer_"), state="*")
+25302:@dp.callback_query_handler(
+25377:@dp.callback_query_handler(lambda c: c.data.startswith("edit_offer_"), state="*")
+25452:@dp.callback_query_handler(lambda c: c.data.startswith("edit_price_"), state="*")
+25495:@dp.message_handler(state=EditOfferStatesGroup.value)
+25900:@dp.callback_query_handler(lambda c: c.data == "my_deliveries", state="*")
+25993:@dp.callback_query_handler(lambda c: c.data == "logistic_statistics", state="*")
+26097:@dp.message_handler(state=ShippingRequestStatesGroup.route_from)
+26119:@dp.message_handler(state=ShippingRequestStatesGroup.route_to)
+26155:@dp.message_handler(state=ShippingRequestStatesGroup.volume)
+26204:@dp.message_handler(state=ShippingRequestStatesGroup.culture)
+26227:@dp.message_handler(state=ShippingRequestStatesGroup.price_rub)
+26259:@dp.message_handler(
+26268:@dp.message_handler(state=ShippingRequestStatesGroup.desired_date)
+26723:@dp.message_handler(lambda m: m.text == "📦 Доступные партии", state="*")
+26840:@dp.callback_query_handler(lambda c: c.data.startswith("view_delivery_"), state="*")
+26966:@dp.callback_query_handler(lambda c: c.data.startswith("complete_delivery:"), state="*")
+27033:@dp.callback_query_handler(
+27053:@dp.message_handler(
+27080:@dp.message_handler(lambda message: message.text == "📊 Новости и цены", state="*")
+27102:@dp.callback_query_handler(lambda c: c.data == "show_prices", state="*")
+27131:@dp.callback_query_handler(lambda c: c.data == "show_news", state="*")
+27158:@dp.callback_query_handler(lambda c: c.data == "back_to_news_menu", state="*")
+27255:@dp.callback_query_handler(lambda c: c.data == "back_to_my_batches", state="*")
+27424:@dp.callback_query_handler(lambda c: c.data.startswith("filter_batches:"), state="*")
+27503:@dp.callback_query_handler(text="back_to_requests", state="*")
+27604:@dp.callback_query_handler(lambda c: c.data == "back_to_exporter_menu", state="*")
+27645:@dp.callback_query_handler(lambda c: c.data == "advanced_batch_search", state="*")
+27668:@dp.callback_query_handler(lambda c: c.data.startswith("contact_farmer_"), state="*")
+27716:@dp.message_handler(lambda message: message.text == "🔍 Поиск", state="*")
+27754:@dp.callback_query_handler(lambda c: c.data == "search_by_culture")
+27790:@dp.callback_query_handler(lambda c: c.data == "search_by_region", state="*")
+27955:@dp.callback_query_handler(lambda c: c.data == "reload_data", state="*")
+27974:@dp.callback_query_handler(
+28089:@dp.message_handler(lambda m: m.text == "📋 Мои пуллы", state="*")
+28140:@dp.message_handler(lambda m: m.text == "➕ Создать партию", state="*")
+28162:@dp.message_handler(commands=["debug"], state="*")
+28212:@dp.message_handler(
+28332:@dp.callback_query_handler(
+28369:@dp.message_handler(state=CreateLogisticRequestStatesGroup.route_from)
+28401:@dp.message_handler(state=CreateLogisticRequestStatesGroup.loading_date)
+28443:@dp.message_handler(state=CreateLogisticRequestStatesGroup.desired_price)
+28481:@dp.message_handler(
+28484:@dp.message_handler(state=CreateLogisticRequestStatesGroup.notes)
+28574:@dp.callback_query_handler(
+28680:@dp.callback_query_handler(lambda c: c.data.startswith("respond_logistics:"), state="*")
+28799:@dp.message_handler(state=LogisticOfferStatesGroup.price)
+28823:@dp.message_handler(state=LogisticOfferStatesGroup.vehicle_type)
+28840:@dp.message_handler(state=LogisticOfferStatesGroup.delivery_date)
+28869:@dp.message_handler(
+28872:@dp.message_handler(state=LogisticOfferStatesGroup.additional_info)
+29075:@dp.callback_query_handler(lambda c: c.data == "back_to_logistics_requests", state="*")
+29095:@dp.callback_query_handler(lambda c: c.data == "noop", state="*")
+29104:@dp.message_handler(Text(equals="🔍 Поиск по культуре"), state="*")
+29139:@dp.message_handler(Text(equals="📋 Моя карточка"), state="*")
+29253:@dp.callback_query_handler(lambda c: c.data == "create_logistic_card", state="*")
+29279:@dp.message_handler(state=CreateLogisticCardStates.routes)
+29302:@dp.message_handler(state=CreateLogisticCardStates.price_per_km)
+29330:@dp.message_handler(state=CreateLogisticCardStates.price_per_ton)
+29359:@dp.message_handler(state=CreateLogisticCardStates.min_volume)
+29387:@dp.message_handler(state=CreateLogisticCardStates.transport_type)
+29442:@dp.callback_query_handler(
+29500:@dp.callback_query_handler(
+29534:@dp.message_handler(state=CreateLogisticCardStates.additional_info)
+29614:@dp.callback_query_handler(lambda c: c.data == "create_expeditor_card", state="*")
+29644:@dp.message_handler(state=CreateExpeditorCardStates.services_text)
+29696:@dp.callback_query_handler(
+29761:@dp.callback_query_handler(
+29796:@dp.message_handler(state=CreateExpeditorCardStates.regions)
+29825:@dp.message_handler(state=CreateExpeditorCardStates.experience)
+29895:@dp.callback_query_handler(lambda c: c.data.startswith("select_logistic_"))
+29986:@dp.callback_query_handler(lambda c: c.data.startswith("select_expeditor_"))
+30073:@dp.callback_query_handler(lambda c: c.data == "back_to_menu", state="*")
+30121:@dp.callback_query_handler(lambda c: c.data == "cancel", state="*")
+30141:@dp.callback_query_handler(lambda c: c.data == "cancel_action", state="*")
+30161:@dp.callback_query_handler(lambda c: c.data == "transport_type", state="*")
+30188:@dp.callback_query_handler(lambda c: c.data == "view_my_batches", state="*")
+30228:@dp.callback_query_handler(lambda c: c.data == "startsearch", state="*")
+30255:@dp.callback_query_handler(lambda c: c.data == "broadcast_confirm", state="*")
+30376:@dp.callback_query_handler(lambda c: c.data == "broadcast_cancel", state="*")
+30420:@dp.callback_query_handler(lambda c: c.data.startswith("doctype_"), state="*")
+30448:@dp.callback_query_handler(lambda c: c.data == "continue_shipping", state="*")
+30479:@dp.callback_query_handler(lambda c: c.data.startswith("viewoffer:"))
+30578:@dp.callback_query_handler(lambda c: c.data.startswith("viewoffer:"), state="*")
+30701:@dp.callback_query_handler(lambda c: c.data.startswith("cancel_offer:"), state="*")
+30752:@dp.callback_query_handler(
+30849:@dp.callback_query_handler(lambda c: c.data == "back_to_offers_list", state="*")
+30975:@dp.callback_query_handler(lambda c: c.data == "edit_logistic_card", state="*")
+31016:@dp.callback_query_handler(lambda c: c.data == "edit_card_vehicle", state="*")
+31053:@dp.callback_query_handler(lambda c: c.data.startswith("transport_type:"), state="*")
+31116:@dp.callback_query_handler(lambda c: c.data.startswith("edit_vtype_"), state="*")
+31172:@dp.callback_query_handler(lambda c: c.data == "edit_card_capacity", state="*")
+31216:@dp.message_handler(state=EditCardStates.capacity, content_types=["text"])
+31290:@dp.callback_query_handler(lambda c: c.data == "edit_card_regions", state="*")
+31322:@dp.message_handler(state=EditCardStates.regions, content_types=["text"])
+31418:@dp.callback_query_handler(lambda c: c.data == "edit_card_price", state="*")
+31452:@dp.message_handler(state=EditCardStates.price_per_km, content_types=["text"])
+31541:@dp.callback_query_handler(lambda c: c.data == "edit_card_description", state="*")
+31578:@dp.message_handler(state=EditCardStates.description, content_types=["text"])
+31765:@dp.callback_query_handler(lambda c: c.data == "back_to_card", state="*")
+31788:@dp.message_handler(lambda m: m.text == "📋 Создать предложение", state="*")
+31806:@dp.callback_query_handler(
+31831:@dp.message_handler(state=ExpeditorOfferStates.ports)
+31848:@dp.message_handler(state=ExpeditorOfferStates.price)
+31869:@dp.message_handler(state=ExpeditorOfferStates.terms)
+31896:@dp.callback_query_handler(
+31931:@dp.message_handler(
+31974:@dp.callback_query_handler(
+32144:@dp.callback_query_handler(
+32272:@dp.callback_query_handler(lambda c: c.data.startswith("compare_offers_"), state="*")
+32420:@dp.callback_query_handler(lambda c: c.data.startswith("accept_offer_"), state="*")
+32521:@dp.callback_query_handler(lambda c: c.data.startswith("confirm_accept_"), state="*")
+32673:@dp.callback_query_handler(lambda c: c.data.startswith("reject_offer_"), state="*")
+32752:@dp.callback_query_handler(
+32786:@dp.message_handler(state=RejectOfferStatesGroup.reason)
+32878:@dp.callback_query_handler(lambda c: c.data == "my_shipping_requests", state="*")
+32999:@dp.callback_query_handler(lambda c: c.data.startswith("view_my_request_"), state="*")
+33113:@dp.callback_query_handler(lambda c: c.data.startswith("cancel_request_"), state="*")
+33180:@dp.callback_query_handler(
+33251:@dp.callback_query_handler(lambda c: c.data == "exporter_deliveries", state="*")
+33344:@dp.callback_query_handler(
+33425:@dp.callback_query_handler(lambda c: c.data.startswith("rate_logistic_"), state="*")
+33500:@dp.callback_query_handler(
+33553:@dp.callback_query_handler(
+33571:@dp.message_handler(state=RateLogisticStatesGroup.review)
+33718:@dp.callback_query_handler(
+33803:@dp.callback_query_handler(lambda c: c.data == "edit_expeditor_card", state="*")
+33865:@dp.callback_query_handler(lambda c: c.data == "edit_exp_services", state="*")
+33876:@dp.message_handler(state=EditExpeditorCardStates.services_text)
+33891:@dp.callback_query_handler(lambda c: c.data == "edit_exp_regions", state="*")
+33911:@dp.message_handler(state=EditExpeditorCardStates.regions)
+33926:@dp.callback_query_handler(lambda c: c.data == "edit_exp_experience", state="*")
+33946:@dp.message_handler(state=EditExpeditorCardStates.experience)
+33961:@dp.callback_query_handler(lambda c: c.data == "edit_exp_description", state="*")
+33981:@dp.message_handler(state=EditExpeditorCardStates.description)
+34001:@dp.callback_query_handler(lambda c: c.data == "expeditor_my_offers", state="*")
+34099:@dp.callback_query_handler(
+34186:@dp.callback_query_handler(
+34237:@dp.callback_query_handler(lambda c: c.data == "expeditor_available_pulls", state="*")
+34365:@dp.callback_query_handler(
+34437:@dp.callback_query_handler(lambda c: c.data == "expeditor_statistics", state="*")
+34527:@dp.message_handler(lambda msg: msg.text in ["📋 Мои сделки"])
+34932:@dp.callback_query_handler(
+35012:@dp.callback_query_handler(lambda q: q.data.startswith("deals_status:"))
+35344:@dp.callback_query_handler(lambda q: q.data in ("main_menu", "back_to_main"))
+35542:@dp.callback_query_handler(lambda q: q.data.startswith("deal_detail:"))
+35986:@dp.callback_query_handler(lambda q: q.data.startswith("change_farmer_status:"))
+36052:@dp.callback_query_handler(lambda q: q.data.startswith("change_exporter_status:"))
+36116:@dp.callback_query_handler(lambda q: q.data.startswith("change_logist_status:"))
+36174:@dp.callback_query_handler(lambda q: q.data.startswith("change_expeditor_status:"))
+36279:@dp.callback_query_handler(lambda q: q.data.startswith("change_pull_status:"))
+36349:@dp.callback_query_handler(lambda q: q.data.startswith("confirm_pull_status:"))
