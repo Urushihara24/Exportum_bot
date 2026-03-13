@@ -6,5 +6,8 @@
 ## Changelog
 - `docs/CHANGELOG.md`
 
+## Customer
+- `docs/CUSTOMER_OVERVIEW.md` - non-technical product summary for stakeholders
+
 ## Notes
 - `docs/notes/handlers_to_fix.txt`
