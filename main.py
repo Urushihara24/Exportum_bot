@@ -1,9 +1,3 @@
-import warnings
-
-warnings.filterwarnings("ignore", message=".*LibreSSL.*")
-warnings.filterwarnings("ignore", message=".*NotOpenSSLWarning.*")
-warnings.filterwarnings("ignore", category=UserWarning, module="urllib3")
-
 import os
 import logging
 import requests
@@ -12,6 +6,7 @@ import re
 import time
 import json
 import pickle
+import html
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -224,6 +219,9 @@ STORAGE_TYPES = ["Элеватор", "Склад", "Напольное хран�
 DEAL_STATUSES = {
     "pending": "🔄 В процессе",
     "matched": "🎯 Найден партнёр",
+    "assigned": "👤 Выбран логист",
+    "expeditor_selected": "✈️ Выбран экспедитор",
+    "in_progress": "🚚 В работе",
     "shipping": "🚛 Организация перевозки",
     "completed": "✅ Завершена",
     "cancelled": "❌ Отменена",
@@ -337,6 +335,30 @@ def is_request_open_for_expeditor(status: str) -> bool:
     }
 
 
+OPEN_LOGISTIC_OFFER_STATUSES = {"pending", "active", "new", "open"}
+SELECTED_LOGISTIC_OFFER_STATUSES = {
+    "accepted",
+    "assigned",
+    "in_progress",
+    "selected",
+    "reserved",
+}
+MUTABLE_LOGISTIC_OFFER_STATUSES = (
+    OPEN_LOGISTIC_OFFER_STATUSES | SELECTED_LOGISTIC_OFFER_STATUSES
+)
+OPEN_EXPEDITOR_OFFER_STATUSES = {"pending", "active", "new", "open"}
+SELECTED_EXPEDITOR_OFFER_STATUSES = {
+    "accepted",
+    "assigned",
+    "in_progress",
+    "selected",
+    "reserved",
+}
+MUTABLE_EXPEDITOR_OFFER_STATUSES = (
+    OPEN_EXPEDITOR_OFFER_STATUSES | SELECTED_EXPEDITOR_OFFER_STATUSES
+)
+
+
 def is_logistic_role(role: str) -> bool:
     """Проверка роли логиста с учетом legacy-значений."""
     normalized = str(role or "").strip().lower()
@@ -428,7 +450,7 @@ def count_logistic_offers_for_request(request_id, source: str = None) -> int:
 
 
 def count_open_logistic_offers_for_request(request_id, source: str = None) -> int:
-    """Количество только открытых (pending/active) логистических офферов по заявке."""
+    """Количество открытых логистических офферов по заявке."""
     if not isinstance(logistic_offers, dict):
         return 0
 
@@ -443,10 +465,10 @@ def count_open_logistic_offers_for_request(request_id, source: str = None) -> in
 
         if not logistic_offer_matches_request(offer, request_id, source):
             continue
-        if normalize_transition_status(offer.get("status") or "pending") in {
-            "pending",
-            "active",
-        }:
+        if (
+            normalize_transition_status(offer.get("status") or "pending")
+            in OPEN_LOGISTIC_OFFER_STATUSES
+        ):
             total += 1
     return total
 
@@ -454,43 +476,13 @@ def count_open_logistic_offers_for_request(request_id, source: str = None) -> in
 def count_open_expeditor_request_offers_for_request(
     request_id, source: str = "exporter"
 ) -> int:
-    """Количество открытых (pending/active) офферов экспедитора по заявке."""
-    if not isinstance(expeditor_request_offers, dict):
-        return 0
-
+    """Количество открытых офферов экспедитора по заявке."""
     total = 0
-    seen_offer_ids = set()
-    for offer_key, offer in expeditor_request_offers.items():
-        if not isinstance(offer, dict):
-            continue
-
-        canonical_offer_id = offer.get("id", offer_key)
-        canonical_key = str(canonical_offer_id)
-        if canonical_key in seen_offer_ids:
-            continue
-        seen_offer_ids.add(canonical_key)
-
-        if not same_id(offer.get("request_id"), request_id):
-            continue
-        offer_source = str(offer.get("source") or "").strip().lower()
-        if offer_source == "logistic":
-            offer_source = "logistics"
-        if offer_source not in {"exporter", "farmer", "logistics"}:
-            inferred_source = infer_logistic_offer_source(offer.get("request_id"))
-            if inferred_source in {"exporter", "farmer", "logistics"}:
-                offer_source = inferred_source
-            else:
-                continue
-        if source == "exporter" and offer_source != "exporter":
-            continue
-        if source == "farmer" and offer_source != "farmer":
-            continue
-        if source == "logistics" and offer_source != "logistics":
-            continue
-        if normalize_transition_status(offer.get("status") or "pending") in {
-            "pending",
-            "active",
-        }:
+    for _, _, offer in iter_request_related_expeditor_offers(request_id, source):
+        if (
+            normalize_transition_status(offer.get("status") or "pending")
+            in OPEN_EXPEDITOR_OFFER_STATUSES
+        ):
             total += 1
     return total
 
@@ -517,11 +509,31 @@ def get_assigned_logist_id(entity: dict):
     """Возвращает ID назначенного логиста (с учетом legacy-полей)."""
     if not isinstance(entity, dict):
         return None
-    return entity.get("logist_id") or entity.get("assigned_logist_id") or entity.get(
-        "selected_logistic"
-    ) or entity.get(
-        "logistic_id"
+    assigned_id = (
+        entity.get("assigned_logist_id")
+        or entity.get("selected_logistic")
+        or entity.get("logistic_id")
     )
+    if assigned_id:
+        return assigned_id
+
+    logist_id = entity.get("logist_id")
+    if not logist_id:
+        return None
+
+    # Logistics-заявки могут хранить владельца в logist_id.
+    # Если logist_id совпадает с owner-полем, считаем что исполнитель ещё не назначен.
+    owner_id = entity.get("customer_id") or entity.get("created_by")
+    if owner_id and same_id(logist_id, owner_id):
+        # Для delivery-сущностей (обычно есть request_id) logist_id — исполнитель.
+        if entity.get("request_id") is not None:
+            return logist_id
+        status_norm = normalize_transition_status(entity.get("status"))
+        if status_norm in {"assigned", "in_progress", "completed", "expeditor_selected"}:
+            return logist_id
+        return None
+
+    return logist_id
 
 
 def has_assigned_logist(entity: dict) -> bool:
@@ -558,7 +570,18 @@ def refresh_exporter_request_offer_state(request_id) -> bool:
         request_id, "exporter"
     )
 
-    request_status = normalize_transition_status(request.get("status"))
+    request_owner_id = (
+        request.get("exporter_id")
+        or request.get("customer_id")
+        or request.get("created_by")
+    )
+    request_status = get_effective_request_status(
+        request_id,
+        "exporter",
+        request,
+        request_owner_id=request_owner_id,
+        request_exporter_id=request_owner_id,
+    )
     logist_assigned = has_assigned_logist(request)
     expeditor_assigned = has_assigned_expeditor(request)
     if (
@@ -667,6 +690,254 @@ def infer_logistic_offer_source(request_id):
     return None
 
 
+def get_request_delivery_guard_state(
+    request_id,
+    request_source: str = "exporter",
+    request_owner_id=None,
+    request_exporter_id=None,
+):
+    """Возвращает блокирующее состояние delivery по заявке: live / closed / None."""
+    if not isinstance(deliveries, dict):
+        return None
+
+    source = str(request_source or "").strip().lower()
+    if source == "logistic":
+        source = "logistics"
+    if source not in {"exporter", "farmer", "logistics"}:
+        return None
+
+    has_live_delivery = False
+    has_closed_delivery = False
+
+    for delivery in deliveries.values():
+        if not isinstance(delivery, dict):
+            continue
+        if not same_id(delivery.get("request_id"), request_id):
+            continue
+
+        delivery_source = str(delivery.get("source") or "").strip().lower()
+        if delivery_source == "logistic":
+            delivery_source = "logistics"
+        if delivery_source not in {"exporter", "farmer", "logistics"}:
+            inferred_source = infer_logistic_offer_source(delivery.get("request_id"))
+            if inferred_source in {"exporter", "farmer", "logistics"}:
+                delivery_source = inferred_source
+            else:
+                continue
+
+        if source == "exporter":
+            if delivery_source not in {"", "exporter"}:
+                continue
+            delivery_owner_id = (
+                delivery.get("exporter_id")
+                or delivery.get("customer_id")
+                or delivery.get("created_by")
+            )
+            if (
+                request_exporter_id
+                and delivery_owner_id not in {None, ""}
+                and not same_id(delivery_owner_id, request_exporter_id)
+            ):
+                continue
+        elif source == "farmer":
+            if delivery_source != "farmer":
+                continue
+            delivery_owner_id = delivery.get("farmer_id") or delivery.get("user_id")
+            if (
+                request_owner_id
+                and delivery_owner_id not in {None, ""}
+                and not same_id(delivery_owner_id, request_owner_id)
+            ):
+                continue
+        else:
+            if delivery_source != "logistics":
+                continue
+            delivery_owner_id = (
+                delivery.get("customer_id")
+                or delivery.get("created_by")
+                or delivery.get("exporter_id")
+            )
+            if not delivery_owner_id:
+                legacy_logist_owner_id = delivery.get("logist_id")
+                has_assigned_logist_id = bool(
+                    delivery.get("assigned_logist_id") or delivery.get("selected_logistic")
+                )
+                if legacy_logist_owner_id and not has_assigned_logist_id:
+                    delivery_owner_id = legacy_logist_owner_id
+            if (
+                request_owner_id
+                and delivery_owner_id not in {None, ""}
+                and not same_id(delivery_owner_id, request_owner_id)
+            ):
+                continue
+
+        delivery_status = normalize_transition_status(delivery.get("status"))
+        if delivery_status in {"completed", "cancelled"}:
+            has_closed_delivery = True
+        elif delivery_status in {"in_progress", "expeditor_selected"}:
+            has_live_delivery = True
+
+    if has_closed_delivery:
+        return "closed"
+    if has_live_delivery:
+        return "live"
+    return None
+
+
+def get_effective_delivery_status(delivery: dict, linked_request: dict = None) -> str:
+    """Возвращает эффективный статус доставки с учетом связанной заявки."""
+    if not isinstance(delivery, dict):
+        return "pending"
+
+    delivery_status = normalize_transition_status(delivery.get("status", "pending"))
+    if delivery_status in {"completed", "cancelled"}:
+        return delivery_status
+
+    request = linked_request if isinstance(linked_request, dict) else None
+    if request is None:
+        request_id = delivery.get("request_id")
+        delivery_source = str(delivery.get("source") or "").strip().lower()
+        if delivery_source == "logistic":
+            delivery_source = "logistics"
+        if delivery_source not in {"exporter", "farmer", "logistics"}:
+            inferred_source = infer_logistic_offer_source(request_id)
+            if inferred_source in {"exporter", "farmer", "logistics"}:
+                delivery_source = inferred_source
+        if delivery_source == "farmer":
+            _, request = find_farmer_request_by_id(request_id)
+        elif delivery_source == "logistics":
+            request = logistics_requests.get(request_id) or logistics_requests.get(
+                str(request_id)
+            )
+        else:
+            _, request = find_shipping_request_by_id(request_id)
+        request = request if isinstance(request, dict) else None
+
+    request_status = normalize_transition_status((request or {}).get("status"))
+    if request_status in {"completed", "cancelled"}:
+        return request_status
+    if (
+        request_status in {"in_progress", "expeditor_selected"}
+        and delivery_status in {"", "pending", "assigned", "accepted", "new", "open", "active", "selected", "reserved"}
+    ):
+        return request_status
+
+    return delivery_status or request_status or "pending"
+
+
+def get_effective_request_status(
+    request_id,
+    source: str,
+    request: dict,
+    request_owner_id=None,
+    request_exporter_id=None,
+) -> str:
+    """Возвращает эффективный статус заявки с учетом связанной доставки."""
+    if not isinstance(request, dict):
+        return "pending"
+
+    request_status = normalize_transition_status(request.get("status") or "pending")
+    if request_status in {"completed", "cancelled"}:
+        return request_status
+
+    best_delivery_status = ""
+    best_delivery_rank = -1
+    delivery_status_rank = {
+        "cancelled": 5,
+        "completed": 5,
+        "in_progress": 4,
+        "expeditor_selected": 3,
+        "assigned": 2,
+        "accepted": 1,
+        "pending": 1,
+        "new": 1,
+        "open": 1,
+        "active": 1,
+        "selected": 1,
+        "reserved": 1,
+    }
+
+    for delivery in deliveries.values():
+        if not isinstance(delivery, dict):
+            continue
+        if not same_id(delivery.get("request_id"), request_id):
+            continue
+
+        delivery_source = str(delivery.get("source") or "").strip().lower()
+        if delivery_source == "logistic":
+            delivery_source = "logistics"
+        if delivery_source not in {"exporter", "farmer", "logistics"}:
+            inferred_source = infer_logistic_offer_source(delivery.get("request_id"))
+            if inferred_source in {"exporter", "farmer", "logistics"}:
+                delivery_source = inferred_source
+            else:
+                continue
+
+        if source == "exporter":
+            if delivery_source not in {"", "exporter"}:
+                continue
+            delivery_owner_id = (
+                delivery.get("exporter_id")
+                or delivery.get("customer_id")
+                or delivery.get("created_by")
+            )
+            if (
+                request_exporter_id
+                and delivery_owner_id not in {None, ""}
+                and not same_id(delivery_owner_id, request_exporter_id)
+            ):
+                continue
+        elif source == "farmer":
+            if delivery_source != "farmer":
+                continue
+            delivery_owner_id = delivery.get("farmer_id") or delivery.get("user_id")
+            if (
+                request_owner_id
+                and delivery_owner_id not in {None, ""}
+                and not same_id(delivery_owner_id, request_owner_id)
+            ):
+                continue
+        else:
+            if delivery_source != "logistics":
+                continue
+            delivery_owner_id = (
+                delivery.get("customer_id")
+                or delivery.get("created_by")
+                or delivery.get("exporter_id")
+            )
+            if not delivery_owner_id:
+                legacy_logist_owner_id = delivery.get("logist_id")
+                has_assigned_logist_id = bool(
+                    delivery.get("assigned_logist_id")
+                    or delivery.get("selected_logistic")
+                )
+                if legacy_logist_owner_id and not has_assigned_logist_id:
+                    delivery_owner_id = legacy_logist_owner_id
+            if (
+                request_owner_id
+                and delivery_owner_id not in {None, ""}
+                and not same_id(delivery_owner_id, request_owner_id)
+            ):
+                continue
+
+        effective_delivery_status = get_effective_delivery_status(delivery, request)
+        rank = delivery_status_rank.get(effective_delivery_status, 0)
+        if rank > best_delivery_rank:
+            best_delivery_rank = rank
+            best_delivery_status = effective_delivery_status
+
+    if best_delivery_status in {"cancelled", "completed"}:
+        return best_delivery_status
+    if (
+        best_delivery_status in {"expeditor_selected", "in_progress"}
+        and request_status
+        in {"pending", "active", "has_offers", "assigned", "new", "open", "accepted", "selected"}
+    ):
+        return best_delivery_status
+
+    return request_status or best_delivery_status or "pending"
+
+
 def normalize_logistic_offer_sources() -> int:
     """Нормализация source у legacy-офферов без источника."""
     if not isinstance(logistic_offers, dict):
@@ -722,6 +993,30 @@ def find_batch_by_id(batch_id):
 def count_all_batches() -> int:
     """Количество партий в batches с учетом mixed-структур."""
     return sum(1 for _ in iter_all_batches())
+
+
+def iter_all_requests():
+    """Итерирует заявки в unified-формате: (source, request_id, request_dict)."""
+    request_storages = (
+        ("exporter", shipping_requests),
+        ("farmer", farmer_shipping_requests),
+        ("farmer", farmer_logistics_requests),
+        ("logistics", logistics_requests),
+    )
+    seen_request_keys = set()
+
+    for source, storage in request_storages:
+        if not isinstance(storage, dict):
+            continue
+        for request_key, request in storage.items():
+            if not isinstance(request, dict):
+                continue
+            canonical_id = request.get("id", request_key)
+            dedupe_key = (source, str(canonical_id))
+            if dedupe_key in seen_request_keys:
+                continue
+            seen_request_keys.add(dedupe_key)
+            yield source, canonical_id, request
 
 
 def get_user_batches(user_id):
@@ -1023,6 +1318,354 @@ def find_expeditor_request_offer_by_id(offer_id):
     return None, None
 
 
+def find_request_related_expeditor_offer_by_ref(offer_ref):
+    """Поиск оффера экспедитора по заявке в новых и legacy-хранилищах."""
+    raw_ref = str(offer_ref).strip()
+    storage = "request"
+    offer_lookup_id = raw_ref
+    if raw_ref.startswith("route_"):
+        storage = "route"
+        offer_lookup_id = raw_ref.split("_", 1)[1]
+    elif raw_ref.startswith("request_"):
+        storage = "request"
+        offer_lookup_id = raw_ref.split("_", 1)[1]
+
+    normalized_offer_id = (
+        int(offer_lookup_id) if str(offer_lookup_id).isdigit() else offer_lookup_id
+    )
+
+    if storage == "route":
+        resolved_offer_id, offer = find_expeditor_offer_by_id(normalized_offer_id)
+        return storage, resolved_offer_id, offer
+
+    resolved_offer_id, offer = find_expeditor_request_offer_by_id(normalized_offer_id)
+    if offer:
+        return storage, resolved_offer_id, offer
+
+    resolved_offer_id, offer = find_expeditor_offer_by_id(normalized_offer_id)
+    if offer:
+        return "route", resolved_offer_id, offer
+
+    return storage, None, None
+
+
+def iter_request_related_expeditor_offers(request_id, source: str = "exporter"):
+    """Итератор по expeditor-offers заявки из новых и legacy-хранилищ."""
+    storages = (
+        ("request", expeditor_request_offers),
+        ("route", expeditor_offers),
+    )
+    seen_offer_keys = set()
+
+    for storage_name, storage in storages:
+        if not isinstance(storage, dict):
+            continue
+        for offer_key, offer in storage.items():
+            if not isinstance(offer, dict):
+                continue
+            if not same_id(offer.get("request_id"), request_id):
+                continue
+            offer_source = str(offer.get("source") or "").strip().lower()
+            if offer_source == "logistic":
+                offer_source = "logistics"
+            if offer_source not in {"exporter", "farmer", "logistics"}:
+                inferred_source = infer_logistic_offer_source(offer.get("request_id"))
+                if inferred_source in {"exporter", "farmer", "logistics"}:
+                    offer_source = inferred_source
+                else:
+                    continue
+            if source == "exporter" and offer_source != "exporter":
+                continue
+            if source == "farmer" and offer_source != "farmer":
+                continue
+            if source == "logistics" and offer_source != "logistics":
+                continue
+
+            canonical_offer_id = offer.get("id", offer_key)
+            if canonical_offer_id is None:
+                canonical_offer_id = offer_key
+            dedup_key = f"{storage_name}:{canonical_offer_id}"
+            if dedup_key in seen_offer_keys:
+                continue
+            seen_offer_keys.add(dedup_key)
+
+            if offer.get("id") is None and canonical_offer_id is not None:
+                offer["id"] = canonical_offer_id
+            yield storage_name, canonical_offer_id, offer
+
+
+def find_expeditor_self_offer_by_ref(offer_ref):
+    """Поиск оффера экспедитора в self-списках по ref с type-prefix."""
+    raw_ref = str(offer_ref).strip()
+    storage = "route"
+    offer_lookup_id = raw_ref
+    if raw_ref.startswith("request_"):
+        storage = "request"
+        offer_lookup_id = raw_ref.split("_", 1)[1]
+    elif raw_ref.startswith("route_"):
+        storage = "route"
+        offer_lookup_id = raw_ref.split("_", 1)[1]
+
+    normalized_offer_id = (
+        int(offer_lookup_id) if str(offer_lookup_id).isdigit() else offer_lookup_id
+    )
+
+    if storage == "request":
+        resolved_offer_id, offer = find_expeditor_request_offer_by_id(normalized_offer_id)
+        return storage, resolved_offer_id, offer
+
+    resolved_offer_id, offer = find_expeditor_offer_by_id(normalized_offer_id)
+    if offer:
+        return storage, resolved_offer_id, offer
+
+    resolved_offer_id, offer = find_expeditor_request_offer_by_id(normalized_offer_id)
+    if offer:
+        return "request", resolved_offer_id, offer
+
+    return storage, None, None
+
+
+def iter_expeditor_self_offers(expeditor_id=None):
+    """Итератор по офферам экспедитора из новых и legacy-хранилищ."""
+    storages = (
+        ("route", expeditor_offers),
+        ("request", expeditor_request_offers),
+    )
+    seen_offer_keys = set()
+
+    for storage_name, storage in storages:
+        if not isinstance(storage, dict):
+            continue
+        for offer_key, offer in storage.items():
+            if not isinstance(offer, dict):
+                continue
+            if expeditor_id is not None and not same_id(offer.get("expeditor_id"), expeditor_id):
+                continue
+            canonical_offer_id = offer.get("id", offer_key)
+            if canonical_offer_id is None:
+                canonical_offer_id = offer_key
+            dedup_key = f"{storage_name}:{canonical_offer_id}"
+            if dedup_key in seen_offer_keys:
+                continue
+            seen_offer_keys.add(dedup_key)
+            if offer.get("id") is None and canonical_offer_id is not None:
+                offer["id"] = canonical_offer_id
+            yield storage_name, canonical_offer_id, offer
+
+
+def get_effective_expeditor_offer_status(storage_name: str, offer: dict) -> str:
+    """Эффективный статус оффера экспедитора с учетом связанной заявки и доставки."""
+    raw_status = normalize_transition_status((offer or {}).get("status") or "pending")
+    if raw_status in {"completed", "cancelled", "rejected", "in_progress"}:
+        return raw_status
+
+    request_id = (offer or {}).get("request_id")
+    if request_id in {None, ""}:
+        return raw_status
+
+    offer_source = str((offer or {}).get("source") or "").strip().lower()
+    if offer_source == "logistic":
+        offer_source = "logistics"
+    if offer_source not in {"exporter", "farmer", "logistics"}:
+        inferred_source = infer_logistic_offer_source(request_id)
+        if inferred_source in {"exporter", "farmer", "logistics"}:
+            offer_source = inferred_source
+        else:
+            return raw_status
+
+    if offer_source == "farmer":
+        _, linked_request = find_farmer_request_by_id(request_id)
+        request_owner_id = (linked_request if isinstance(linked_request, dict) else {}).get(
+            "farmer_id"
+        ) or (linked_request if isinstance(linked_request, dict) else {}).get("user_id")
+        request_exporter_id = None
+    elif offer_source == "logistics":
+        linked_request = logistics_requests.get(request_id) or logistics_requests.get(
+            str(request_id)
+        )
+        request_obj = linked_request if isinstance(linked_request, dict) else {}
+        request_owner_id = (
+            request_obj.get("customer_id")
+            or request_obj.get("created_by")
+            or request_obj.get("exporter_id")
+        )
+        if not request_owner_id:
+            legacy_logist_owner_id = request_obj.get("logist_id")
+            has_assigned_logist_id = bool(
+                request_obj.get("assigned_logist_id")
+                or request_obj.get("selected_logistic")
+            )
+            if legacy_logist_owner_id and not has_assigned_logist_id:
+                request_owner_id = legacy_logist_owner_id
+        request_exporter_id = None
+    else:
+        _, linked_request = find_shipping_request_by_id(request_id)
+        request_owner_id = None
+        request_exporter_id = (
+            (linked_request if isinstance(linked_request, dict) else {}).get("exporter_id")
+            or (linked_request if isinstance(linked_request, dict) else {}).get("customer_id")
+            or (linked_request if isinstance(linked_request, dict) else {}).get("created_by")
+        )
+
+    linked_request = linked_request if isinstance(linked_request, dict) else {}
+    if not linked_request:
+        return raw_status
+
+    offer_expeditor_id = (offer or {}).get("expeditor_id")
+    for delivery in deliveries.values():
+        if not isinstance(delivery, dict):
+            continue
+        if not same_id(delivery.get("request_id"), request_id):
+            continue
+        if not same_id(get_assigned_expeditor_id(delivery), offer_expeditor_id):
+            continue
+
+        delivery_source = str(delivery.get("source") or "").strip().lower()
+        if delivery_source == "logistic":
+            delivery_source = "logistics"
+        if delivery_source not in {"exporter", "farmer", "logistics"}:
+            inferred_source = infer_logistic_offer_source(delivery.get("request_id"))
+            if inferred_source in {"exporter", "farmer", "logistics"}:
+                delivery_source = inferred_source
+            else:
+                continue
+        if delivery_source != offer_source:
+            continue
+
+        delivery_status = get_effective_delivery_status(delivery, linked_request)
+        if delivery_status == "expeditor_selected":
+            return "accepted"
+        if delivery_status in {"in_progress", "completed", "cancelled"}:
+            return delivery_status
+
+    selected_expeditor_id = (
+        linked_request.get("selected_expeditor")
+        or linked_request.get("selected_expeditor_id")
+        or linked_request.get("expeditor_id")
+    )
+    if same_id(selected_expeditor_id, offer_expeditor_id):
+        request_status = get_effective_request_status(
+            request_id,
+            offer_source,
+            linked_request,
+            request_owner_id=request_owner_id,
+            request_exporter_id=request_exporter_id,
+        )
+        if request_status == "expeditor_selected":
+            return "accepted"
+        if request_status in {"in_progress", "completed", "cancelled"}:
+            return request_status
+
+    return raw_status
+
+
+def get_effective_deal_status(deal: dict) -> str:
+    """Возвращает фактический статус сделки с учетом связанной заявки или пула."""
+    if not isinstance(deal, dict):
+        return "pending"
+
+    raw_status = normalize_transition_status(deal.get("status") or "pending")
+    if raw_status in {"completed", "cancelled"}:
+        return raw_status
+
+    request_id = deal.get("request_id")
+    deal_source = str(deal.get("source") or "").strip().lower()
+    if deal_source == "logistic":
+        deal_source = "logistics"
+
+    if request_id is not None:
+        if deal_source not in {"exporter", "farmer", "logistics"}:
+            inferred_source = infer_logistic_offer_source(request_id)
+            if inferred_source in {"exporter", "farmer", "logistics"}:
+                deal_source = inferred_source
+
+        linked_request = None
+        if deal_source == "farmer":
+            _, linked_request = find_farmer_request_by_id(request_id)
+        elif deal_source == "logistics":
+            linked_request = logistics_requests.get(request_id) or logistics_requests.get(
+                str(request_id)
+            )
+        else:
+            _, linked_request = find_shipping_request_by_id(request_id)
+        if linked_request is None and deal_source != "exporter":
+            _, linked_request = find_shipping_request_by_id(request_id)
+        linked_request = linked_request if isinstance(linked_request, dict) else None
+
+        if linked_request is not None:
+            request_owner_id = None
+            request_exporter_id = None
+            if deal_source == "farmer":
+                request_owner_id = linked_request.get("farmer_id") or linked_request.get(
+                    "user_id"
+                )
+            elif deal_source == "logistics":
+                request_owner_id = (
+                    linked_request.get("owner_id")
+                    or linked_request.get("customer_id")
+                    or linked_request.get("created_by")
+                    or linked_request.get("exporter_id")
+                    or linked_request.get("farmer_id")
+                    or linked_request.get("user_id")
+                )
+                if not request_owner_id:
+                    legacy_logist_owner_id = linked_request.get("logist_id")
+                    has_assigned_logist_id = bool(
+                        linked_request.get("assigned_logist_id")
+                        or linked_request.get("selected_logistic")
+                    )
+                    if legacy_logist_owner_id and not has_assigned_logist_id:
+                        request_owner_id = legacy_logist_owner_id
+            else:
+                request_exporter_id = (
+                    linked_request.get("exporter_id")
+                    or linked_request.get("customer_id")
+                    or linked_request.get("created_by")
+                )
+
+            request_status = get_effective_request_status(
+                request_id,
+                deal_source or "exporter",
+                linked_request,
+                request_owner_id=request_owner_id,
+                request_exporter_id=request_exporter_id,
+            )
+            if request_status in {"completed", "cancelled"}:
+                return request_status
+            if request_status in {"assigned", "expeditor_selected", "in_progress"}:
+                return request_status
+
+    pull_id = deal.get("pull_id")
+    if pull_id is not None:
+        all_pulls = pulls.get("pulls", {}) if isinstance(pulls, dict) else {}
+        pull = all_pulls.get(pull_id) or all_pulls.get(str(pull_id))
+        pull = pull if isinstance(pull, dict) else None
+        pull_status = normalize_transition_status((pull or {}).get("status"))
+        if pull_status in {"completed", "sold"}:
+            return "completed"
+        if pull_status == "cancelled":
+            return "cancelled"
+        if pull_status in {"filled", "closed", "shipped"} and raw_status in {
+            "",
+            "none",
+            "pending",
+            "matched",
+            "new",
+            "accepted",
+            "active",
+            "open",
+            "assigned",
+        }:
+            return "shipping"
+
+    if raw_status in {"assigned", "expeditor_selected", "in_progress"}:
+        return raw_status
+    if raw_status in {"accepted", "active", "open"}:
+        return "shipping"
+
+    return raw_status or "pending"
+
+
 def find_deal_by_id(deal_id):
     """Поиск сделки с учетом int/str ключей."""
     if not isinstance(deals, dict):
@@ -1054,7 +1697,7 @@ def migrate_all_existing_pulls():
             changed = True
 
         if "price_per_ton" not in pull and "price" in pull:
-            pull["price_per_ton"] = float(pull.get("price", 0))
+            pull["price_per_ton"] = get_safe_float(pull.get("price"), 0)
             changed = True
 
         if "farmer_ids" not in pull:
@@ -1129,8 +1772,8 @@ def migrate_old_pulls():
 
         if needs_migration:
             # Определяем статус по заполненности
-            current_vol = pull.get("current_volume", 0)
-            target_vol = pull.get("target_volume", 1)
+            current_vol = get_safe_float(pull.get("current_volume"), 0)
+            target_vol = get_safe_float(pull.get("target_volume"), 1)
 
             if current_vol >= target_vol and target_vol > 0:
                 pull["status"] = "filled"
@@ -1200,6 +1843,13 @@ def find_matching_batches(pull_data):
 
 def _batch_matches_pull(batch, pull_data):
     """✅ Логика сравнения батча и пула"""
+    batch_price = get_safe_float(batch.get("price"), float("inf"))
+    pull_price = get_safe_float(pull_data.get("price"), float("inf"))
+    batch_humidity = get_safe_float(batch.get("humidity"), 999)
+    pull_moisture = get_safe_float(pull_data.get("moisture"), 999)
+    batch_impurity = get_safe_float(batch.get("impurity"), 999)
+    pull_impurity = get_safe_float(pull_data.get("impurity"), 999)
+
     return (
         batch.get("culture", "").strip().lower()
         == pull_data.get("culture", "").strip().lower()
@@ -1207,10 +1857,9 @@ def _batch_matches_pull(batch, pull_data):
             batch.get("status"),
             {"active", "активна", "available", "доступна", "", "none"},
         )
-        and batch.get("price", float("inf"))
-        <= pull_data.get("price", float("inf")) * 0.75
-        and batch.get("humidity", 999) <= pull_data.get("moisture", 999)
-        and batch.get("impurity", 999) <= pull_data.get("impurity", 999)
+        and batch_price <= pull_price * 0.75
+        and batch_humidity <= pull_moisture
+        and batch_impurity <= pull_impurity
     )
 
 
@@ -1218,7 +1867,8 @@ def parse_join_pull_callback(callback_data: str) -> dict:
     """Универсальный парсер callback для join_pull"""
     try:
         parts = callback_data.split(":")
-        pull_id = int(parts[1])
+        pull_id_raw = parts[1]
+        pull_id = int(pull_id_raw) if str(pull_id_raw).isdigit() else pull_id_raw
         timestamp = parts[2] if len(parts) >= 3 else None
 
         logging.info(f"🔗 Parsed callback: pull_id={pull_id}, timestamp={timestamp}")
@@ -1231,8 +1881,8 @@ def parse_join_pull_callback(callback_data: str) -> dict:
 def validate_batch_volume(batch: dict, pull: dict) -> tuple:
     """Проверяет, поместится ли партия в пул"""
     batch_volume = batch.get("volume", 0)
-    current_volume = pull.get("current_volume", 0)
-    target_volume = pull.get("target_volume", 0)
+    current_volume = get_safe_float(pull.get("current_volume"), 0)
+    target_volume = get_safe_float(pull.get("target_volume"), 0)
     available = target_volume - current_volume
 
     if batch_volume > available:
@@ -1251,8 +1901,8 @@ async def check_and_close_pool_if_full(pull_id: int):
         logging.error(f"❌ Пул #{pull_id} не найден")
         return
     pull_id = resolved_pull_id
-    current = pull.get("current_volume", 0)
-    target = pull.get("target_volume", 0)
+    current = get_safe_float(pull.get("current_volume"), 0)
+    target = get_safe_float(pull.get("target_volume"), 0)
 
     logging.info(f"🔍 Проверка автозакрытия пула #{pull_id}: {current}/{target} т")
 
@@ -1278,7 +1928,7 @@ async def check_and_close_pool_if_full(pull_id: int):
         )
 
         # Уведомляем экспортёра
-        exporter_id = pull.get("exporter_id")
+        exporter_id = pull.get("exporter_id") or pull.get("creator_id")
         if exporter_id:
             try:
                 await bot.send_message(
@@ -1839,7 +2489,37 @@ def get_farmers_from_pull(pull_id):
 
 
 def parse_price(text: str) -> float:
-    value = float(text.replace(",", ".").replace(" ", ""))
+    raw = str(text or "").strip().replace(" ", "").replace("\u00A0", "").replace("₽", "")
+    if not raw:
+        raise ValueError("price is empty")
+
+    normalized = raw
+    has_comma = "," in raw
+    has_dot = "." in raw
+
+    # Поддержка форматов:
+    # 10000 | 10 000 | 10,000 | 10.000 | 10,5 | 10.5 | 10,50 | 10.50
+    if has_comma and has_dot:
+        if raw.rfind(",") > raw.rfind("."):
+            # 1.234,56 -> 1234.56
+            normalized = raw.replace(".", "").replace(",", ".")
+        else:
+            # 1,234.56 -> 1234.56
+            normalized = raw.replace(",", "")
+    elif has_comma:
+        parts = raw.split(",")
+        if len(parts) > 1 and len(parts[-1]) in {1, 2}:
+            normalized = "".join(parts[:-1]) + "." + parts[-1]
+        else:
+            normalized = "".join(parts)
+    elif has_dot:
+        parts = raw.split(".")
+        if len(parts) > 1 and len(parts[-1]) in {1, 2}:
+            normalized = "".join(parts[:-1]) + "." + parts[-1]
+        else:
+            normalized = "".join(parts)
+
+    value = float(normalized)
     if value < 0:
         raise ValueError("price must be positive")
     return value
@@ -2646,6 +3326,10 @@ def expeditor_service_keyboard():
 async def expeditor_view_deal_details(callback: types.CallbackQuery, state: FSMContext):
     """Просмотр деталей сделки"""
     await state.finish()
+    user_id = callback.from_user.id
+    user = get_user_by_id(user_id) or {}
+    user_role = str(user.get("role", "")).strip().lower()
+    is_admin = user_role == "admin" or user_id == ADMIN_ID
 
     try:
         deal_id = parse_callback_id(callback.data)
@@ -2662,21 +3346,51 @@ async def expeditor_view_deal_details(callback: types.CallbackQuery, state: FSMC
         await callback.answer("❌ Сделка не найдена", show_alert=True)
         return
 
+    effective_status = get_effective_deal_status(deal)
+    assigned_expeditor_id = get_assigned_expeditor_id(deal)
+    assigned_logist_id = get_assigned_logist_id(deal)
+    if not (is_admin or is_expeditor_role(user_role)):
+        await callback.answer("❌ Нет доступа к сделке", show_alert=True)
+        return
+    if not is_admin and assigned_expeditor_id in {None, ""}:
+        await callback.answer(
+            "❌ Сделка ещё не назначена вам экспортёром", show_alert=True
+        )
+        return
+    if not is_admin and not same_id(assigned_expeditor_id, user_id):
+        await callback.answer("❌ Сделка назначена другому экспедитору", show_alert=True)
+        return
+
     msg = f"📋 <b>Сделка #{deal_id}</b>\n\n"
     msg += f"🌾 Культура: {deal.get('culture', 'Н/Д')}\n"
-    msg += f"📦 Объём: {deal.get('total_volume', deal.get('volume', 0))} т\n"
-    msg += f"💰 Цена: {deal.get('price', 0):,.0f} ₽/т\n"
+    msg += (
+        f"📦 Объём: {get_safe_float(deal.get('total_volume', deal.get('volume', 0)), 0):,.0f} т\n"
+    )
+    msg += f"💰 Цена: {get_safe_float(deal.get('price'), 0):,.0f} ₽/т\n"
     msg += f"🚢 Порт: {deal.get('port', 'Не указан')}\n"
+    msg += f"📊 Статус: {DEAL_STATUSES.get(effective_status, effective_status)}\n"
     participants = deal.get("participants") or deal.get("farmer_ids", [])
+    legacy_farmer_id = deal.get("farmer_id")
+    if legacy_farmer_id not in {None, ""} and not any(
+        same_id(legacy_farmer_id, pid) for pid in participants
+    ):
+        participants = [*participants, legacy_farmer_id]
     msg += f"👥 Участников: {len(participants)}\n\n"
 
     keyboard = InlineKeyboardMarkup(row_width=1)
-    keyboard.add(
-        InlineKeyboardButton(
-            "✅ Взять в работу", callback_data=f"expeditor_take:{deal_id}"
-        ),
-        InlineKeyboardButton("◀️ Назад", callback_data="expeditor_available_deals"),
-    )
+    if (
+        effective_status not in {"completed", "cancelled"}
+        and assigned_logist_id
+        and assigned_expeditor_id not in {None, ""}
+        and same_id(assigned_expeditor_id, user_id)
+        and effective_status != "in_progress"
+    ):
+        keyboard.add(
+            InlineKeyboardButton(
+                "✅ Взять в работу", callback_data=f"expeditor_take:{deal_id}"
+            )
+        )
+    keyboard.add(InlineKeyboardButton("◀️ Назад", callback_data="back_to_deals"))
 
     await callback.message.edit_text(msg, reply_markup=keyboard, parse_mode="HTML")
     await callback.answer()
@@ -2707,9 +3421,31 @@ async def expeditor_take_deal(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer("❌ Сделка не найдена", show_alert=True)
         return
 
-    if deal.get("expeditor_id"):
+    deal_status = get_effective_deal_status(deal)
+    if deal_status in {"completed", "cancelled"}:
+        await callback.answer("ℹ️ Сделка уже закрыта", show_alert=True)
+        return
+    if deal_status == "in_progress":
+        await callback.answer("ℹ️ Сделка уже в работе", show_alert=True)
+        return
+
+    if not get_assigned_logist_id(deal):
+        await callback.answer(
+            "❌ Сначала по сделке должен быть выбран логист", show_alert=True
+        )
+        return
+
+    assigned_expeditor_id = get_assigned_expeditor_id(deal)
+    if assigned_expeditor_id not in {None, ""} and not same_id(
+        assigned_expeditor_id, user_id
+    ):
         await callback.answer(
             "❌ Сделка уже взята другим экспедитором", show_alert=True
+        )
+        return
+    if assigned_expeditor_id in {None, ""}:
+        await callback.answer(
+            "❌ Сделка ещё не назначена вам экспортёром", show_alert=True
         )
         return
 
@@ -2717,6 +3453,7 @@ async def expeditor_take_deal(callback: types.CallbackQuery, state: FSMContext):
     deal["expeditor_id"] = user_id
     deal["expeditor_name"] = (get_user_by_id(user_id) or {}).get("name", "Неизвестно")
     deal["status"] = "in_progress"
+    deal.setdefault("started_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
     save_deals_to_pickle()
 
@@ -2731,15 +3468,22 @@ async def expeditor_take_deal(callback: types.CallbackQuery, state: FSMContext):
     )
 
     # Уведомляем экспортёра
+    pull_id = deal.get("pull_id")
+    all_pulls = pulls.get("pulls", {}) if isinstance(pulls, dict) else {}
+    pull = all_pulls.get(pull_id) or all_pulls.get(str(pull_id), {})
+    deal_exporter_id = (
+        deal.get("exporter_id") or pull.get("exporter_id") or pull.get("creator_id")
+    )
     try:
-        await bot.send_message(
-            deal["exporter_id"],
-            f"✅ <b>Сделка #{deal_id} взята в работу!</b>\n\n"
-            f"📋 Экспедитор: {(get_user_by_id(user_id) or {}).get('name')}\n"
-            f"📱 Телефон: {(get_user_by_id(user_id) or {}).get('phone')}\n\n"
-            "Экспедитор начнёт оформление документов.",
-            parse_mode="HTML",
-        )
+        if deal_exporter_id is not None:
+            await bot.send_message(
+                deal_exporter_id,
+                f"✅ <b>Сделка #{deal_id} взята в работу!</b>\n\n"
+                f"📋 Экспедитор: {(get_user_by_id(user_id) or {}).get('name')}\n"
+                f"📱 Телефон: {(get_user_by_id(user_id) or {}).get('phone')}\n\n"
+                "Экспедитор начнёт оформление документов.",
+                parse_mode="HTML",
+            )
     except Exception as e:
         logging.error(f"Ошибка уведомления экспортёра: {e}")
 
@@ -2769,11 +3513,23 @@ def adminkeyboard():
 
 def format_admin_statistics():
     """Форматирование статистики"""
-    total_users = len(users)
-    farmers = sum(1 for u in users.values() if u.get("role") == "farmer")
-    exporters = sum(1 for u in users.values() if u.get("role") == "exporter")
-    logists = sum(1 for u in users.values() if is_logistic_role(u.get("role")))
-    expeditors = sum(1 for u in users.values() if is_expeditor_role(u.get("role")))
+    unique_users = {}
+    for user_id_data, user_data in users.items():
+        if not isinstance(user_data, dict):
+            continue
+        canonical_user_id = user_data.get("id", user_id_data)
+        canonical_key = str(canonical_user_id)
+        if canonical_key in unique_users:
+            continue
+        unique_users[canonical_key] = user_data
+
+    total_users = len(unique_users)
+    farmers = sum(1 for u in unique_users.values() if u.get("role") == "farmer")
+    exporters = sum(1 for u in unique_users.values() if u.get("role") == "exporter")
+    logists = sum(1 for u in unique_users.values() if is_logistic_role(u.get("role")))
+    expeditors = sum(
+        1 for u in unique_users.values() if is_expeditor_role(u.get("role"))
+    )
 
     # ❗️ Берём реальные пулы с учётом вложенной структуры
     all_pulls = pulls.get("pulls", pulls)
@@ -2787,11 +3543,35 @@ def format_admin_statistics():
 
     total_batches = count_all_batches()
 
-    total_requests = len(shipping_requests)
+    all_requests = list(iter_all_requests())
+    total_requests = len(all_requests)
     active_requests = sum(
         1
-        for r in shipping_requests.values()
-        if isinstance(r, dict) and is_request_open_for_offers(r.get("status"))
+        for source, request_id, request in all_requests
+        if get_effective_request_status(
+            request_id,
+            source,
+            request,
+            request_owner_id=(
+                (request.get("farmer_id") or request.get("user_id"))
+                if source == "farmer"
+                else (
+                    request.get("customer_id")
+                    or request.get("created_by")
+                    or request.get("exporter_id")
+                )
+                if source == "logistics"
+                else None
+            ),
+            request_exporter_id=(
+                request.get("exporter_id")
+                or request.get("customer_id")
+                or request.get("created_by")
+            )
+            if source == "exporter"
+            else None,
+        )
+        not in {"completed", "cancelled", "rejected"}
     )
 
     msg = "📊 <b>Статистика бота</b>\n\n"
@@ -2861,16 +3641,24 @@ async def confirm_reset_account(callback: CallbackQuery, state: FSMContext):
     await state.finish()
 
     deleted_items = []
+    removed_pull_ids = set()
 
     # 1. Удаляем пользователя из памяти
-    if user_id in users:
-        role = (get_user_by_id(user_id) or {}).get("role", "user")
-        del users[user_id]
+    user = get_user_by_id(user_id) or {}
+    if user:
+        role = user.get("role", "user")
+        for key in [user_id, str(user_id)]:
+            if key in users:
+                del users[key]
         deleted_items.append(f"профиль ({role})")
         logging.info(f"✅ Удалён user {user_id} из памяти")
 
     # 2. Удаляем партии пользователя и каскадно чистим ВСЁ
-    user_batches = batches.pop(user_id, [])
+    user_batches = []
+    for key in [user_id, str(user_id)]:
+        batches_for_key = batches.pop(key, [])
+        if isinstance(batches_for_key, list):
+            user_batches.extend(batches_for_key)
     batch_ids_to_delete = [
         b["id"] for b in user_batches if isinstance(b, dict) and "id" in b
     ]
@@ -2902,12 +3690,12 @@ async def confirm_reset_account(callback: CallbackQuery, state: FSMContext):
                 ]
 
                 pull["current_volume"] = (
-                    sum(b.get("volume", 0) for b in pull.get("batches_data", []))
+                    sum(get_safe_float(b.get("volume"), 0) for b in pull.get("batches_data", []))
                     if pull.get("batches_data")
                     else 0
                 )
 
-                target_volume = pull.get("target_volume", 0) or 0
+                target_volume = get_safe_float(pull.get("target_volume"), 0)
                 if pull["current_volume"] < target_volume:
                     pull["status"] = "active"
                 elif pull["current_volume"] >= target_volume and target_volume > 0:
@@ -2919,7 +3707,7 @@ async def confirm_reset_account(callback: CallbackQuery, state: FSMContext):
                         p
                         for p in pullparticipants[pull_id]
                         if p.get("batch_id") not in batch_ids_to_delete
-                        and not same_id(p.get("farmer_id"), user_id)
+                        and not same_id(p.get("farmer_id") or p.get("user_id"), user_id)
                     ]
 
         # 2.2. Чистим совпадения (matches) по удаляемым партиям/фермеру
@@ -2943,14 +3731,49 @@ async def confirm_reset_account(callback: CallbackQuery, state: FSMContext):
         save_pulls_to_pickle()
         logging.info("✅ Сохранены изменения пулов после каскадного удаления партий")
 
+    # 2.25. Удаляем пулы экспортёра и связанные записи по pull_id
+    if isinstance(pulls, dict) and "pulls" in pulls:
+        pull_keys_to_delete = []
+        for pull_key, pull in pulls["pulls"].items():
+            if not isinstance(pull, dict):
+                continue
+            pull_owner_id = pull.get("exporter_id") or pull.get("creator_id")
+            if not same_id(pull_owner_id, user_id):
+                continue
+            removed_pull_ids.add(pull.get("id", pull_key))
+            pull_keys_to_delete.append(pull_key)
+        for pull_key in pull_keys_to_delete:
+            pulls["pulls"].pop(pull_key, None)
+        if pull_keys_to_delete:
+            deleted_items.append(f"{len(pull_keys_to_delete)} пулов")
+            logging.info(f"✅ Удалено {len(pull_keys_to_delete)} пулов пользователя {user_id}")
+
+    if removed_pull_ids:
+        for participant_key in list(pullparticipants.keys()):
+            if any(same_id(participant_key, removed_pull_id) for removed_pull_id in removed_pull_ids):
+                pullparticipants.pop(participant_key, None)
+
     # 2.3. Чистим ЗАЯВКИ НА ЛОГИСТИКУ, ОФФЕРЫ И КАРТОЧКИ
+    removed_request_refs = set()
+
     # Заявки экспортёра
     sr_to_delete = [
         rid
         for rid, req in shipping_requests.items()
-        if same_id(req.get("exporter_id"), user_id)
+        if same_id(
+            req.get("exporter_id") or req.get("customer_id") or req.get("created_by"),
+            user_id,
+        )
+        or any(same_id(req.get("pull_id"), removed_pull_id) for removed_pull_id in removed_pull_ids)
     ]
     for rid in sr_to_delete:
+        req_obj = shipping_requests.get(rid)
+        req_ref = (
+            req_obj.get("id", rid)
+            if isinstance(req_obj, dict)
+            else rid
+        )
+        removed_request_refs.add(("exporter", req_ref))
         del shipping_requests[rid]
     if sr_to_delete:
         deleted_items.append(f"{len(sr_to_delete)} заявок экспортёра")
@@ -2958,18 +3781,73 @@ async def confirm_reset_account(callback: CallbackQuery, state: FSMContext):
             f"✅ Удалено {len(sr_to_delete)} shipping_requests для user {user_id}"
         )
 
-    # Заявки фермера
+    # Заявки заказчика-логиста
+    lr_to_delete = [
+        rid
+        for rid, req in logistics_requests.items()
+        if same_id(
+            req.get("customer_id")
+            or req.get("created_by")
+            or req.get("exporter_id")
+            or req.get("farmer_id")
+            or req.get("user_id"),
+            user_id,
+        )
+        or any(same_id(req.get("pull_id"), removed_pull_id) for removed_pull_id in removed_pull_ids)
+    ]
+    for rid in lr_to_delete:
+        req_obj = logistics_requests.get(rid)
+        req_ref = (
+            req_obj.get("id", rid)
+            if isinstance(req_obj, dict)
+            else rid
+        )
+        removed_request_refs.add(("logistics", req_ref))
+        del logistics_requests[rid]
+    if lr_to_delete:
+        deleted_items.append(f"{len(lr_to_delete)} заявок заказчика")
+        logging.info(
+            f"✅ Удалено {len(lr_to_delete)} logistics_requests для user {user_id}"
+        )
+
+    # Заявки фермера (shipping + logistics)
+    fsr_to_delete = [
+        rid
+        for rid, req in farmer_shipping_requests.items()
+        if same_id(req.get("farmer_id") or req.get("user_id"), user_id)
+        or any(same_id(req.get("pull_id"), removed_pull_id) for removed_pull_id in removed_pull_ids)
+    ]
+    for rid in fsr_to_delete:
+        req_obj = farmer_shipping_requests.get(rid)
+        req_ref = (
+            req_obj.get("id", rid)
+            if isinstance(req_obj, dict)
+            else rid
+        )
+        removed_request_refs.add(("farmer", req_ref))
+        del farmer_shipping_requests[rid]
+
     flr_to_delete = [
         rid
         for rid, req in farmer_logistics_requests.items()
-        if same_id(req.get("farmer_id"), user_id)
+        if same_id(req.get("farmer_id") or req.get("user_id"), user_id)
+        or any(same_id(req.get("pull_id"), removed_pull_id) for removed_pull_id in removed_pull_ids)
     ]
     for rid in flr_to_delete:
+        req_obj = farmer_logistics_requests.get(rid)
+        req_ref = (
+            req_obj.get("id", rid)
+            if isinstance(req_obj, dict)
+            else rid
+        )
+        removed_request_refs.add(("farmer", req_ref))
         del farmer_logistics_requests[rid]
-    if flr_to_delete:
-        deleted_items.append(f"{len(flr_to_delete)} заявок фермера")
+    if fsr_to_delete or flr_to_delete:
+        deleted_items.append(f"{len(fsr_to_delete) + len(flr_to_delete)} заявок фермера")
         logging.info(
-            f"✅ Удалено {len(flr_to_delete)} farmer_logistics_requests для user {user_id}"
+            "✅ Удалено "
+            f"{len(fsr_to_delete)} farmer_shipping_requests и "
+            f"{len(flr_to_delete)} farmer_logistics_requests для user {user_id}"
         )
 
     # Офферы логиста
@@ -2979,6 +3857,16 @@ async def confirm_reset_account(callback: CallbackQuery, state: FSMContext):
         if same_id(off.get("logistic_id"), user_id)
         or same_id(off.get("logist_id"), user_id)
     ]
+    if removed_request_refs:
+        lo_to_delete.extend(
+            oid
+            for oid, off in logistic_offers.items()
+            if any(
+                logistic_offer_matches_request(off, request_ref, request_source)
+                for request_source, request_ref in removed_request_refs
+            )
+        )
+    lo_to_delete = list(dict.fromkeys(lo_to_delete))
     for oid in lo_to_delete:
         del logistic_offers[oid]
     if lo_to_delete:
@@ -2992,6 +3880,7 @@ async def confirm_reset_account(callback: CallbackQuery, state: FSMContext):
         oid
         for oid, off in expeditor_pull_offers.items()
         if same_id(off.get("expeditor_id"), user_id)
+        or any(same_id(off.get("pull_id"), removed_pull_id) for removed_pull_id in removed_pull_ids)
     ]
     for oid in epo_to_delete:
         del expeditor_pull_offers[oid]
@@ -3001,22 +3890,164 @@ async def confirm_reset_account(callback: CallbackQuery, state: FSMContext):
         for oid, off in expeditor_request_offers.items()
         if same_id(off.get("expeditor_id"), user_id)
     ]
+    if removed_request_refs:
+        for oid, off in expeditor_request_offers.items():
+            if not isinstance(off, dict):
+                continue
+            offer_request_id = off.get("request_id")
+            offer_source = str(off.get("source") or "").strip().lower()
+            if offer_source == "logistic":
+                offer_source = "logistics"
+            if offer_source not in {"exporter", "farmer", "logistics"}:
+                inferred_source = infer_logistic_offer_source(offer_request_id)
+                if inferred_source in {"exporter", "farmer", "logistics"}:
+                    offer_source = inferred_source
+                else:
+                    offer_source = ""
+            if any(
+                same_id(offer_request_id, request_ref) and offer_source == request_source
+                for request_source, request_ref in removed_request_refs
+            ):
+                ero_to_delete.append(oid)
+    ero_to_delete = list(dict.fromkeys(ero_to_delete))
     for oid in ero_to_delete:
         del expeditor_request_offers[oid]
+
+    legacy_expeditor_offers_to_delete = []
+    for oid, off in expeditor_offers.items():
+        if not isinstance(off, dict):
+            continue
+        if same_id(off.get("expeditor_id"), user_id):
+            legacy_expeditor_offers_to_delete.append(oid)
+            continue
+        if not removed_request_refs:
+            continue
+        offer_request_id = off.get("request_id")
+        if offer_request_id is None:
+            continue
+        offer_source = str(off.get("source") or "").strip().lower()
+        if offer_source == "logistic":
+            offer_source = "logistics"
+        if offer_source not in {"exporter", "farmer", "logistics"}:
+            inferred_source = infer_logistic_offer_source(offer_request_id)
+            if inferred_source in {"exporter", "farmer", "logistics"}:
+                offer_source = inferred_source
+            else:
+                offer_source = ""
+        if any(
+            same_id(offer_request_id, request_ref) and offer_source == request_source
+            for request_source, request_ref in removed_request_refs
+        ):
+            legacy_expeditor_offers_to_delete.append(oid)
+    for oid in list(dict.fromkeys(legacy_expeditor_offers_to_delete)):
+        del expeditor_offers[oid]
 
     if epo_to_delete or ero_to_delete:
         total_exp = len(epo_to_delete) + len(ero_to_delete)
         deleted_items.append(f"{total_exp} офферов экспедитора")
         logging.info(f"✅ Удалено {total_exp} expeditor_offers для user {user_id}")
+    if legacy_expeditor_offers_to_delete:
+        deleted_items.append(f"{len(legacy_expeditor_offers_to_delete)} legacy-офферов экспедитора")
+        logging.info(
+            "✅ Удалено "
+            f"{len(legacy_expeditor_offers_to_delete)} expeditor_offers для user {user_id}"
+        )
+
+    # Удаляем связанные доставки и сделки, чтобы после reset не оставались orphan-сущности.
+    deliveries_to_delete = []
+    for delivery_id, delivery in deliveries.items():
+        if not isinstance(delivery, dict):
+            continue
+        delivery_request_id = delivery.get("request_id")
+        delivery_source = str(delivery.get("source") or "").strip().lower()
+        if delivery_source == "logistic":
+            delivery_source = "logistics"
+        if delivery_source not in {"exporter", "farmer", "logistics"} and delivery_request_id is not None:
+            inferred_source = infer_logistic_offer_source(delivery_request_id)
+            if inferred_source in {"exporter", "farmer", "logistics"}:
+                delivery_source = inferred_source
+            else:
+                delivery_source = ""
+        if (
+            same_id(
+                delivery.get("exporter_id")
+                or delivery.get("customer_id")
+                or delivery.get("created_by")
+                or delivery.get("farmer_id")
+                or delivery.get("user_id"),
+                user_id,
+            )
+            or same_id(get_assigned_logist_id(delivery), user_id)
+            or same_id(get_assigned_expeditor_id(delivery), user_id)
+            or any(same_id(delivery.get("pull_id"), removed_pull_id) for removed_pull_id in removed_pull_ids)
+            or any(
+                same_id(delivery_request_id, request_ref)
+                and delivery_source in {"", request_source}
+                for request_source, request_ref in removed_request_refs
+            )
+        ):
+            deliveries_to_delete.append(delivery_id)
+    for delivery_id in deliveries_to_delete:
+        deliveries.pop(delivery_id, None)
+    if deliveries_to_delete:
+        deleted_items.append(f"{len(deliveries_to_delete)} доставок")
+        logging.info(f"✅ Удалено {len(deliveries_to_delete)} deliveries для user {user_id}")
+
+    deals_to_delete = []
+    for deal_id, deal in deals.items():
+        if not isinstance(deal, dict):
+            continue
+        deal_request_id = deal.get("request_id")
+        deal_source = str(deal.get("source") or "").strip().lower()
+        if deal_source == "logistic":
+            deal_source = "logistics"
+        if deal_source not in {"exporter", "farmer", "logistics"} and deal_request_id is not None:
+            inferred_source = infer_logistic_offer_source(deal_request_id)
+            if inferred_source in {"exporter", "farmer", "logistics"}:
+                deal_source = inferred_source
+            else:
+                deal_source = ""
+        if (
+            same_id(
+                deal.get("exporter_id")
+                or deal.get("customer_id")
+                or deal.get("created_by")
+                or deal.get("farmer_id"),
+                user_id,
+            )
+            or same_id(get_assigned_expeditor_id(deal), user_id)
+            or same_id(get_assigned_logist_id(deal), user_id)
+            or any(same_id(deal.get("pull_id"), removed_pull_id) for removed_pull_id in removed_pull_ids)
+            or any(same_id(deal.get("batch_id"), batch_id) for batch_id in batch_ids_to_delete)
+            or any(
+                same_id(deal_request_id, request_ref)
+                and deal_source in {"", request_source}
+                for request_source, request_ref in removed_request_refs
+            )
+        ):
+            deals_to_delete.append(deal_id)
+    for deal_id in deals_to_delete:
+        deals.pop(deal_id, None)
+    if deals_to_delete:
+        deleted_items.append(f"{len(deals_to_delete)} сделок")
+        logging.info(f"✅ Удалено {len(deals_to_delete)} deals для user {user_id}")
 
     # Карточки логиста / экспедитора
-    if user_id in logistics_cards:
-        del logistics_cards[user_id]
+    removed_logistics_card = False
+    for key in [user_id, str(user_id)]:
+        if key in logistics_cards:
+            del logistics_cards[key]
+            removed_logistics_card = True
+    if removed_logistics_card:
         deleted_items.append("карточка логиста")
         logging.info(f"✅ Удалена карточка логиста {user_id}")
 
-    if user_id in expeditor_cards:
-        del expeditor_cards[user_id]
+    removed_expeditor_card = False
+    for key in [user_id, str(user_id)]:
+        if key in expeditor_cards:
+            del expeditor_cards[key]
+            removed_expeditor_card = True
+    if removed_expeditor_card:
         deleted_items.append("карточка экспедитора")
         logging.info(f"✅ Удалена карточка экспедитора {user_id}")
 
@@ -3102,11 +4133,11 @@ async def confirm_reset_account(callback: CallbackQuery, state: FSMContext):
                 bid for bid in pull.get("batch_ids", []) if bid in all_active_batch_ids
             ]
             pull["current_volume"] = (
-                sum(b.get("volume", 0) for b in pull.get("batches_data", []))
+                sum(get_safe_float(b.get("volume"), 0) for b in pull.get("batches_data", []))
                 if pull.get("batches_data")
                 else 0
             )
-            target_volume = pull.get("target_volume", 0) or 0
+            target_volume = get_safe_float(pull.get("target_volume"), 0)
             if pull["current_volume"] < target_volume:
                 pull["status"] = "active"
             elif pull["current_volume"] >= target_volume and target_volume > 0:
@@ -3139,6 +4170,9 @@ async def confirm_reset_account(callback: CallbackQuery, state: FSMContext):
         logging.info("✅ Глобальная очистка «мертвых» партий выполнена")
 
     global_cleanup_orphaned_batches_and_matches()
+
+    # 6.1. Сохраняем все изменённые структуры после каскадного удаления.
+    save_data()
 
     # 7. Формируем сообщение о результатах удаления
     if deleted_items:
@@ -3208,13 +4242,25 @@ def format_admin_analytics():
 
 def format_admin_users():
     """Форматирование списка пользователей для админа"""
-    farmers = [u for u in users.values() if u.get("role") == "farmer"]
-    exporters = [u for u in users.values() if u.get("role") == "exporter"]
-    logistics = [u for u in users.values() if is_logistic_role(u.get("role"))]
-    expeditors = [u for u in users.values() if is_expeditor_role(u.get("role"))]
+    unique_users = {}
+    for user_id_data, user_data in users.items():
+        if not isinstance(user_data, dict):
+            continue
+        canonical_user_id = user_data.get("id", user_id_data)
+        canonical_key = str(canonical_user_id)
+        if canonical_key in unique_users:
+            continue
+        unique_users[canonical_key] = user_data
+
+    farmers = [u for u in unique_users.values() if u.get("role") == "farmer"]
+    exporters = [u for u in unique_users.values() if u.get("role") == "exporter"]
+    logistics = [u for u in unique_users.values() if is_logistic_role(u.get("role"))]
+    expeditors = [
+        u for u in unique_users.values() if is_expeditor_role(u.get("role"))
+    ]
 
     msg = "👥 <b>Пользователи системы</b>\n\n"
-    msg += f"Всего: {len(users)}\n\n"
+    msg += f"Всего: {len(unique_users)}\n\n"
 
     if farmers:
         msg += f"<b>🌾 Фермеры ({len(farmers)})</b>\n"
@@ -3273,7 +4319,8 @@ def get_pull_details_keyboard(pull_id, user_id, pull):
     """Создание клавиатуры для карточки пула"""
     keyboard = InlineKeyboardMarkup(row_width=2)
 
-    if same_id(user_id, pull.get("exporter_id")):
+    pull_owner_id = pull.get("exporter_id") or pull.get("creator_id")
+    if same_id(user_id, pull_owner_id):
         keyboard.add(
             InlineKeyboardButton(
                 "👥 Участники", callback_data=f"viewparticipants:{pull_id}"
@@ -3289,7 +4336,7 @@ def get_pull_details_keyboard(pull_id, user_id, pull):
             InlineKeyboardButton("❌ Удалить", callback_data=f"deletepull_{pull_id}"),
         )
 
-    elif user_id in users and (get_user_by_id(user_id) or {}).get("role") == "farmer":
+    elif (get_user_by_id(user_id) or {}).get("role") == "farmer":
         keyboard.add(
             InlineKeyboardButton(
                 "✅ Присоединиться", callback_data=f"join_pull:{pull_id}"
@@ -3308,7 +4355,7 @@ def get_pull_details_keyboard(pull_id, user_id, pull):
             )
         )
 
-    keyboard.add(InlineKeyboardButton("◀️ Назад", callback_data="back_to_pools"))
+    keyboard.add(InlineKeyboardButton("◀️ Назад", callback_data="back_to_pulls"))
 
     return keyboard
 
@@ -3542,6 +4589,10 @@ def search_criteria_keyboard():
         InlineKeyboardButton("📍 По региону", callback_data="search_by:region"),
     )
     keyboard.add(
+        InlineKeyboardButton("💰 По цене", callback_data="search_by:price"),
+        InlineKeyboardButton("📦 По объёму", callback_data="search_by:volume"),
+    )
+    keyboard.add(
         InlineKeyboardButton(
             "🌾 Все доступные партии", callback_data="search_by:available"
         )
@@ -3598,7 +4649,7 @@ async def back_to_main_handler(callback: types.CallbackQuery, state: FSMContext)
     await callback.answer()
 
 
-def deal_actions_keyboard(deal_id):
+def deal_actions_keyboard(deal_id, show_complete=True, show_cancel=True):
     """Клавиатура действий со сделкой"""
     keyboard = InlineKeyboardMarkup(row_width=2)
     keyboard.add(
@@ -3607,14 +4658,21 @@ def deal_actions_keyboard(deal_id):
         ),
         InlineKeyboardButton("🚚 Логистика", callback_data=f"logistics:{deal_id}"),
     )
-    keyboard.add(
-        InlineKeyboardButton(
-            "✅ Завершить сделку", callback_data=f"complete_deal:{deal_id}"
-        ),
-        InlineKeyboardButton(
-            "❌ Отменить сделку", callback_data=f"cancel_deal:{deal_id}"
-        ),
-    )
+    action_buttons = []
+    if show_complete:
+        action_buttons.append(
+            InlineKeyboardButton(
+                "✅ Завершить сделку", callback_data=f"complete_deal:{deal_id}"
+            )
+        )
+    if show_cancel:
+        action_buttons.append(
+            InlineKeyboardButton(
+                "❌ Отменить сделку", callback_data=f"cancel_deal:{deal_id}"
+            )
+        )
+    if action_buttons:
+        keyboard.add(*action_buttons)
     keyboard.add(
         InlineKeyboardButton("🔙 К списку сделок", callback_data="back_to_deals")
     )
@@ -3744,11 +4802,11 @@ def format_farmer_card(farmer_id, batch_id=None):
             or []
         )
         for batch in farmer_batches:
-            if batch["id"] == batch_id:
+            if isinstance(batch, dict) and same_id(batch.get("id"), batch_id):
                 msg += f"<b>📦 Партия #{batch_id}:</b>\n"
                 msg += f"🌾 Культура: {batch.get('culture', 'Не указано')}\n"
-                msg += f"📦 Объём: {batch.get('volume', 0)} т\n"
-                msg += f"💰 Цена: {batch.get('price', 0):,.0f} ₽/т\n"
+                msg += f"📦 Объём: {get_safe_float(batch.get('volume'), 0):,.0f} т\n"
+                msg += f"💰 Цена: {get_safe_float(batch.get('price'), 0):,.0f} ₽/т\n"
 
                 # ✅ КАЧЕСТВО - только если есть
                 if "moisture" in batch or "nature" in batch:
@@ -3769,12 +4827,13 @@ def format_farmer_card(farmer_id, batch_id=None):
                 break
 
     # ✅ СТАТИСТИКА
-    if farmer_id in batches:
-        total_batches = len(batches[farmer_id])
+    farmer_batches = get_user_batches(farmer_id)
+    if farmer_batches:
+        total_batches = len(farmer_batches)
         active_batches = len(
             [
                 b
-                for b in batches[farmer_id]
+                for b in farmer_batches
                 if status_in_group(
                     b.get("status"),
                     {"active", "активна", "available", "доступна", "", "none"},
@@ -3850,8 +4909,8 @@ async def find_matching_exporters(batch):
 
             pull_culture = pull.get("culture", "").strip()
             pull_status = normalize_transition_status(pull.get("status", ""))
-            pull_current_volume = pull.get("current_volume", 0)
-            pull_target_volume = pull.get("target_volume", 0)
+            pull_current_volume = get_safe_float(pull.get("current_volume"), 0)
+            pull_target_volume = get_safe_float(pull.get("target_volume"), 0)
 
             if (
                 pull_culture.lower() == batch_culture.lower()
@@ -3862,7 +4921,7 @@ async def find_matching_exporters(batch):
                 free_space = pull_target_volume - pull_current_volume
 
                 if free_space > 0:
-                    exporter_id = pull.get("exporter_id")
+                    exporter_id = pull.get("exporter_id") or pull.get("creator_id")
                     exporter = get_user_by_id(exporter_id) or {}
 
                     matching_pulls.append(
@@ -3875,7 +4934,7 @@ async def find_matching_exporters(batch):
                             "exporter_company": exporter.get("company", "Неизвестно"),
                             "exporter_phone": exporter.get("phone", "Не указан"),
                             "culture": pull_culture,
-                            "price": pull.get("price", 0),
+                            "price": get_safe_float(pull.get("price"), 0),
                             "port": pull.get("port", "Не указан"),
                             "free_space": free_space,
                             "current_volume": pull_current_volume,
@@ -3944,10 +5003,10 @@ async def notify_match(farmer_id, batch, matching_pulls, extra=None, *args, **kw
             email = exporter_info.get("email", "Не указан")
 
             # ✅ Данные пула
-            price = pull_data.get("price", 0)
+            price = get_safe_float(pull_data.get("price"), 0)
             port = pull_data.get("port", "Не указан")
-            current_volume = pull_data.get("current_volume", 0)
-            target_volume = pull_data.get("target_volume", 0)
+            current_volume = get_safe_float(pull_data.get("current_volume"), 0)
+            target_volume = get_safe_float(pull_data.get("target_volume"), 0)
             doc_type = pull_data.get("doc_type", "Не указан")
 
             # Добавляем кнопку
@@ -3968,7 +5027,7 @@ async def notify_match(farmer_id, batch, matching_pulls, extra=None, *args, **kw
             text += f"💰 <b>Цена:</b> {price:,.0f} ₽/т\n"
             text += f"🚢 <b>Порт:</b> {port}\n"
             text += f"📋 <b>Условия:</b> {doc_type}\n"
-            text += f"📊 <b>Заполнено:</b> {current_volume}/{target_volume} т\n"
+            text += f"📊 <b>Заполнено:</b> {current_volume:.0f}/{target_volume:.0f} т\n"
             text += "\n"
 
         text += "💡 <i>Свяжитесь с экспортёром для обсуждения условий!</i>"
@@ -4013,7 +5072,7 @@ async def auto_match_batches_and_pulls():
             for batch_id, farmer_id, batch in iter_all_batches():
 
                 # ✅ ПРОВЕРКА РОЛИ: Только фермеры получают уведомления
-                if farmer_id not in users:
+                if not get_user_by_id(farmer_id):
                     logging.debug(f"⚠️ Пользователь {farmer_id} не найден в базе")
                     continue
 
@@ -4112,9 +5171,9 @@ async def cmd_start(message: types.Message, state: FSMContext):
     last_start_times[user_id] = current_time
     logging.info(f"🚀 /start от пользователя {user_id}")
 
-    if user_id in users:
+    user = get_user_by_id(user_id) or {}
+    if user:
         # Зарегистрированный пользователь
-        user = get_user_by_id(user_id) or {}
         role = user.get("role", "unknown")
         name = user.get("name", "Пользователь")
 
@@ -4170,38 +5229,69 @@ async def cmd_start(message: types.Message, state: FSMContext):
 # ============================================================================
 def format_admin_statistics_legacy():
     """Форматирование статистики"""
-    total_users = len(users)
+    unique_users = {}
+    for user_id_data, user_data in users.items():
+        if not isinstance(user_data, dict):
+            continue
+        canonical_user_id = user_data.get("id", user_id_data)
+        canonical_key = str(canonical_user_id)
+        if canonical_key in unique_users:
+            continue
+        unique_users[canonical_key] = user_data
+
+    total_users = len(unique_users)
     farmers = sum(
-        1 for u in users.values() if isinstance(u, dict) and u.get("role") == "farmer"
+        1 for u in unique_users.values() if u.get("role") == "farmer"
     )
     exporters = sum(
-        1 for u in users.values() if isinstance(u, dict) and u.get("role") == "exporter"
+        1 for u in unique_users.values() if u.get("role") == "exporter"
     )
     logists = sum(
-        1
-        for u in users.values()
-        if isinstance(u, dict) and is_logistic_role(u.get("role"))
+        1 for u in unique_users.values() if is_logistic_role(u.get("role"))
     )
     expeditors = sum(
-        1
-        for u in users.values()
-        if isinstance(u, dict) and is_expeditor_role(u.get("role"))
+        1 for u in unique_users.values() if is_expeditor_role(u.get("role"))
     )
 
-    total_pulls = len(pulls)
+    all_pulls = pulls.get("pulls", pulls) if isinstance(pulls, dict) else {}
+    total_pulls = len(all_pulls)
     active_pulls = sum(
         1
-        for p in pulls.values()
+        for p in all_pulls.values()
         if isinstance(p, dict) and is_pull_open_status(p.get("status"))
     )
 
     total_batches = count_all_batches()
 
-    total_requests = len(shipping_requests)
+    all_requests = list(iter_all_requests())
+    total_requests = len(all_requests)
     active_requests = sum(
         1
-        for r in shipping_requests.values()
-        if isinstance(r, dict) and is_request_open_for_offers(r.get("status"))
+        for source, request_id, request in all_requests
+        if get_effective_request_status(
+            request_id,
+            source,
+            request,
+            request_owner_id=(
+                (request.get("farmer_id") or request.get("user_id"))
+                if source == "farmer"
+                else (
+                    request.get("customer_id")
+                    or request.get("created_by")
+                    or request.get("exporter_id")
+                )
+                if source == "logistics"
+                else None
+            ),
+            request_exporter_id=(
+                request.get("exporter_id")
+                or request.get("customer_id")
+                or request.get("created_by")
+            )
+            if source == "exporter"
+            else None,
+        )
+        not in {"completed", "cancelled", "rejected"}
     )
 
     msg = "📊 <b>Статистика бота</b>\n\n"
@@ -4540,12 +5630,20 @@ async def export_users_callback(callback: CallbackQuery, state: FSMContext):
         writer = csv.writer(output)
         writer.writerow(["ID", "Роль", "Телефон", "Email", "Регион", "ИНН", "Компания"])
 
+        unique_users = {}
         for user_id_data, user_data in users.items():
             if not isinstance(user_data, dict):
                 continue
+            canonical_user_id = user_data.get("id", user_id_data)
+            canonical_key = str(canonical_user_id)
+            if canonical_key in unique_users:
+                continue
+            unique_users[canonical_key] = (canonical_user_id, user_data)
+
+        for canonical_user_id, user_data in unique_users.values():
             writer.writerow(
                 [
-                    user_id_data,
+                    canonical_user_id,
                     user_data.get("role", ""),
                     user_data.get("phone", ""),
                     user_data.get("email", ""),
@@ -4561,11 +5659,11 @@ async def export_users_callback(callback: CallbackQuery, state: FSMContext):
         await bot.send_document(
             callback.from_user.id,
             ("users_" + timestamp + ".csv", output.getvalue().encode("utf-8-sig")),
-            caption=f"📤 Экспорт пользователей\nВсего: {len(users)}",
+            caption=f"📤 Экспорт пользователей\nВсего: {len(unique_users)}",
         )
 
         await callback.answer("✅ Файл отправлен")
-        logging.info(f"Экспорт пользователей выполнен: {len(users)} записей")
+        logging.info(f"Экспорт пользователей выполнен: {len(unique_users)} записей")
 
     except Exception as e:
         logging.error(f"Ошибка экспорта пользователей: {e}")
@@ -4820,8 +5918,8 @@ def check_and_close_pull_if_full(pull_id):
     if not pull:
         return False
     pull_id = resolved_pull_id
-    current = pull.get("current_volume", 0)
-    target = pull.get("target_volume", 0)
+    current = get_safe_float(pull.get("current_volume"), 0)
+    target = get_safe_float(pull.get("target_volume"), 0)
 
     pull_status = normalize_transition_status(pull.get("status", ""))
     if current >= target and is_pull_open_status(pull_status):
@@ -4844,14 +5942,29 @@ def check_and_close_pull_if_full(pull_id):
 def create_deal_from_full_pull(pull):
     """Создаёт сделку из заполненного пула"""
     global deal_counter
+    pull_id = pull.get("id")
+
+    for existing_deal_id, existing_deal in deals.items():
+        if not isinstance(existing_deal, dict):
+            continue
+        if (
+            same_id(existing_deal.get("pull_id"), pull_id)
+            and str(existing_deal.get("type") or "").strip().lower() == "pool_deal"
+        ):
+            return existing_deal_id
 
     deal_counter += 1
 
     farmer_ids = []
     batch_details = []
+    participants = pull.get("participants") or (
+        pullparticipants.get(pull_id)
+        or pullparticipants.get(str(pull_id))
+        or []
+    )
 
-    for participant in pull.get("participants", []):
-        f_id = participant.get("farmer_id")
+    for participant in participants:
+        f_id = participant.get("farmer_id") or participant.get("user_id")
         b_id = participant.get("batch_id")
         volume = participant.get("volume", 0)
 
@@ -4867,21 +5980,27 @@ def create_deal_from_full_pull(pull):
             }
         )
 
+    exporter_id = pull.get("exporter_id") or pull.get("creator_id")
+    exporter_name = pull.get("exporter_name") or (get_user_by_id(exporter_id) or {}).get(
+        "name", "Не указано"
+    )
+
     deal = {
         "id": deal_counter,
-        "pull_id": pull["id"],
+        "pull_id": pull_id,
         "type": "pool_deal",
-        "exporter_id": pull["exporter_id"],
-        "exporter_name": pull["exporter_name"],
+        "exporter_id": exporter_id,
+        "exporter_name": exporter_name,
         "farmer_ids": farmer_ids,
         "batches": batch_details,
         "logistic_id": None,
         "expeditor_id": None,
-        "culture": pull["culture"],
-        "volume": pull["current_volume"],
-        "price": pull["price"],
-        "total_sum": pull["current_volume"] * pull["price"],
-        "port": pull["port"],
+        "culture": pull.get("culture", "Не указано"),
+        "volume": get_safe_float(pull.get("current_volume"), 0),
+        "price": get_safe_float(pull.get("price"), 0),
+        "total_sum": get_safe_float(pull.get("current_volume"), 0)
+        * get_safe_float(pull.get("price"), 0),
+        "port": pull.get("port", "Не указан"),
         "quality": {
             "moisture": pull.get("moisture", 0),
             "nature": pull.get("nature", 0),
@@ -4898,7 +6017,7 @@ def create_deal_from_full_pull(pull):
 
     deals[deal_counter] = deal
     save_deals_to_pickle()
-    logging.info(f"✅ Deal {deal_counter} created from pull {pull['id']}")
+    logging.info(f"✅ Deal {deal_counter} created from pull {pull_id}")
     return deal_counter
 
 
@@ -4907,8 +6026,8 @@ async def notify_all_about_pull_closure(pull, deal_id):
     Массовое уведомление всем логистам и фермерам-участникам о закрытии или сборе пула.
     + уведомление экспортёра и базовое информирование экспедиторов по порту.
     """
-    pull_id = pull["id"]
-    exporter_id = pull["exporter_id"]
+    pull_id = pull.get("id")
+    exporter_id = pull.get("exporter_id") or pull.get("creator_id")
     port = pull.get("port", "Не указан")
 
     # --- Релевантные логисты по порту + фермеры-участники ---
@@ -4933,9 +6052,9 @@ async def notify_all_about_pull_closure(pull, deal_id):
         or []
     )
     farmer_ids = [
-        p.get("farmer_id")
+        p.get("farmer_id") or p.get("user_id")
         for p in participants
-        if isinstance(p, dict) and p.get("farmer_id")
+        if isinstance(p, dict) and (p.get("farmer_id") or p.get("user_id"))
     ]
 
     all_notify_ids = set(farmer_ids) | set(logist_ids)
@@ -4955,12 +6074,15 @@ async def notify_all_about_pull_closure(pull, deal_id):
         seen_notify_keys.add(notify_key)
         normalized_notify_ids.append(notify_id)
 
+    pull_current_volume = get_safe_float(pull.get("current_volume"), 0)
+    pull_target_volume = get_safe_float(pull.get("target_volume"), 0)
+
     notify_text = (
         f"🔒 <b>ПУЛ #{pull_id} СОБРАН/ЗАКРЫТ!</b>\n\n"
         f"🌾 Культура: {pull.get('culture')}\n"
-        f"🎯 Объём: {pull.get('current_volume')} / {pull.get('target_volume')} т\n"
+        f"🎯 Объём: {pull_current_volume:.0f} / {pull_target_volume:.0f} т\n"
         f"🏢 Порт: {port}\n"
-        f"💰 Цена: {pull.get('price', 0):,.0f} ₽/т\n"
+        f"💰 Цена: {get_safe_float(pull.get('price'), 0):,.0f} ₽/т\n"
         f"✅ Сделка #{deal_id} создана\n"
     )
 
@@ -4985,9 +6107,9 @@ async def notify_all_about_pull_closure(pull, deal_id):
     exporter_text = (
         f"🎉 <b>ПУЛ #{pull_id} СОБРАН!</b>\n\n"
         f"📦 Культура: {pull.get('culture')}\n"
-        f"🎯 Объём: {pull.get('current_volume')} / {pull.get('target_volume')} т\n"
+        f"🎯 Объём: {pull_current_volume:.0f} / {pull_target_volume:.0f} т\n"
         f"🏢 Порт: {port}\n"
-        f"💰 Цена: {pull.get('price', 0):,.0f} ₽/т\n\n"
+        f"💰 Цена: {get_safe_float(pull.get('price'), 0):,.0f} ₽/т\n\n"
         f"✅ Сделка #{deal_id} создана\n\n"
         "Теперь вы можете:\n"
         "• Настроить логистику через меню пула → «🚚 Логистика»\n"
@@ -5029,9 +6151,9 @@ async def notify_all_about_pull_closure(pull, deal_id):
         exp_text = (
             f"📦 <b>Новый собранный пул #{pull_id} по вашему порту</b>\n\n"
             f"🌾 Культура: {pull.get('culture')}\n"
-            f"🎯 Объём: {pull.get('current_volume')} / {pull.get('target_volume')} т\n"
+            f"🎯 Объём: {pull_current_volume:.0f} / {pull_target_volume:.0f} т\n"
             f"🏢 Порт: {port}\n"
-            f"💰 Цена: {pull.get('price', 0):,.0f} ₽/т\n\n"
+            f"💰 Цена: {get_safe_float(pull.get('price'), 0):,.0f} ₽/т\n\n"
             "Если вам интересно сопровождение этого пула как экспедитора, "
             "откройте пул и оставьте своё предложение."
         )
@@ -5223,6 +6345,15 @@ async def export_callbacks_router(callback: types.CallbackQuery, state: FSMConte
             import json
 
             zip_buffer = io.BytesIO()
+            unique_users = {}
+            for user_id_data, user_data in users.items():
+                if not isinstance(user_data, dict):
+                    continue
+                canonical_user_id = user_data.get("id", user_id_data)
+                canonical_key = str(canonical_user_id)
+                if canonical_key in unique_users:
+                    continue
+                unique_users[canonical_key] = user_data
 
             with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
                 zip_file.writestr(
@@ -5244,7 +6375,7 @@ async def export_callbacks_router(callback: types.CallbackQuery, state: FSMConte
 
                 backup_info = {
                     "created_at": datetime.now().isoformat(),
-                    "total_users": len(users),
+                    "total_users": len(unique_users),
                     "total_pulls": len(pulls.get("pulls", {})),  # ✅ ИСПРАВЛЕНО
                     "total_batches": count_all_batches(),
                 }
@@ -5259,7 +6390,7 @@ async def export_callbacks_router(callback: types.CallbackQuery, state: FSMConte
             await callback.message.answer_document(
                 types.InputFile(zip_buffer, filename=filename),
                 caption="💼 Полный бэкап\n\n"
-                f"👥 Пользователей: {len(users)}\n"
+                f"👥 Пользователей: {len(unique_users)}\n"
                 f"📦 Пуллов: {len(pulls.get('pulls', {}))}\n"  # ✅ ИСПРАВЛЕНО
                 f"🌾 Партий: {count_all_batches()}",
             )
@@ -5641,7 +6772,7 @@ async def join_pull_start(callback: types.CallbackQuery, state: FSMContext):
                 [
                     p["batch_id"]
                     for p in pullparticipants[key]
-                    if same_id(p.get("farmer_id"), user_id)
+                    if same_id(p.get("farmer_id") or p.get("user_id"), user_id)
                 ]
             )
 
@@ -5702,7 +6833,8 @@ async def join_pull_start(callback: types.CallbackQuery, state: FSMContext):
     keyboard = InlineKeyboardMarkup(row_width=1)
     for batch in active_batches:
         button_text = (
-            f"{batch.get('culture', 'Культура')} - {batch.get('volume', 0)} т - {batch.get('price', 0):,.0f} ₽/т"
+            f"{batch.get('culture', 'Культура')} - {get_safe_float(batch.get('volume'), 0):,.0f} т - "
+            f"{get_safe_float(batch.get('price'), 0):,.0f} ₽/т"
         )
         keyboard.add(
             InlineKeyboardButton(
@@ -5720,7 +6852,7 @@ async def join_pull_start(callback: types.CallbackQuery, state: FSMContext):
         f"🌾 Культура: {pull.get('culture', 'Неизвестно')}\n"
         f"📦 Целевой объём: {pull.get('target_volume', 0)} т\n"
         f"📊 Текущий объём: {pull.get('current_volume', 0)} т\n"
-        f"📉 Доступно: {pull.get('target_volume', 0) - pull.get('current_volume', 0)} т\n\n"
+        f"📉 Доступно: {max(get_safe_float(pull.get('target_volume'), 0) - get_safe_float(pull.get('current_volume'), 0), 0):,.0f} т\n\n"
         "Выберите партию из списка ниже:",
         reply_markup=keyboard,
         parse_mode="HTML",
@@ -5761,8 +6893,8 @@ async def quick_batch_start(callback: types.CallbackQuery, state: FSMContext):
     await QuickBatchStatesGroup.volume.set()
 
     # ✅ ИСПРАВЛЕНО: Используем правильные поля
-    target_volume = pull.get("target_volume", 0)
-    current_volume = pull.get("current_volume", 0)
+    target_volume = get_safe_float(pull.get("target_volume"), 0)
+    current_volume = get_safe_float(pull.get("current_volume"), 0)
     available_volume = target_volume - current_volume
 
     msg = (
@@ -5800,8 +6932,8 @@ async def quick_batch_volume(message: types.Message, state: FSMContext):
             return
 
         # ✅ ИСПРАВЛЕНО: Используем правильные поля
-        target_volume = pull.get("target_volume", 0)
-        current_volume = pull.get("current_volume", 0)
+        target_volume = get_safe_float(pull.get("target_volume"), 0)
+        current_volume = get_safe_float(pull.get("current_volume"), 0)
         available = target_volume - current_volume
 
         if volume > available:
@@ -5815,7 +6947,7 @@ async def quick_batch_volume(message: types.Message, state: FSMContext):
         await QuickBatchStatesGroup.price.set()
         await message.answer(
             "💰 <b>Введите цену</b>\n\n"
-            f"Цена пула: {pull.get('price', 0):,.0f} ₽/т\n\n"
+            f"Цена пула: {get_safe_float(pull.get('price'), 0):,.0f} ₽/т\n\n"
             "Введите вашу цену (₽/т):",
             parse_mode="HTML",
         )
@@ -5829,7 +6961,7 @@ async def quick_batch_volume(message: types.Message, state: FSMContext):
 async def quick_batch_price(message: types.Message, state: FSMContext):
     """Получение цены"""
     try:
-        price = float(message.text.replace(",", ".").replace(" ", ""))
+        price = parse_price(message.text)
         if price <= 0:
             await message.answer("❌ Цена должна быть больше нуля")
             return
@@ -5997,9 +7129,14 @@ async def finish_quick_batch(message_or_callback, state: FSMContext, user_id: in
         batch["impurity"] = data.get("impurity")
 
     # Сохраняем партию
-    if user_id not in batches:
-        batches[user_id] = []
-    batches[user_id].append(batch)
+    batch_owner_key = (
+        user_id
+        if user_id in batches
+        else (str(user_id) if str(user_id) in batches else user_id)
+    )
+    if batch_owner_key not in batches:
+        batches[batch_owner_key] = []
+    batches[batch_owner_key].append(batch)
 
     # ✅ ИСПРАВЛЕНО: Работа с глобальной переменной pullparticipants
     pull_id_str = str(pull_id)
@@ -6031,7 +7168,7 @@ async def finish_quick_batch(message_or_callback, state: FSMContext, user_id: in
             "farmer_id": user_id,
             "culture": batch.get("culture"),
             "volume": batch.get("volume"),
-            "price": batch.get("price"),
+            "price": get_safe_float(batch.get("price"), 0),
             "moisture": batch.get("moisture", 0),
             "impurity": batch.get("impurity", 0),
             "joined_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -6048,7 +7185,7 @@ async def finish_quick_batch(message_or_callback, state: FSMContext, user_id: in
         pull["farmer_ids"].append(user_id)
 
     # ✅ ИСПРАВЛЕНО: Используем current_volume
-    pull["current_volume"] = pull.get("current_volume", 0) + batch_volume
+    pull["current_volume"] = get_safe_float(pull.get("current_volume"), 0) + get_safe_float(batch_volume, 0)
 
     # Создаём сделку с числовым ID (совместимо с parse_callback_id)
     deal_id = next_numeric_id(deals)
@@ -6058,7 +7195,7 @@ async def finish_quick_batch(message_or_callback, state: FSMContext, user_id: in
         "pull_id": pull_id,
         "batch_id": batch_id,
         "farmer_id": user_id,
-        "exporter_id": pull.get("exporter_id"),
+        "exporter_id": pull.get("exporter_id") or pull.get("creator_id"),
         "status": "matched",
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
@@ -6071,17 +7208,18 @@ async def finish_quick_batch(message_or_callback, state: FSMContext, user_id: in
 
     # Уведомления
     farmer = user_info
-    exporter_id = pull.get("exporter_id")
-    target_volume = pull.get("target_volume", 0)
+    exporter_id = pull.get("exporter_id") or pull.get("creator_id")
+    target_volume = get_safe_float(pull.get("target_volume"), 0)
+    current_volume = get_safe_float(pull.get("current_volume"), 0)
     fill_percent = (
-        (pull["current_volume"] / target_volume * 100) if target_volume > 0 else 0
+        (current_volume / target_volume * 100) if target_volume > 0 else 0
     )
 
     await bot.send_message(
         user_id,
         "✅ <b>Партия создана и добавлена в пулл!</b>\n\n"
         f"🌾 {batch['culture']} • {batch['volume']:,.0f} т • {batch['price']:,.0f} ₽/т\n"
-        f"📊 Пулл заполнен: {pull['current_volume']:,.0f}/{target_volume:,.0f} т ({fill_percent:.0f}%)",
+        f"📊 Пулл заполнен: {current_volume:,.0f}/{target_volume:,.0f} т ({fill_percent:.0f}%)",
         parse_mode="HTML",
     )
 
@@ -6091,7 +7229,7 @@ async def finish_quick_batch(message_or_callback, state: FSMContext, user_id: in
             f"📦 <b>Новая партия добавлена в ваш пулл #{pull_id}!</b>\n\n"
             f"👤 Фермер: {farmer.get('name')}\n"
             f"🌾 {batch['culture']} • {batch['volume']:,.0f} т • {batch['price']:,.0f} ₽/т\n"
-            f"📊 Заполнено: {pull['current_volume']:,.0f}/{target_volume:,.0f} т ({fill_percent:.0f}%)",
+            f"📊 Заполнено: {current_volume:,.0f}/{target_volume:,.0f} т ({fill_percent:.0f}%)",
             parse_mode="HTML",
         )
 
@@ -6245,11 +7383,11 @@ async def select_batch_for_join(callback: types.CallbackQuery, state: FSMContext
         await state.finish()
         return
 
-    target_volume = pull.get("target_volume", 0)
-    current_volume = pull.get("current_volume", 0)
+    target_volume = get_safe_float(pull.get("target_volume"), 0)
+    current_volume = get_safe_float(pull.get("current_volume"), 0)
     available = target_volume - current_volume
 
-    if batch.get("volume", 0) > available:
+    if get_safe_float(batch.get("volume"), 0) > available:
         await callback.answer(
             "❌ Объем партии больше доступного в пуле!", show_alert=True
         )
@@ -6310,7 +7448,7 @@ async def select_batch_for_join(callback: types.CallbackQuery, state: FSMContext
                 "farmer_id": user_id,
                 "culture": batch.get("culture"),
                 "volume": batch.get("volume"),
-                "price": batch.get("price"),
+                "price": get_safe_float(batch.get("price"), 0),
                 "moisture": batch.get("moisture", 0),
                 "impurity": batch.get("impurity", batch.get("impurities", 0)),
                 "quality_class": batch.get("quality_class", ""),
@@ -6318,16 +7456,10 @@ async def select_batch_for_join(callback: types.CallbackQuery, state: FSMContext
             }
         )
 
-    pull["current_volume"] = current_volume + batch.get("volume", 0)
-
-    # Закрытие пула при заполнении
-    if pull["current_volume"] >= target_volume:
-        pull["status"] = "filled"
-        save_pulls_to_pickle()
-        logging.info(f"🎉 Пул #{pull_id} заполнен на 100%!")
+    pull["current_volume"] = get_safe_float(current_volume, 0) + get_safe_float(batch.get("volume"), 0)
 
     # Уведомление экспортера с данными фермера
-    exporter_id = pull.get("exporter_id")
+    exporter_id = pull.get("exporter_id") or pull.get("creator_id")
     if exporter_id:
         farmer = get_user_by_id(user_id) or {}
         farmer_name = farmer.get("name", "Неизвестно")
@@ -6335,12 +7467,14 @@ async def select_batch_for_join(callback: types.CallbackQuery, state: FSMContext
         farmer_email = farmer.get("email", "Не указан")
         farmer_company = farmer.get("company_details", "Не указано")
 
-        fill_ratio = (pull["current_volume"] / target_volume * 100) if target_volume > 0 else 0
+        current_volume = get_safe_float(pull.get("current_volume"), 0)
+        target_volume = get_safe_float(target_volume, 0)
+        fill_ratio = (current_volume / target_volume * 100) if target_volume > 0 else 0
         message_exporter = (
             f"🎉 <b>Фермер присоединился к пулу #{pull_id}!</b>\n"
             f"Культура: {pull.get('culture')}\n"
-            f"Объём партии: {batch.get('volume', 0):,.0f} т\n"
-            f"Текущий объём пула: {pull['current_volume']:,.0f}/{target_volume:,.0f} т\n"
+            f"Объём партии: {get_safe_float(batch.get('volume'), 0):,.0f} т\n"
+            f"Текущий объём пула: {current_volume:,.0f}/{target_volume:,.0f} т\n"
             f"Заполненность: {fill_ratio:.1f}%\n\n"
             "👤 <b>Данные фермера:</b>\n"
             f"Имя: {farmer_name}\n"
@@ -6364,8 +7498,8 @@ async def select_batch_for_join(callback: types.CallbackQuery, state: FSMContext
         message_farmer = (
             f"✅ <b>Вы присоединились к пулу #{pull_id}!</b>\n"
             f"Культура: {batch.get('culture')}\n"
-            f"Объём: {batch.get('volume')} т\n"
-            f"Цена: {batch.get('price'):,.0f} ₽/т\n\n"
+            f"Объём: {get_safe_float(batch.get('volume'), 0):,.0f} т\n"
+            f"Цена: {get_safe_float(batch.get('price'), 0):,.0f} ₽/т\n\n"
             "👤 <b>Данные экспортера:</b>\n"
             f"Имя: {exporter_name}\n"
             f"Компания: {exporter_company}\n"
@@ -6381,6 +7515,8 @@ async def select_batch_for_join(callback: types.CallbackQuery, state: FSMContext
 
     save_pulls_to_pickle()
     save_batches_to_pickle()
+
+    check_and_close_pull_if_full(pull_id)
 
     # ✅ ДИАГНОСТИКА - можно убрать после отладки
     logging.info("✅ Данные сохранены в файл")
@@ -6429,7 +7565,7 @@ async def view_pullparticipants(callback: types.CallbackQuery, state: FSMContext
     user_role = (get_user_by_id(user_id) or {}).get("role")
     pull_owner_id = pull.get("exporter_id") or pull.get("creator_id")
     is_participant = any(
-        isinstance(p, dict) and same_id(p.get("farmer_id"), user_id)
+        isinstance(p, dict) and same_id(p.get("farmer_id") or p.get("user_id"), user_id)
         for p in participants
     )
     if not (user_role == "admin" or same_id(pull_owner_id, user_id) or is_participant):
@@ -6453,30 +7589,25 @@ async def view_pullparticipants(callback: types.CallbackQuery, state: FSMContext
     msg += f"📦 Целевой объём: {pull.get('target_volume', 0)} т\n"
     msg += f"📊 Текущий объём: {pull.get('current_volume', 0)} т\n"
 
-    target_vol = pull.get("target_volume", 1)
-    current_vol = pull.get("current_volume", 0)
+    target_vol = get_safe_float(pull.get("target_volume"), 1)
+    current_vol = get_safe_float(pull.get("current_volume"), 0)
     progress = (current_vol / target_vol * 100) if target_vol > 0 else 0
 
     msg += f"📈 Заполнено: {progress:.1f}%\n\n"
     msg += f"<b>Участники ({len(participants)}):</b>\n\n"
 
     for i, p in enumerate(participants, 1):
-        farmer_id = p.get("farmer_id")
+        farmer_id = p.get("farmer_id") or p.get("user_id")
         farmer = get_user_by_id(farmer_id) or {}
 
         msg += f"{i}. <b>{p.get('farmer_name', '?')}</b>\n"
         msg += f"   📦 Объём: {p.get('volume', 0)} т\n"
 
         batch_id = p.get("batch_id")
-        batch = None
-        if farmer_id in batches:
-            for b in batches[farmer_id]:
-                if same_id(b.get("id"), batch_id):
-                    batch = b
-                    break
+        _, batch = find_batch_by_id(batch_id)
 
         if batch:
-            msg += f"   💰 Цена: {batch.get('price', 0):,.0f} ₽/т\n"
+            msg += f"   💰 Цена: {get_safe_float(batch.get('price'), 0):,.0f} ₽/т\n"
             msg += f"   📍 Регион: {batch.get('region', 'Не указано')}\n"
 
         msg += f"   📅 Присоединился: {p.get('joined_at', '?')}\n"
@@ -6610,11 +7741,27 @@ async def admin_stats_button(message: types.Message, state: FSMContext):
 
     try:
         # Собираем статистику
-        total_users = len(users)
-        farmers = len([u for u in users.values() if u.get("role") == "farmer"])
-        exporters = len([u for u in users.values() if u.get("role") == "exporter"])
-        logists = len([u for u in users.values() if is_logistic_role(u.get("role"))])
-        expeditors = len([u for u in users.values() if is_expeditor_role(u.get("role"))])
+        unique_users = {}
+        for user_id_data, user_data in users.items():
+            if not isinstance(user_data, dict):
+                continue
+            canonical_user_id = user_data.get("id", user_id_data)
+            canonical_key = str(canonical_user_id)
+            if canonical_key in unique_users:
+                continue
+            unique_users[canonical_key] = user_data
+
+        total_users = len(unique_users)
+        farmers = len([u for u in unique_users.values() if u.get("role") == "farmer"])
+        exporters = len(
+            [u for u in unique_users.values() if u.get("role") == "exporter"]
+        )
+        logists = len(
+            [u for u in unique_users.values() if is_logistic_role(u.get("role"))]
+        )
+        expeditors = len(
+            [u for u in unique_users.values() if is_expeditor_role(u.get("role"))]
+        )
 
         # ✅ ИСПРАВЛЕНО: Правильный перебор batches
         total_batches = sum(len(farmer_batches) for farmer_batches in batches.values())
@@ -6774,6 +7921,17 @@ async def admin_export_button(message: types.Message, state: FSMContext):
 
     try:
         await message.answer("⏳ Формирую экспорт данных...")
+        unique_users = {}
+        for user_id_data, user_data in users.items():
+            if not isinstance(user_data, dict):
+                continue
+            canonical_user_id = user_data.get("id", user_id_data)
+            canonical_key = str(canonical_user_id)
+            if canonical_key in unique_users:
+                continue
+            unique_users[canonical_key] = user_data
+
+        all_pulls = pulls.get("pulls", pulls) if isinstance(pulls, dict) else {}
 
         # ✅ ИСПРАВЛЕНО: Правильная структура batches
         export_data = {
@@ -6796,9 +7954,9 @@ async def admin_export_button(message: types.Message, state: FSMContext):
                 f,
                 caption="📂 <b>Экспорт данных</b>\n\n"
                 f"📅 {datetime.now().strftime('%d.%m.%Y %H:%M')}\n"
-                f"👥 Пользователей: {len(users)}\n"
+                f"👥 Пользователей: {len(unique_users)}\n"
                 f"📦 Партий: {count_all_batches()}\n"
-                f"🎯 Пулов: {len(pulls)}",
+                f"🎯 Пулов: {len(all_pulls)}",
                 parse_mode="HTML",
             )
 
@@ -6822,11 +7980,19 @@ async def admin_manual_match(message: types.Message, state: FSMContext):
     await message.answer("🔍 Запуск поиска совпадений...")
 
     matches_found = await auto_match_batches_and_pulls()
+    active_matches_count = len(
+        [
+            m
+            for m in matches.values()
+            if isinstance(m, dict)
+            and normalize_transition_status(m.get("status")) == "active"
+        ]
+    )
 
     await message.answer(
         "✅ <b>Поиск завершён!</b>\n\n"
         f"🔍 Найдено совпадений: {matches_found}\n"
-        f"📊 Всего активных: {len([m for m in matches.values() if m.get('status') == 'active'])}",
+        f"📊 Всего активных: {active_matches_count}",
         parse_mode="HTML",
     )
 
@@ -6839,8 +8005,9 @@ async def admin_back(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     if user_id != ADMIN_ID:
         return
-    if user_id in users:
-        role = (get_user_by_id(user_id) or {}).get("role")
+    user = get_user_by_id(user_id) or {}
+    if user:
+        role = user.get("role")
         keyboard = get_role_keyboard(role)
         await message.answer("◀️ Возврат в главное меню", reply_markup=keyboard)
     else:
@@ -6946,13 +8113,14 @@ async def edit_profile_region(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer("❌ Ошибка")
         return
 
-    old_value = (get_user_by_id(user_id) or {}).get("region", "Не указан")
-    users[user_id]["region"] = new_region
+    user_data = get_user_by_id(user_id) or {}
+    old_value = user_data.get("region", "Не указан")
+    user_data["region"] = new_region
 
     save_users_to_json()
 
     if gs and gs.spreadsheet:
-        gs.update_user_in_sheets(user_id, users[user_id])
+        gs.update_user_in_sheets(user_id, user_data)
 
     await state.finish()
 
@@ -6990,12 +8158,13 @@ async def edit_profile_value(message: types.Message, state: FSMContext):
             await message.answer("❌ Некорректный номер телефона. Попробуйте ещё раз:")
             return
 
-    users[user_id][field] = new_value
+    user_data = get_user_by_id(user_id) or {}
+    user_data[field] = new_value
 
     save_users_to_json()
 
     if gs and gs.spreadsheet:
-        gs.update_user_in_sheets(user_id, users[user_id])
+        gs.update_user_in_sheets(user_id, user_data)
 
     await state.finish()
 
@@ -7576,7 +8745,20 @@ def load_batches_from_pickle():
 
                 if first_key and isinstance(loaded_data[first_key], list):
                     # ПРАВИЛЬНЫЙ формат: {user_id: [batches]}
-                    batches = loaded_data
+                    merged_batches = {}
+                    merged_keys = {}
+                    for owner_key, owner_batches in loaded_data.items():
+                        if not isinstance(owner_batches, list):
+                            continue
+                        canonical_owner_key = str(owner_key)
+                        target_key = merged_keys.get(canonical_owner_key, owner_key)
+                        if canonical_owner_key not in merged_keys:
+                            merged_keys[canonical_owner_key] = target_key
+                            merged_batches[target_key] = []
+                        merged_batches[target_key].extend(
+                            [b for b in owner_batches if isinstance(b, dict)]
+                        )
+                    batches = merged_batches
                     total_batches = sum(
                         len(b) for b in batches.values() if isinstance(b, list)
                     )
@@ -7590,14 +8772,25 @@ def load_batches_from_pickle():
                     # Конвертируем обратно в {user_id: [batches]}
                     logging.warning("⚠️ Обнаружен неправильный формат, конвертируем...")
                     batches = {}
+                    merged_keys = {}
                     for batch_id, batch in loaded_data.items():
                         if not isinstance(batch, dict):
                             continue
                         user_id = batch.get("user_id") or batch.get("farmer_id")
                         if user_id:
-                            if user_id not in batches:
-                                batches[user_id] = []
-                            batches[user_id].append(batch)
+                            normalized_user_id = (
+                                int(user_id)
+                                if isinstance(user_id, str) and user_id.isdigit()
+                                else user_id
+                            )
+                            canonical_owner_key = str(normalized_user_id)
+                            target_key = merged_keys.get(
+                                canonical_owner_key, normalized_user_id
+                            )
+                            if canonical_owner_key not in merged_keys:
+                                merged_keys[canonical_owner_key] = target_key
+                                batches[target_key] = []
+                            batches[target_key].append(batch)
 
                     total_batches = count_all_batches()
                     logging.info(
@@ -8312,7 +9505,8 @@ async def farmer_view_logistics_offers(message: types.Message, state: FSMContext
         req.get("id", req_id)
         for storage in (farmer_shipping_requests, farmer_logistics_requests)
         for req_id, req in storage.items()
-        if isinstance(req, dict) and same_id(req.get("farmer_id"), user_id)
+        if isinstance(req, dict)
+        and same_id(req.get("farmer_id") or req.get("user_id"), user_id)
     }
 
     if not farmer_request_ids:
@@ -8328,7 +9522,8 @@ async def farmer_view_logistics_offers(message: types.Message, state: FSMContext
         (offer_id, offer)
         for offer_id, offer in logistic_offers.items()
         if any(logistic_offer_matches_request(offer, req_id, "farmer") for req_id in farmer_request_ids)
-        and normalize_transition_status(offer.get("status", "pending")) == "pending"
+        and normalize_transition_status(offer.get("status", "pending"))
+        in {"pending", "active", "new", "open"}
     ]
 
     if not active_offers:
@@ -8340,7 +9535,7 @@ async def farmer_view_logistics_offers(message: types.Message, state: FSMContext
         return
 
     # Сортируем по цене (дешевле выше)
-    active_offers.sort(key=lambda x: x[1].get("price", 999999999))
+    active_offers.sort(key=lambda x: get_safe_float(x[1].get("price"), 999999999))
 
     text = "<b>🚚 ДОСТУПНЫЕ ПРЕДЛОЖЕНИЯ ЛОГИСТОВ</b>\n\n"
     text += f"📊 Найдено предложений: <b>{len(active_offers)}</b>\n\n"
@@ -8365,7 +9560,7 @@ async def farmer_view_logistics_offers(message: types.Message, state: FSMContext
         route_from = request.get("route_from", "—")
         route_to = request.get("route_to", "—")
 
-        price = offer.get("price", 0)
+        price = get_safe_float(offer.get("price"), 0)
 
         emoji = TRANSPORT_TYPES.get(vehicle_type, "🚛")
 
@@ -8416,7 +9611,7 @@ async def farmer_view_offer_details(callback: types.CallbackQuery, state: FSMCon
         return
 
     user_id = callback.from_user.id
-    if not same_id(request.get("farmer_id"), user_id):
+    if not same_id(request.get("farmer_id") or request.get("user_id"), user_id):
         await callback.answer("❌ Это не ваша заявка", show_alert=True)
         return
 
@@ -8437,9 +9632,11 @@ async def farmer_view_offer_details(callback: types.CallbackQuery, state: FSMCon
     additional_info = offer.get("additional_info", "Нет доп. информации")
 
     culture = request.get("culture", "Не указана")
-    volume = request.get("volume", 0)
+    volume = get_safe_float(request.get("volume"), 0)
     route_from = request.get("route_from", "Не указано")
     route_to = request.get("route_to", "Не указано")
+    desired_price = get_safe_float(request.get("desired_price"), 0)
+    offer_price = get_safe_float(offer.get("price"), 0)
 
     text = f"""
 🚚 <b>ПРЕДЛОЖЕНИЕ ЛОГИСТА #{offer_id}</b>
@@ -8459,11 +9656,11 @@ async def farmer_view_offer_details(callback: types.CallbackQuery, state: FSMCon
 Культура: {culture}
 Объём: {volume:.1f} т
 Маршрут: {route_from} → {route_to}
-Ожидаемая цена: {request.get('desired_price', 0):,.0f} ₽/т
+Ожидаемая цена: {desired_price:,.0f} ₽/т
 
 <b>🚛 ПРЕДЛОЖЕНИЕ:</b>
 Тип транспорта: {offer.get('vehicle_type', 'Не указан')}
-Цена: {offer.get('price', 0):,.0f} ₽
+Цена: {offer_price:,.0f} ₽
 Дата доставки: {offer.get('delivery_date', 'Не указана')}
 
 <b>ℹ️ Дополнительно:</b>
@@ -8481,7 +9678,7 @@ async def farmer_view_offer_details(callback: types.CallbackQuery, state: FSMCon
             InlineKeyboardButton("💬 Написать", url=f"tg://user?id={logist_id}"),
         )
 
-    if normalize_transition_status(status) == "pending":
+    if normalize_transition_status(status) in {"pending", "active", "new", "open"}:
         keyboard.add(
             InlineKeyboardButton(
                 "✅ Принять предложение",
@@ -8537,10 +9734,16 @@ async def farmer_accept_logistics_offer(
         )
         return
 
-    if not same_id(request.get("farmer_id"), user_id):
+    if not same_id(request.get("farmer_id") or request.get("user_id"), user_id):
         await callback.answer("❌ Это не ваша заявка", show_alert=True)
         return
-    if not is_request_open_for_offers(request.get("status")):
+    request_status = get_effective_request_status(
+        request_id,
+        "farmer",
+        request,
+        request_owner_id=request.get("farmer_id") or request.get("user_id"),
+    )
+    if not is_request_open_for_offers(request_status):
         await callback.answer(
             "❌ Заявка уже не принимает предложения", show_alert=True
         )
@@ -8550,19 +9753,49 @@ async def farmer_accept_logistics_offer(
         await callback.answer("❌ По заявке уже назначен логист", show_alert=True)
         return
 
-    if normalize_transition_status(offer.get("status")) not in {"pending", "active"}:
+    if normalize_transition_status(offer.get("status")) not in OPEN_LOGISTIC_OFFER_STATUSES:
         await callback.answer("❌ Это предложение уже обработано", show_alert=True)
         return
 
-    # Принимаем предложение
+    now_sql = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    selected_logist_id = get_offer_logist_id(offer)
+    if not selected_logist_id:
+        await callback.answer(
+            "❌ В предложении не указан логист, принятие невозможно",
+            show_alert=True,
+        )
+        return
+
+    # Отклоняем остальные открытые офферы по заявке фермера
+    matching_deliveries = [
+        (deliv_key, d)
+        for deliv_key, d in deliveries.items()
+        if isinstance(d, dict)
+        and same_id(d.get("request_id"), request_id)
+        and same_id(d.get("farmer_id") or d.get("user_id"), user_id)
+        and str(d.get("source") or "").strip().lower() in {"", "farmer"}
+    ]
+    if any(
+        get_effective_delivery_status(d, request if isinstance(request, dict) else None)
+        in {"completed", "cancelled"}
+        for _, d in matching_deliveries
+    ):
+        await callback.answer("❌ По заявке уже есть закрытая доставка", show_alert=True)
+        return
+    if any(
+        get_effective_delivery_status(d, request if isinstance(request, dict) else None)
+        in {"in_progress", "expeditor_selected"}
+        for _, d in matching_deliveries
+    ):
+        await callback.answer("❌ По заявке уже есть доставка в работе", show_alert=True)
+        return
+
+    # Принимаем предложение только после проверки целостности доставки.
     offer["status"] = "accepted"
     offer["farmer_id"] = user_id
-    offer["accepted_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    offer["accepted_at"] = now_sql
 
-    # Можно пометить заявку как "assigned", если нужно
-    now_sql = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     request["status"] = "assigned"
-    selected_logist_id = get_offer_logist_id(offer)
     request["logist_id"] = selected_logist_id
     request["assigned_logist_id"] = selected_logist_id
     request["selected_logistic"] = selected_logist_id
@@ -8570,7 +9803,6 @@ async def farmer_accept_logistics_offer(
     request["logistic_offer_id"] = offer_id
     request["assigned_at"] = now_sql
 
-    # Отклоняем остальные открытые офферы по заявке фермера
     for other_offer in logistic_offers.values():
         if not isinstance(other_offer, dict):
             continue
@@ -8579,49 +9811,44 @@ async def farmer_accept_logistics_offer(
         if same_id(other_offer.get("id"), offer_id):
             continue
         other_status = normalize_transition_status(other_offer.get("status") or "pending")
-        if other_status not in {"pending", "active"}:
+        if other_status not in OPEN_LOGISTIC_OFFER_STATUSES:
             continue
         other_offer["status"] = "rejected"
         other_offer["rejected_at"] = now_sql
         other_offer["rejection_reason"] = "Принято другое предложение"
+    request["offers_count"] = count_open_logistic_offers_for_request(request_id, "farmer")
 
-    # Создаём/обновляем доставку по принятому предложению
-    existing_delivery = next(
-        (
-            d
-            for d in deliveries.values()
-            if same_id(d.get("request_id"), request_id)
-            and same_id(d.get("farmer_id"), user_id)
-            and str(d.get("source") or "").strip().lower() == "farmer"
-        ),
-        None,
-    )
-    if existing_delivery:
-        existing_delivery_status = normalize_transition_status(
-            existing_delivery.get("status")
-        )
-        if existing_delivery_status in {"completed", "cancelled"}:
-            await callback.answer(
-                "❌ По заявке уже есть закрытая доставка", show_alert=True
+    active_matching_deliveries = [
+        (deliv_key, d)
+        for deliv_key, d in matching_deliveries
+        if get_effective_delivery_status(d, request if isinstance(request, dict) else None)
+        not in {"completed", "cancelled"}
+    ]
+    if active_matching_deliveries:
+        for existing_delivery_key, existing_delivery in active_matching_deliveries:
+            if existing_delivery.get("id") is None:
+                existing_delivery["id"] = (
+                    int(existing_delivery_key)
+                    if str(existing_delivery_key).isdigit()
+                    else existing_delivery_key
+                )
+            existing_delivery["offer_id"] = offer_id
+            existing_delivery["farmer_id"] = user_id
+            existing_delivery["logist_id"] = selected_logist_id
+            existing_delivery["pull_id"] = request.get("pull_id")
+            existing_delivery["route_from"] = (
+                request.get("route_from") or request.get("from_city") or request.get("from")
             )
-            return
-        existing_delivery["offer_id"] = offer_id
-        existing_delivery["farmer_id"] = user_id
-        existing_delivery["logist_id"] = selected_logist_id
-        existing_delivery["pull_id"] = request.get("pull_id")
-        existing_delivery["route_from"] = (
-            request.get("route_from") or request.get("from_city") or request.get("from")
-        )
-        existing_delivery["route_to"] = (
-            request.get("route_to") or request.get("to_city") or request.get("to")
-        )
-        existing_delivery["volume"] = request.get("volume", 0)
-        existing_delivery["price"] = offer.get("price", 0)
-        existing_delivery["vehicle_type"] = offer.get("vehicle_type")
-        existing_delivery["delivery_date"] = offer.get("delivery_date")
-        existing_delivery["status"] = "pending"
-        existing_delivery["source"] = "farmer"
-        existing_delivery["updated_at"] = now_sql
+            existing_delivery["route_to"] = (
+                request.get("route_to") or request.get("to_city") or request.get("to")
+            )
+            existing_delivery["volume"] = request.get("volume", 0)
+            existing_delivery["price"] = get_safe_float(offer.get("price"), 0)
+            existing_delivery["vehicle_type"] = offer.get("vehicle_type")
+            existing_delivery["delivery_date"] = offer.get("delivery_date")
+            existing_delivery["status"] = "pending"
+            existing_delivery["source"] = "farmer"
+            existing_delivery["updated_at"] = now_sql
     else:
         delivery_id = next_numeric_id(deliveries)
         deliveries[delivery_id] = {
@@ -8638,7 +9865,7 @@ async def farmer_accept_logistics_offer(
             or request.get("to_city")
             or request.get("to"),
             "volume": request.get("volume", 0),
-            "price": offer.get("price", 0),
+            "price": get_safe_float(offer.get("price"), 0),
             "vehicle_type": offer.get("vehicle_type"),
             "delivery_date": offer.get("delivery_date"),
             "status": "pending",
@@ -8669,7 +9896,7 @@ async def farmer_accept_logistics_offer(
 <b>🚛 УСЛОВИЯ:</b>
 Тип транспорта: {offer.get('vehicle_type', 'Не указан')}
 Маршрут: {request.get('route_from', 'Не указан')} → {request.get('route_to', 'Не указан')}
-Цена: {offer.get('price', 0):,.0f} ₽
+Цена: {get_safe_float(offer.get('price'), 0):,.0f} ₽
 Дата доставки: {offer.get('delivery_date', 'Не указана')}
 
 ⏳ Логист свяжется с вами в ближайшее время для согласования деталей.
@@ -8706,7 +9933,7 @@ async def farmer_accept_logistics_offer(
 
 <b>🚛 ДЕТАЛИ ПЕРЕВОЗКИ:</b>
 Маршрут: {request.get('route_from', 'Не указан')} → {request.get('route_to', 'Не указан')}
-Ваша цена: {offer.get('price', 0):,.0f} ₽
+Ваша цена: {get_safe_float(offer.get('price'), 0):,.0f} ₽
 
 📞 Свяжитесь с фермером в ближайшее время для уточнения деталей.
 """.replace(
@@ -8732,7 +9959,7 @@ async def farmer_accept_logistics_offer(
             exp_msg = (
                 "📬 <b>ЗАЯВКА ФЕРМЕРА ДОСТУПНА ДЛЯ ЭКСПЕДИТОРА</b>\n\n"
                 f"📋 Заявка: #{request_id}\n"
-                f"🌾 {request.get('culture', '—')} • {request.get('volume', 0):.0f} т\n"
+                f"🌾 {request.get('culture', '—')} • {get_safe_float(request.get('volume'), 0):.0f} т\n"
                 f"📍 {request.get('route_from', '—')} → {request.get('route_to', '—')}\n"
                 f"👤 Фермер: {farmer_user.get('name', 'Не указан')}\n\n"
                 "Логист уже назначен, можно отправлять отклик экспедитора."
@@ -8802,11 +10029,11 @@ async def farmer_reject_logistics_offer(
         )
         return
 
-    if not same_id(request.get("farmer_id"), user_id):
+    if not same_id(request.get("farmer_id") or request.get("user_id"), user_id):
         await callback.answer("❌ Это не ваша заявка", show_alert=True)
         return
 
-    if normalize_transition_status(offer.get("status")) not in {"pending", "active"}:
+    if normalize_transition_status(offer.get("status")) not in OPEN_LOGISTIC_OFFER_STATUSES:
         await callback.answer("❌ Это предложение уже обработано", show_alert=True)
         return
 
@@ -8881,7 +10108,8 @@ async def view_farmer_offers_history(message: types.Message, state: FSMContext):
         req.get("id", req_id)
         for storage in (farmer_shipping_requests, farmer_logistics_requests)
         for req_id, req in storage.items()
-        if isinstance(req, dict) and same_id(req.get("farmer_id"), user_id)
+        if isinstance(req, dict)
+        and same_id(req.get("farmer_id") or req.get("user_id"), user_id)
     }
 
     offers = [
@@ -8896,16 +10124,29 @@ async def view_farmer_offers_history(message: types.Message, state: FSMContext):
 
     text = "<b>📋 ИСТОРИЯ ПРЕДЛОЖЕНИЙ ЛОГИСТОВ</b>\n\n"
 
-    active = [o for o in offers if normalize_transition_status(o.get("status")) == "pending"]
-    accepted = [o for o in offers if normalize_transition_status(o.get("status")) == "accepted"]
-    rejected = [o for o in offers if normalize_transition_status(o.get("status")) == "rejected"]
+    active = [
+        o
+        for o in offers
+        if normalize_transition_status(o.get("status")) in OPEN_LOGISTIC_OFFER_STATUSES
+    ]
+    accepted = [
+        o
+        for o in offers
+        if normalize_transition_status(o.get("status"))
+        in (SELECTED_LOGISTIC_OFFER_STATUSES | {"completed"})
+    ]
+    rejected = [
+        o
+        for o in offers
+        if normalize_transition_status(o.get("status")) in {"rejected", "cancelled", "canceled"}
+    ]
 
     if active:
         text += f"<b>⏳ На рассмотрении ({len(active)}):</b>\n"
         for offer in active[:5]:
             text += (
                 f"• #{offer.get('id')}: {offer.get('vehicle_type', '—')} | "
-                f"{offer.get('price', 0):,.0f}₽\n"
+                f"{get_safe_float(offer.get('price'), 0):,.0f}₽\n"
             )
         text += "\n"
 
@@ -8969,13 +10210,25 @@ async def view_deal_details(callback: types.CallbackQuery):
     deal_id = resolved_deal_id
 
     is_admin = user_role == "admin" or user_id == ADMIN_ID
+    pull_id = deal.get("pull_id")
+    all_pulls = pulls.get("pulls", {}) if isinstance(pulls, dict) else {}
+    pull = all_pulls.get(pull_id) or all_pulls.get(str(pull_id), {})
+    deal_exporter_id = (
+        deal.get("exporter_id") or pull.get("exporter_id") or pull.get("creator_id")
+    )
     farmer_ids = deal.get("farmer_ids") or []
+    legacy_farmer_id = deal.get("farmer_id")
+    if legacy_farmer_id not in {None, ""} and not any(
+        same_id(legacy_farmer_id, fid) for fid in farmer_ids
+    ):
+        farmer_ids = [*farmer_ids, legacy_farmer_id]
+    assigned_logist_id = get_assigned_logist_id(deal)
+    assigned_expeditor_id = get_assigned_expeditor_id(deal)
     can_view = (
         is_admin
-        or same_id(deal.get("exporter_id"), user_id)
-        or same_id(deal.get("logistic_id"), user_id)
-        or same_id(deal.get("logist_id"), user_id)
-        or same_id(deal.get("expeditor_id"), user_id)
+        or same_id(deal_exporter_id, user_id)
+        or same_id(assigned_logist_id, user_id)
+        or same_id(assigned_expeditor_id, user_id)
         or same_id(deal.get("farmer_id"), user_id)
         or any(same_id(fid, user_id) for fid in farmer_ids)
         or same_id(deal.get("created_by"), user_id)
@@ -8984,16 +10237,16 @@ async def view_deal_details(callback: types.CallbackQuery):
         await callback.answer("❌ Доступ запрещен", show_alert=True)
         return
 
+    effective_status = get_effective_deal_status(deal)
     text = f"📋 <b>Сделка #{deal_id}</b>\n\n"
-
-    text += f"📊 Статус: {DEAL_STATUSES.get(deal.get('status', 'pending'), deal.get('status'))}\n"
+    text += f"📊 Статус: {DEAL_STATUSES.get(effective_status, effective_status)}\n"
 
     total_volume = safe_float(deal.get("total_volume", deal.get("volume", 0)), 0.0)
     if total_volume > 0:
         text += f"📦 Объём: {total_volume:,.0f} т\n"
 
-    if deal.get("exporter_id"):
-        exporter_name = (get_user_by_id(deal["exporter_id"]) or {}).get(
+    if deal_exporter_id:
+        exporter_name = (get_user_by_id(deal_exporter_id) or {}).get(
             "name", "Неизвестно"
         )
         text += f"📦 Экспортёр: {exporter_name}\n"
@@ -9002,14 +10255,14 @@ async def view_deal_details(callback: types.CallbackQuery):
         farmers_count = len(farmer_ids)
         text += f"🌾 Фермеров: {farmers_count}\n"
 
-    if deal.get("logistic_id"):
-        logistic_name = (get_user_by_id(deal["logistic_id"]) or {}).get(
+    if assigned_logist_id:
+        logistic_name = (get_user_by_id(assigned_logist_id) or {}).get(
             "name", "Неизвестно"
         )
         text += f"🚚 Логист: {logistic_name}\n"
 
-    if deal.get("expeditor_id"):
-        expeditor_name = (get_user_by_id(deal["expeditor_id"]) or {}).get(
+    if assigned_expeditor_id:
+        expeditor_name = (get_user_by_id(assigned_expeditor_id) or {}).get(
             "name", "Неизвестно"
         )
         text += f"🚛 Экспедитор: {expeditor_name}\n"
@@ -9020,7 +10273,23 @@ async def view_deal_details(callback: types.CallbackQuery):
     if deal.get("completed_at"):
         text += f"✅ Завершена: {deal.get('completed_at')}\n"
 
-    keyboard = deal_actions_keyboard(deal_id)
+    can_complete = effective_status == "in_progress" and (
+        same_id(deal_exporter_id, user_id)
+        or any(same_id(fid, user_id) for fid in farmer_ids)
+    )
+    can_cancel = effective_status in {
+        "pending",
+        "matched",
+        "new",
+        "active",
+        "open",
+        "accepted",
+        "assigned",
+        "expeditor_selected",
+    } and same_id(deal_exporter_id, user_id)
+    keyboard = deal_actions_keyboard(
+        deal_id, show_complete=can_complete, show_cancel=can_cancel
+    )
 
     await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
     await callback.answer()
@@ -9077,8 +10346,8 @@ async def search_exporters(message: types.Message, state: FSMContext):
     keyboard = InlineKeyboardMarkup(row_width=1)
     for batch_id, batch in list(farmer_batches.items())[:10]:
         culture = batch.get("culture", "—")
-        volume = batch.get("volume", 0)
-        price = batch.get("price", 0)
+        volume = get_safe_float(batch.get("volume"), 0)
+        price = get_safe_float(batch.get("price"), 0)
         button_text = f"🌾 {culture} - {volume:.0f} т • {price:,.0f} ₽/т"
         keyboard.add(
             InlineKeyboardButton(button_text, callback_data=f"findexporters:{batch_id}")
@@ -9096,8 +10365,11 @@ async def search_exporters(message: types.Message, state: FSMContext):
 async def process_find_exporters(callback: types.CallbackQuery):
     """Обработка выбора партии для поиска экспортёров — финальная версия"""
     try:
-        batch_id = int(callback.data.split(":")[1])
-    except (IndexError, ValueError):
+        batch_id = parse_callback_id(callback.data)
+    except Exception:
+        await callback.answer("❌ Ошибка", show_alert=True)
+        return
+    if batch_id is None:
         await callback.answer("❌ Ошибка", show_alert=True)
         return
 
@@ -9110,8 +10382,13 @@ async def process_find_exporters(callback: types.CallbackQuery):
     batch = None
 
     # Случай 1: Новая структура {batch_id: {farmer_id: ..., ...}}
-    if batch_id in batches and isinstance(batches[batch_id], dict):
-        batch = batches[batch_id]
+    direct_batch = (
+        batches.get(batch_id) if isinstance(batches, dict) else None
+    ) or (
+        batches.get(str(batch_id)) if isinstance(batches, dict) else None
+    )
+    if isinstance(direct_batch, dict):
+        batch = direct_batch
 
     # Случай 2: Старая структура {user_id: [batch1, batch2, ...]}
     else:
@@ -9163,20 +10440,20 @@ async def process_find_exporters(callback: types.CallbackQuery):
             continue
 
         # Проверка объёма
-        target_volume = pull.get("target_volume", 0)
-        current_volume = pull.get("current_volume", 0)
+        target_volume = get_safe_float(pull.get("target_volume"), 0)
+        current_volume = get_safe_float(pull.get("current_volume"), 0)
         remaining = target_volume - current_volume
 
-        if remaining < batch.get("volume", 0):
+        if remaining < get_safe_float(batch.get("volume"), 0):
             continue
 
         # Получаем экспортёра
-        exporter_id = pull.get("exporter_id")
+        exporter_id = pull.get("exporter_id") or pull.get("creator_id")
         exporter = get_user_by_id(exporter_id) or {}
 
         # Флаг предупреждения о цене
-        pull_price = pull.get("price", 0)
-        batch_price = batch.get("price", 0)
+        pull_price = get_safe_float(pull.get("price"), 0)
+        batch_price = get_safe_float(batch.get("price"), 0)
         price_warning = pull_price < batch_price
 
         matching_pulls.append(
@@ -9199,8 +10476,8 @@ async def process_find_exporters(callback: types.CallbackQuery):
 
         await callback.message.edit_text(
             f"🔍 <b>Результаты поиска для партии #{batch_id}</b>\n\n"
-            f"🌾 {batch.get('culture', '—')} - {batch.get('volume', 0):.0f} т\n"
-            f"💰 {batch.get('price', 0):,.0f} ₽/т\n\n"
+            f"🌾 {batch.get('culture', '—')} - {get_safe_float(batch.get('volume'), 0):.0f} т\n"
+            f"💰 {get_safe_float(batch.get('price'), 0):,.0f} ₽/т\n\n"
             "❌ К сожалению, подходящих экспортёров не найдено.\n\n"
             "💡 Попробуйте:\n"
             "• Снизить цену\n"
@@ -9215,8 +10492,8 @@ async def process_find_exporters(callback: types.CallbackQuery):
     text = (
         f"🎯 <b>Найдено {len(matching_pulls)} подходящих экспортёров</b>\n\n"
         "Для партии:\n"
-        f"🌾 {batch.get('culture', '—')} - {batch.get('volume', 0):.0f} т\n"
-        f"💰 {batch.get('price', 0):,.0f} ₽/т\n"
+        f"🌾 {batch.get('culture', '—')} - {get_safe_float(batch.get('volume'), 0):.0f} т\n"
+        f"💰 {get_safe_float(batch.get('price'), 0):,.0f} ₽/т\n"
         f"📍 {batch.get('region', 'Не указан')}\n\n"
         "<b>Подходящие предложения:</b>\n\n"
     )
@@ -9227,7 +10504,7 @@ async def process_find_exporters(callback: types.CallbackQuery):
         company = exporter.get("company_name") or exporter.get("name", "—")
         phone = exporter.get("phone", "Не указан")
         email = exporter.get("email", "Не указан")
-        pull_price = pull.get("price", 0)
+        pull_price = get_safe_float(pull.get("price"), 0)
 
         text += (
             f"{idx}. <b>Экспортёр:</b> {company}\n" f"   💰 Цена: {pull_price:,.0f} ₽/т"
@@ -9235,11 +10512,13 @@ async def process_find_exporters(callback: types.CallbackQuery):
 
         # Добавляем предупреждение о низкой цене
         if match.get("price_warning"):
-            text += f" ⚠️ <i>(ниже вашей {batch.get('price', 0):,.0f} ₽/т)</i>"
+            text += (
+                f" ⚠️ <i>(ниже вашей {get_safe_float(batch.get('price'), 0):,.0f} ₽/т)</i>"
+            )
 
         text += (
             "\n"
-            f"   📦 Нужно: {pull.get('target_volume', 0):.0f} т (свободно: {match['remaining_volume']:.0f} т)\n"
+            f"   📦 Нужно: {get_safe_float(pull.get('target_volume'), 0):.0f} т (свободно: {match['remaining_volume']:.0f} т)\n"
             f"   🚢 Порт: {pull.get('port', '—')}\n"
             f"   📞 Телефон: <code>{phone}</code>\n"
             f"   📧 Email: <code>{email}</code>\n\n"
@@ -9355,7 +10634,9 @@ async def search_by_culture_selected(callback: types.CallbackQuery, state: FSMCo
     # ════════════════════════════════════════════════════════════════════════════
 
     # Сортируем по цене
-    found_batches_sorted = sorted(found_batches, key=lambda x: x.get("price", 0))
+    found_batches_sorted = sorted(
+        found_batches, key=lambda x: get_safe_float(x.get("price"), 0)
+    )
 
     # Формируем сообщение
     text = f"🌾 <b>Найдено партий:</b> {len(found_batches)}\n\n"
@@ -9366,8 +10647,8 @@ async def search_by_culture_selected(callback: types.CallbackQuery, state: FSMCo
     for idx, batch in enumerate(found_batches_sorted[:10], 1):
         batch_id = batch.get("batch_id") or batch.get("id", 0)
         batch_culture = batch.get("culture", "Не указана")
-        volume = batch.get("volume", 0)
-        price = batch.get("price", 0)
+        volume = get_safe_float(batch.get("volume"), 0)
+        price = get_safe_float(batch.get("price"), 0)
         region = batch.get("region", "Не указан")
         farmer_id = batch.get("farmer_id")
 
@@ -9394,8 +10675,8 @@ async def search_by_culture_selected(callback: types.CallbackQuery, state: FSMCo
     for batch in found_batches_sorted[:10]:
         batch_id = batch.get("batch_id") or batch.get("id", 0)
         batch_culture = batch.get("culture", "Не указана")
-        volume = batch.get("volume", 0)
-        price = batch.get("price", 0)
+        volume = get_safe_float(batch.get("volume"), 0)
+        price = get_safe_float(batch.get("price"), 0)
 
         keyboard.add(
             InlineKeyboardButton(
@@ -9438,8 +10719,21 @@ async def contact_farmer_callback(callback: types.CallbackQuery):
         # Поддержка обоих форматов:
         # contact_farmer:<batch_id>
         # contact_farmer:<batch_id>:<farmer_id>
-        batch_id = int(parts[1])
-        callback_farmer_id = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
+        batch_id_raw = parts[1] if len(parts) > 1 else ""
+        batch_id = (
+            int(batch_id_raw) if str(batch_id_raw).isdigit() else str(batch_id_raw).strip()
+        )
+        callback_farmer_id = None
+        if len(parts) > 2:
+            callback_farmer_id_raw = parts[2]
+            callback_farmer_id = (
+                int(callback_farmer_id_raw)
+                if str(callback_farmer_id_raw).isdigit()
+                else str(callback_farmer_id_raw).strip()
+            )
+        if not batch_id:
+            await callback.answer("❌ Ошибка данных партии", show_alert=True)
+            return
         logging.info(f"📞 Запрос контактов для партии {batch_id}")
 
         # Ищем партию в unified-структуре хранения
@@ -9479,8 +10773,8 @@ async def contact_farmer_callback(callback: types.CallbackQuery):
 
         # Получаем информацию о партии
         culture = found_batch.get("culture", "N/A")
-        volume = found_batch.get("volume", 0)
-        price = found_batch.get("price", 0)
+        volume = get_safe_float(found_batch.get("volume"), 0)
+        price = get_safe_float(found_batch.get("price"), 0)
         region = found_batch.get("region", "Не указан")
         quality = found_batch.get("quality_class", "Не указан")
         moisture = found_batch.get("moisture", "—")
@@ -9610,7 +10904,7 @@ async def add_batch_volume(message: types.Message, state: FSMContext):
 async def add_batch_price(message: types.Message, state: FSMContext):
     """Ввод цены партии"""
     try:
-        price = float(message.text.strip().replace(",", "."))
+        price = parse_price(message.text)
         if price <= 0:
             raise ValueError
 
@@ -9732,9 +11026,14 @@ async def add_batch_readiness_date(message: types.Message, state: FSMContext):
     }
 
     # Добавляем партию в базу
-    if user_id not in batches:
-        batches[user_id] = []
-    batches[user_id].append(batch)
+    batch_owner_key = (
+        user_id
+        if user_id in batches
+        else (str(user_id) if str(user_id) in batches else user_id)
+    )
+    if batch_owner_key not in batches:
+        batches[batch_owner_key] = []
+    batches[batch_owner_key].append(batch)
 
     save_batches_to_pickle()
 
@@ -9761,7 +11060,7 @@ async def add_batch_readiness_date(message: types.Message, state: FSMContext):
 
             if (
                 is_pull_open_status(pull.get("status"))
-                and batch["volume"] <= available
+                and get_safe_float(batch.get("volume"), 0) <= available
                 and batch_culture == pull_culture
             ):
                 if participant_key not in pullparticipants:
@@ -9769,7 +11068,7 @@ async def add_batch_readiness_date(message: types.Message, state: FSMContext):
 
                 # Проверяем что ещё не присоединились
                 already_joined = any(
-                    same_id(p.get("batch_id"), batch["id"])
+                    same_id(p.get("batch_id"), batch.get("id"))
                     for p in pullparticipants[participant_key]
                 )
 
@@ -9777,12 +11076,14 @@ async def add_batch_readiness_date(message: types.Message, state: FSMContext):
                     participant = {
                         "farmer_id": user_id,
                         "farmer_name": user_info.get("name", ""),
-                        "batch_id": batch["id"],
-                        "volume": batch["volume"],
+                        "batch_id": batch.get("id"),
+                        "volume": get_safe_float(batch.get("volume"), 0),
                         "joined_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     }
                     pullparticipants[participant_key].append(participant)
-                    pull["current_volume"] += batch["volume"]
+                    pull["current_volume"] = get_safe_float(
+                        pull.get("current_volume"), 0
+                    ) + get_safe_float(batch.get("volume"), 0)
 
                     batch["status"] = "reserved"
 
@@ -9790,22 +11091,23 @@ async def add_batch_readiness_date(message: types.Message, state: FSMContext):
                     save_batches_to_pickle()
 
                     logging.info(
-                        f"✅ Партия #{batch['id']} автоматически присоединена к пулу #{pull_id}"
+                        f"✅ Партия #{batch.get('id')} автоматически присоединена к пулу #{pull_id}"
                     )
 
                     # Уведомление экспортёру о новой партии
                     try:
                         # ✅ ПРОВЕРКА НАЛИЧИЯ ЭКСПОРТЁРА
-                        if "exporter_id" in pull and pull["exporter_id"]:
-                            farmer_card = format_farmer_card(user_id, batch["id"])
+                        pull_exporter_id = pull.get("exporter_id") or pull.get("creator_id")
+                        if pull_exporter_id:
+                            farmer_card = format_farmer_card(user_id, batch.get("id"))
 
                             await bot.send_message(
-                                pull["exporter_id"],
+                                pull_exporter_id,
                                 f"🎉 <b>Новая партия присоединена к пулу #{pull_id}!</b>\n\n{farmer_card}",
                                 parse_mode="HTML",
                             )
                             logging.info(
-                                f"✅ Уведомление экспортёру {pull['exporter_id']} отправлено"
+                                f"✅ Уведомление экспортёру {pull_exporter_id} отправлено"
                             )
                         else:
                             logging.warning(f"⚠️ В пуле {pull_id} нет exporter_id")
@@ -9814,9 +11116,9 @@ async def add_batch_readiness_date(message: types.Message, state: FSMContext):
 
                     # Уведомление фермеру об успешном присоединении
                     await message.answer(
-                        f"✅ <b>Партия #{batch['id']} создана и автоматически присоединена к пулу #{pull_id}!</b>\n\n"
+                        f"✅ <b>Партия #{batch.get('id')} создана и автоматически присоединена к пулу #{pull_id}!</b>\n\n"
                         f"🌾 {batch['culture']}\n"
-                        f"📦 Объём: {batch['volume']} т\n"
+                        f"📦 Объём: {get_safe_float(batch.get('volume'), 0)} т\n"
                         f"💰 Цена: {batch['price']:,.0f} ₽/т\n\n"
                         "Экспортёр получил уведомление и свяжется с вами.",
                         parse_mode="HTML",
@@ -9843,7 +11145,7 @@ async def add_batch_readiness_date(message: types.Message, state: FSMContext):
     keyboard = get_role_keyboard("farmer")
 
     message_text = (
-        f"✅ <b>Партия #{batch['id']} добавлена!</b>\n\n"
+        f"✅ <b>Партия #{batch.get('id')} добавлена!</b>\n\n"
         f"🌾 Культура: {batch['culture']}\n"
         f"📍 Регион: {batch.get('region', 'Не указан')}\n"
         f"📦 Объём: {batch['volume']} т\n"
@@ -9879,7 +11181,7 @@ async def add_batch_readiness_date(message: types.Message, state: FSMContext):
             match_id = next_numeric_id(matches)
             matches[match_id] = {
                 "id": match_id,
-                "batch_id": batch["id"],
+                "batch_id": batch.get("id"),
                 "pull_id": pull_id,
                 "status": "active",
                 "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -9896,9 +11198,12 @@ async def add_batch_readiness_date(message: types.Message, state: FSMContext):
 async def view_batch_matches(callback: types.CallbackQuery):
     """Просмотр совпадений для партии"""
     try:
-        batch_id = int(callback.data.split(":")[1])
-    except (IndexError, ValueError) as e:
+        batch_id = parse_callback_id(callback.data)
+    except Exception as e:
         logging.error(f"❌ Ошибка парсинга batch_id: {e}")
+        await callback.answer("❌ Ошибка", show_alert=True)
+        return
+    if batch_id is None:
         await callback.answer("❌ Ошибка", show_alert=True)
         return
 
@@ -9932,7 +11237,10 @@ async def view_batch_matches(callback: types.CallbackQuery):
 
     # Формируем текст сообщения
     text = f"🎯 <b>Совпадения для партии #{batch_id}</b>\n\n"
-    text += f"🌾 <b>{batch.get('culture', '?')}</b> • {batch.get('volume', 0)} т • {batch.get('price', 0):,.0f} ₽/т\n\n"
+    text += (
+        f"🌾 <b>{batch.get('culture', '?')}</b> • {get_safe_float(batch.get('volume'), 0):,.0f} т • "
+        f"{get_safe_float(batch.get('price'), 0):,.0f} ₽/т\n\n"
+    )
 
     # ✅ Получаем пулы
     all_pulls = pulls.get("pulls", {})
@@ -9942,8 +11250,8 @@ async def view_batch_matches(callback: types.CallbackQuery):
         pull = all_pulls.get(pull_id) or all_pulls.get(str(pull_id))
 
         if pull and isinstance(pull, dict):
-            target_volume = pull.get("target_volume", 0)
-            current_volume = pull.get("current_volume", 0)
+            target_volume = get_safe_float(pull.get("target_volume"), 0)
+            current_volume = get_safe_float(pull.get("current_volume"), 0)
             progress = (
                 (current_volume / target_volume * 100) if target_volume > 0 else 0
             )
@@ -9952,7 +11260,7 @@ async def view_batch_matches(callback: types.CallbackQuery):
             text += (
                 f"   📦 <b>Нужно:</b> {target_volume} т ({progress:.0f}% заполнено)\n"
             )
-            text += f"   💰 <b>Цена:</b> ₽{pull.get('price', 0):,.0f}/т\n"
+            text += f"   💰 <b>Цена:</b> ₽{get_safe_float(pull.get('price'), 0):,.0f}/т\n"
             text += f"   🚢 <b>Порт:</b> {pull.get('port', '?')}\n"
             text += f"   👤 <b>Экспортёр:</b> {pull.get('exporter_name', '?')}\n"
             text += f"   📋 <b>Условия:</b> {pull.get('doc_type', 'Не указаны')}\n\n"
@@ -10024,39 +11332,51 @@ async def view_my_batches(message: types.Message, state: FSMContext):
             if isinstance(m, dict)
         )
         match_emoji = "🎯 " if has_matches else ""
+        batch_id_value = batch.get("id")
+        if batch_id_value is None:
+            continue
         button_text = (
-            f"{match_emoji}✅ {batch['culture']} - {batch['volume']} т "
-            f"({batch['price']:,.0f} ₽/т)"
+            f"{match_emoji}✅ {batch.get('culture', '?')} - {batch.get('volume', 0)} т "
+            f"({get_safe_float(batch.get('price'), 0):,.0f} ₽/т)"
         )
         keyboard.add(
-            InlineKeyboardButton(button_text, callback_data=f"view_batch:{batch['id']}")
+            InlineKeyboardButton(button_text, callback_data=f"view_batch:{batch_id_value}")
         )
 
     for batch in reserved_batches:
+        batch_id_value = batch.get("id")
+        if batch_id_value is None:
+            continue
         button_text = (
-            f"🔒 {batch['culture']} - {batch['volume']} т "
-            f"({batch['price']:,.0f} ₽/т)"
+            f"🔒 {batch.get('culture', '?')} - {batch.get('volume', 0)} т "
+            f"({get_safe_float(batch.get('price'), 0):,.0f} ₽/т)"
         )
         keyboard.add(
-            InlineKeyboardButton(button_text, callback_data=f"view_batch:{batch['id']}")
+            InlineKeyboardButton(button_text, callback_data=f"view_batch:{batch_id_value}")
         )
 
     for batch in sold_batches:
+        batch_id_value = batch.get("id")
+        if batch_id_value is None:
+            continue
         button_text = (
-            f"💰 {batch['culture']} - {batch['volume']} т "
-            f"({batch['price']:,.0f} ₽/т)"
+            f"💰 {batch.get('culture', '?')} - {batch.get('volume', 0)} т "
+            f"({get_safe_float(batch.get('price'), 0):,.0f} ₽/т)"
         )
         keyboard.add(
-            InlineKeyboardButton(button_text, callback_data=f"view_batch:{batch['id']}")
+            InlineKeyboardButton(button_text, callback_data=f"view_batch:{batch_id_value}")
         )
 
     for batch in withdrawn_batches:
+        batch_id_value = batch.get("id")
+        if batch_id_value is None:
+            continue
         button_text = (
-            f"❌ {batch['culture']} - {batch['volume']} т "
-            f"({batch['price']:,.0f} ₽/т)"
+            f"❌ {batch.get('culture', '?')} - {batch.get('volume', 0)} т "
+            f"({get_safe_float(batch.get('price'), 0):,.0f} ₽/т)"
         )
         keyboard.add(
-            InlineKeyboardButton(button_text, callback_data=f"view_batch:{batch['id']}")
+            InlineKeyboardButton(button_text, callback_data=f"view_batch:{batch_id_value}")
         )
 
     keyboard.add(
@@ -10131,10 +11451,10 @@ async def view_pools_menu(message: types.Message, state: FSMContext):
             logging.warning(f"⚠️ pull_id is None для пула: {pull}")
             continue
 
+        current_volume = get_safe_float(pull.get("current_volume"), 0)
+        target_volume = get_safe_float(pull.get("target_volume"), 0)
         progress = (
-            pull.get("current_volume", 0) / pull.get("target_volume", 1) * 100
-            if pull.get("target_volume", 1) > 0
-            else 0
+            (current_volume / target_volume * 100) if target_volume > 0 else 0
         )
 
         button_text = (
@@ -10179,8 +11499,8 @@ async def join_pull_volume(message: types.Message, state: FSMContext):
             return
 
         # Проверка доступного места
-        target_volume = pull.get("target_volume", 0)
-        current_volume = pull.get("current_volume", 0)
+        target_volume = get_safe_float(pull.get("target_volume"), 0)
+        current_volume = get_safe_float(pull.get("current_volume"), 0)
         available = target_volume - current_volume
 
         if volume > available:
@@ -10214,17 +11534,14 @@ async def join_pull_volume(message: types.Message, state: FSMContext):
         )
 
         # Обновляем текущий объём пула
-        pull["current_volume"] = current_volume + volume
+        pull["current_volume"] = current_volume + get_safe_float(volume, 0)
 
         save_pulls_to_pickle()
 
         # ✅ КЛЮЧЕВАЯ ПРОВЕРКА - заполненность
-        is_full = False
-        if pull["current_volume"] >= pull.get("target_volume", 0):
-            pull["status"] = "filled"
-            save_pulls_to_pickle()
-            is_full = True
-            logging.info(f"🎉 Пул #{pull_id} заполнен на 100%!")
+        target_volume_safe = get_safe_float(pull.get("target_volume"), 0)
+        current_volume_safe = get_safe_float(pull.get("current_volume"), 0)
+        is_full = check_and_close_pull_if_full(pull_id)
 
         await state.finish()
 
@@ -10241,16 +11558,22 @@ async def join_pull_volume(message: types.Message, state: FSMContext):
             )
         else:
             # Обычное добавление
-            fill_percent = (pull["current_volume"] / pull.get("target_volume", 1)) * 100
-            remaining = pull.get("target_volume", 0) - pull["current_volume"]
+            target_volume_safe = get_safe_float(pull.get("target_volume"), 0)
+            current_volume_safe = get_safe_float(pull.get("current_volume"), 0)
+            fill_percent = (
+                (current_volume_safe / target_volume_safe) * 100
+                if target_volume_safe > 0
+                else 0
+            )
+            remaining = target_volume_safe - current_volume_safe
 
             await message.answer(
                 "✅ <b>Партия добавлена в пул!</b>\n\n"
                 f"📦 Ваш объем: {volume:,.0f} т\n"
-                f"💵 Цена: ₽{pull.get('price', 0):,.0f}/т\n"
-                f"💰 Ваша сумма: ₽{volume * pull.get('price', 0):,.0f}\n\n"
+                f"💵 Цена: ₽{get_safe_float(pull.get('price'), 0):,.0f}/т\n"
+                f"💰 Ваша сумма: ₽{volume * get_safe_float(pull.get('price'), 0):,.0f}\n\n"
                 "📊 <b>Заполненность пула:</b>\n"
-                f"{pull['current_volume']:,.0f} / {pull.get('target_volume', 0):,.0f} т ({fill_percent:.1f}%)\n"
+                f"{current_volume_safe:,.0f} / {target_volume_safe:,.0f} т ({fill_percent:.1f}%)\n"
                 f"Осталось: {remaining:,.0f} т\n\n"
                 "Вы получите уведомление, когда пул будет заполнен.",
                 parse_mode="HTML",
@@ -10459,7 +11782,7 @@ async def create_pull_volume(message: types.Message, state: FSMContext):
 @dp.message_handler(state=CreatePullStatesGroup.price)
 async def create_pull_price(message: types.Message, state: FSMContext):
     try:
-        price = float(message.text.strip().replace(",", "."))
+        price = parse_price(message.text)
         if price <= 0:
             raise ValueError
         await state.update_data(price=price)
@@ -10670,7 +11993,7 @@ async def create_pull_finish(callback: types.CallbackQuery, state: FSMContext):
         "status": "active",
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "participants": [],
-        "price_per_ton": float(data.get("price", 0)),
+        "price_per_ton": get_safe_float(data.get("price"), 0),
         "creator_id": userid,
         "farmer_ids": [],
         "batches": [],
@@ -10954,8 +12277,8 @@ async def back_to_my_pulls(callback: types.CallbackQuery, state: FSMContext):
         culture_icon = culture_emoji.get(culture, "🌾")
         status = normalize_transition_status(pull.get("status", "active"))
         status_icon = status_map.get(status, "⚪").split()[0]
-        current = pull.get("current_volume", 0)
-        target = pull.get("target_volume", 1)
+        current = get_safe_float(pull.get("current_volume"), 0)
+        target = get_safe_float(pull.get("target_volume"), 1)
         progress = (current / target * 100) if target > 0 else 0
         button_text = (
             f"{status_icon} {culture_icon} {pull.get('culture', '?')} ({progress:.0f}%)"
@@ -10992,7 +12315,11 @@ async def view_my_pulls(message: types.Message, state: FSMContext):
     my_pulls = {
         pid: pull
         for pid, pull in all_pulls.items()
-        if isinstance(pull, dict) and same_id(pull.get("exporter_id"), userid)
+        if isinstance(pull, dict)
+        and (
+            same_id(pull.get("exporter_id"), userid)
+            or same_id(pull.get("creator_id"), userid)
+        )
     }
     if not my_pulls:
         await message.answer(
@@ -11021,8 +12348,8 @@ async def view_my_pulls(message: types.Message, state: FSMContext):
         culture_icon = culture_emoji.get(culture, "🌾")
         status = normalize_transition_status(pull.get("status", "active"))
         status_icon = status_map.get(status, "⚪").split()[0]
-        current = pull.get("current_volume", 0)
-        target = pull.get("target_volume", 1)
+        current = get_safe_float(pull.get("current_volume"), 0)
+        target = get_safe_float(pull.get("target_volume"), 1)
         progress = (current / target * 100) if target > 0 else 0
         button_text = (
             f"{status_icon} {culture_icon} {pull.get('culture', '?')} ({progress:.0f}%)"
@@ -11082,7 +12409,7 @@ async def view_pull_details(callback: types.CallbackQuery):
                 if same_id(m.get("pull_id"), pull_id) and normalize_transition_status(m.get("status")) == "active"
             ]
 
-        exporter_id = pull.get("exporter_id")
+        exporter_id = pull.get("exporter_id") or pull.get("creator_id")
         exporter_name = pull.get("exporter_name", "Неизвестен")
         exporter_phone = "Не указан"
         exporter_region = "Не указан"
@@ -11091,8 +12418,8 @@ async def view_pull_details(callback: types.CallbackQuery):
             exporter_phone = exporter_data.get("phone", "Не указан")
             exporter_region = exporter_data.get("region", "Не указан")
 
-        target_volume = float(pull.get("target_volume", 1))
-        current_volume = float(pull.get("current_volume", 0))
+        target_volume = get_safe_float(pull.get("target_volume"), 1)
+        current_volume = get_safe_float(pull.get("current_volume"), 0)
         progress = (current_volume / target_volume * 100) if target_volume > 0 else 0
         pull_status = normalize_transition_status(pull.get("status", "active"))
         is_exporter_owner = role == "exporter" and (
@@ -11106,7 +12433,8 @@ async def view_pull_details(callback: types.CallbackQuery):
         if not has_access and role == "farmer":
             # Фермер может смотреть открытые пулы или пулы, где он уже участник.
             has_access = is_pull_open_status(pull_status) or any(
-                isinstance(p, dict) and same_id(p.get("farmer_id"), user_id)
+                isinstance(p, dict)
+                and same_id(p.get("farmer_id") or p.get("user_id"), user_id)
                 for p in participants_for_pull
             )
         if not has_access and is_logistic_role(role):
@@ -11271,7 +12599,7 @@ async def view_pull_details(callback: types.CallbackQuery):
 
 🌾 <b>Культура:</b> {pull.get('culture', '?')}
 📦 <b>Объём:</b> {current_volume:.0f}/{target_volume:.0f} т ({progress:.0f}%)
-💰 <b>Цена FOB:</b> ₽{pull.get('price', 0):,.0f}/т
+💰 <b>Цена FOB:</b> ₽{get_safe_float(pull.get('price'), 0):,.0f}/т
 🚢 <b>Порт:</b> {pull.get('port', 'Не указан')}
 
 
@@ -11417,6 +12745,38 @@ async def handle_search_criteria(callback: types.CallbackQuery, state: FSMContex
                 parse_mode="HTML",
             )
         await SearchBatchesStatesGroup.enter_region.set()
+    elif criteria == "price":
+        await state.update_data(search_type="price")
+        try:
+            await callback.message.edit_text(
+                "💰 <b>Поиск по цене</b>\n\n"
+                "Введите минимальную цену (₽/тонна):",
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            logging.error(f"Ошибка edit_text: {e}")
+            await callback.message.answer(
+                "💰 <b>Поиск по цене</b>\n\n"
+                "Введите минимальную цену (₽/тонна):",
+                parse_mode="HTML",
+            )
+        await SearchBatchesStatesGroup.enter_min_price.set()
+    elif criteria == "volume":
+        await state.update_data(search_type="volume")
+        try:
+            await callback.message.edit_text(
+                "📦 <b>Поиск по объёму</b>\n\n"
+                "Введите минимальный объём (в тоннах):",
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            logging.error(f"Ошибка edit_text: {e}")
+            await callback.message.answer(
+                "📦 <b>Поиск по объёму</b>\n\n"
+                "Введите минимальный объём (в тоннах):",
+                parse_mode="HTML",
+            )
+        await SearchBatchesStatesGroup.enter_min_volume.set()
 
     # ════════════════════════════════════════════════════════════════════════════
     # ПОИСК ДОСТУПНЫХ ПАРТИЙ
@@ -11451,11 +12811,11 @@ async def handle_search_criteria(callback: types.CallbackQuery, state: FSMContex
             # Показываем первые 10 партий
             for i, batch in enumerate(available_batches[:10], 1):
                 culture = batch.get("culture", "Не указана")
-                volume = batch.get("volume", 0)
-                price = batch.get("price", 0)
+                volume = get_safe_float(batch.get("volume"), 0)
+                price = get_safe_float(batch.get("price"), 0)
                 region = batch.get("region", "Не указан")
 
-                text += f"{i}. <b>{culture}</b> - {volume} т\n"
+                text += f"{i}. <b>{culture}</b> - {volume:.0f} т\n"
                 text += f"   💰 {price:,.0f} ₽/т | 📍 {region}\n\n"
 
             if len(available_batches) > 10:
@@ -11466,11 +12826,11 @@ async def handle_search_criteria(callback: types.CallbackQuery, state: FSMContex
             for batch in available_batches[:5]:
                 batch_id = batch.get("id", 0)
                 culture = batch.get("culture", "Не указана")
-                volume = batch.get("volume", 0)
+                volume = get_safe_float(batch.get("volume"), 0)
 
                 keyboard.add(
                     InlineKeyboardButton(
-                        f"{culture} - {volume} т",
+                        f"{culture} - {volume:.0f} т",
                         callback_data=f"view_batch:{batch_id}",
                     )
                 )
@@ -11511,6 +12871,21 @@ async def handle_search_criteria(callback: types.CallbackQuery, state: FSMContex
                     reply_markup=keyboard,
                     parse_mode="HTML",
                 )
+    else:
+        keyboard = search_criteria_keyboard()
+        try:
+            await callback.message.edit_text(
+                "❌ Неизвестный критерий поиска.\n\nВыберите вариант из списка:",
+                reply_markup=keyboard,
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            logging.error(f"Ошибка edit_text: {e}")
+            await callback.message.answer(
+                "❌ Неизвестный критерий поиска.\n\nВыберите вариант из списка:",
+                reply_markup=keyboard,
+                parse_mode="HTML",
+            )
 
     await callback.answer()
 
@@ -11521,9 +12896,12 @@ async def view_batch_details(callback: types.CallbackQuery, state: FSMContext):
     logging.info(f"📦 Просмотр партии {callback.data}")
 
     try:
-        batch_id = int(callback.data.split(":")[1])
-    except (IndexError, ValueError) as e:
+        batch_id = parse_callback_id(callback.data)
+    except Exception as e:
         logging.error(f"❌ Ошибка парсинга batch_id: {e}")
+        await callback.answer("❌ Ошибка: некорректный ID партии", show_alert=True)
+        return
+    if batch_id is None:
         await callback.answer("❌ Ошибка: некорректный ID партии", show_alert=True)
         return
 
@@ -11580,8 +12958,8 @@ async def view_batch_details(callback: types.CallbackQuery, state: FSMContext):
     # ✅ Формируем сообщение
     text = f"📦 <b>Информация о партии #{batch_id}</b>\n\n"
     text += f"🌾 <b>Культура:</b> {found_batch.get('culture', 'Не указана')}\n"
-    text += f"📦 <b>Объём:</b> {found_batch.get('volume', 0)} т\n"
-    text += f"💰 <b>Цена:</b> {found_batch.get('price', 0):,.0f} ₽/т\n"
+    text += f"📦 <b>Объём:</b> {get_safe_float(found_batch.get('volume'), 0):,.0f} т\n"
+    text += f"💰 <b>Цена:</b> {get_safe_float(found_batch.get('price'), 0):,.0f} ₽/т\n"
     text += f"📍 <b>Локация:</b> {found_batch.get('location', 'Не указана')}\n"
     text += f"🚢 <b>Порт:</b> {found_batch.get('port', 'Не указан')}\n"
     text += f"🏛 <b>Статус:</b> {found_batch.get('status', 'Активна')}\n"
@@ -11692,7 +13070,7 @@ async def view_batch_details(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.callback_query_handler(lambda c: c.data.startswith("offer_delivery:"), state="*")
 async def offer_delivery_from_batch(callback: types.CallbackQuery, state: FSMContext):
-    """Запасной обработчик отклика логиста из карточки партии."""
+    """Отклик логиста из карточки партии: переход к активным заявкам на перевозку."""
     await state.finish()
 
     user_id = callback.from_user.id
@@ -11700,18 +13078,8 @@ async def offer_delivery_from_batch(callback: types.CallbackQuery, state: FSMCon
         await callback.answer("❌ Доступно только логистам", show_alert=True)
         return
 
-    keyboard = InlineKeyboardMarkup(row_width=1)
-    keyboard.add(
-        InlineKeyboardButton("📦 К заявкам на перевозку", callback_data="logistic_requests_list")
-    )
-    keyboard.add(InlineKeyboardButton("🏠 Главное меню", callback_data="logist_main_menu"))
-
-    await callback.message.edit_text(
-        "ℹ️ Прямой отклик из карточки партии пока не реализован.\n\n"
-        "Перейдите в список активных заявок и отправьте предложение оттуда.",
-        reply_markup=keyboard,
-    )
-    await callback.answer()
+    # Прямо открываем список активных заявок, чтобы логист сразу мог откликнуться.
+    await show_logistic_requests_list(callback, state)
 
 
 @dp.callback_query_handler(lambda c: c.data == "back_to_search", state="*")
@@ -11762,18 +13130,21 @@ async def search_by_region_selected(callback: types.CallbackQuery, state: FSMCon
         text = f"📍 <b>Найдено партий в '{region}': {len(found_batches)}</b>\n\n"
 
         for i, batch in enumerate(found_batches[:10], 1):
-            text += f"{i}. {batch['culture']} - {batch['volume']} т\n"
-            text += f"   💰 {batch['price']:,.0f} ₽/т\n\n"
+            text += f"{i}. {batch.get('culture', '?')} - {batch.get('volume', 0)} т\n"
+            text += f"   💰 {get_safe_float(batch.get('price'), 0):,.0f} ₽/т\n\n"
 
         if len(found_batches) > 10:
             text += f"... и ещё {len(found_batches) - 10} партий"
 
         keyboard = InlineKeyboardMarkup(row_width=1)
         for batch in found_batches[:5]:
+            batch_id_value = batch.get("id")
+            if batch_id_value is None:
+                continue
             keyboard.add(
                 InlineKeyboardButton(
-                    f"{batch['culture']} - {batch['volume']} т",
-                    callback_data=f"view_batch:{batch['id']}",
+                    f"{batch.get('culture', '?')} - {batch.get('volume', 0)} т",
+                    callback_data=f"view_batch:{batch_id_value}",
                 )
             )
         keyboard.add(InlineKeyboardButton("◀️ Назад", callback_data="back_to_search"))
@@ -11843,9 +13214,9 @@ async def add_batch_to_pull_select(callback: types.CallbackQuery):
             current_vol = 0
             for b in pull.get("batches_data", []):
                 if isinstance(b, dict):
-                    current_vol += b.get("volume", 0)
-
-        target_vol = pull.get("target_volume", 0) or 0
+                    current_vol += get_safe_float(b.get("volume"), 0)
+        current_vol = get_safe_float(current_vol, 0)
+        target_vol = get_safe_float(pull.get("target_volume"), 0)
 
         keyboard.add(
             InlineKeyboardButton(
@@ -11858,9 +13229,9 @@ async def add_batch_to_pull_select(callback: types.CallbackQuery):
 
     await callback.message.edit_text(
         "📦 <b>Добавление партии в пулл</b>\n\n"
-        f"🌾 Партия: {batch.get('culture', 'Неизвестно')} • {batch.get('volume', 0):.1f} т\n"
+        f"🌾 Партия: {batch.get('culture', 'Неизвестно')} • {get_safe_float(batch.get('volume'), 0):.1f} т\n"
         f"📍 Регион: {batch.get('region', 'Не указан')}\n"
-        f"💰 Цена: {batch.get('price', 0):,} ₽/т\n\n"
+        f"💰 Цена: {get_safe_float(batch.get('price'), 0):,.0f} ₽/т\n\n"
         "Выберите пулл для добавления:",
         parse_mode="HTML",
         reply_markup=keyboard,
@@ -11982,7 +13353,7 @@ async def confirm_add_batch_to_pull(callback: types.CallbackQuery):
                     "farmer_id": farmer_id,
                     "culture": batch.get("culture"),
                     "volume": batch.get("volume"),
-                    "price": batch.get("price"),
+                    "price": get_safe_float(batch.get("price"), 0),
                     "moisture": batch.get("moisture", batch.get("humidity", 0)),
                     "impurity": batch.get("impurity", batch.get("impurities", 0)),
                     "quality_class": batch.get("quality_class", ""),
@@ -12007,7 +13378,7 @@ async def confirm_add_batch_to_pull(callback: types.CallbackQuery):
             "volume": batch.get("volume", 0),
             "quality_class": batch.get("quality_class", ""),
             "culture": batch.get("culture", ""),
-            "price_per_ton": batch.get("price", 0),
+            "price_per_ton": get_safe_float(batch.get("price"), 0),
         }
 
         if not any(
@@ -12025,9 +13396,9 @@ async def confirm_add_batch_to_pull(callback: types.CallbackQuery):
         for b_id in pull["batch_ids"]:
             _, existing_batch = find_batch_by_id(b_id)
             if existing_batch:
-                current_volume += existing_batch.get("volume", 0)
+                current_volume += get_safe_float(existing_batch.get("volume"), 0)
 
-        target_volume = pull.get("target_volume", 0)
+        target_volume = get_safe_float(pull.get("target_volume"), 0)
         pull["current_volume"] = current_volume
 
         # 🔟 ПРОВЕРЯЕМ ЗАПОЛНЕНИЕ
@@ -12054,7 +13425,7 @@ async def confirm_add_batch_to_pull(callback: types.CallbackQuery):
             status_msg = "✅ Партия добавлена"
 
         # 1️⃣1️⃣ УВЕДОМЛЯЕМ ФЕРМЕРА
-        if farmer_id in users:
+        if get_user_by_id(farmer_id):
             try:
                 await bot.send_message(
                     farmer_id,
@@ -12064,7 +13435,7 @@ async def confirm_add_batch_to_pull(callback: types.CallbackQuery):
                     f"👥 Участников в пуле: <b>{len(pull['farmer_ids'])}</b>\n"
                     f"📊 Собрано: {current_volume:.1f}/{target_volume:.1f} т\n"
                     f"🚢 Порт: {pull.get('port', 'Не указан')}\n"
-                    f"💰 Цена: {batch.get('price', 0):,} ₽/т",
+                    f"💰 Цена: {get_safe_float(batch.get('price'), 0):,.0f} ₽/т",
                     parse_mode="HTML",
                 )
             except Exception as e:
@@ -12127,8 +13498,8 @@ async def create_logistics_from_menu(message: types.Message, state: FSMContext):
     for batch in user_batches:
         batch_id = batch.get("id")
         culture = batch.get("culture", "Не указана")
-        volume = batch.get("volume", 0)
-        price = batch.get("price", 0)
+        volume = get_safe_float(batch.get("volume"), 0)
+        price = get_safe_float(batch.get("price"), 0)
 
         keyboard.add(
             InlineKeyboardButton(
@@ -12155,8 +13526,12 @@ async def create_logistics_from_batch_handler(
     await state.finish()
 
     try:
-        batch_id = int(callback.data.split(":")[1])
-    except (IndexError, ValueError):
+        batch_id = parse_callback_id(callback.data)
+    except Exception:
+        await callback.answer("❌ Ошибка: некорректный ID партии", show_alert=True)
+        logging.error(f"❌ Неверный callback_data: {callback.data}")
+        return
+    if batch_id is None:
         await callback.answer("❌ Ошибка: некорректный ID партии", show_alert=True)
         logging.error(f"❌ Неверный callback_data: {callback.data}")
         return
@@ -12184,14 +13559,18 @@ async def create_logistics_from_batch_handler(
     # Сохраняем данные партии в состояние
     await state.update_data(batch_id=batch_id, batch=batch, farmer_region=farmer_region)
 
+    batch_volume = get_safe_float(batch.get("volume"), 0)
+    batch_price = get_safe_float(batch.get("price"), 0)
+    batch_total_cost = batch_volume * batch_price
+
     # ШАГ 1: выбор региона / города назначения
     await callback.message.edit_text(
         "🚚 <b>ЗАЯВКА НА ДОСТАВКУ</b>\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🌾 <b>Культура:</b> {batch.get('culture')}\n"
-        f"📦 <b>Объём:</b> {batch.get('volume')} т\n"
-        f"💰 <b>Цена партии:</b> {batch.get('price'):,} ₽/т\n"
-        f"💵 <b>Общая стоимость:</b> {batch.get('volume') * batch.get('price'):,} ₽\n"
+        f"📦 <b>Объём:</b> {batch_volume:,.0f} т\n"
+        f"💰 <b>Цена партии:</b> {batch_price:,.0f} ₽/т\n"
+        f"💵 <b>Общая стоимость:</b> {batch_total_cost:,.0f} ₽\n"
         f"📍 <b>Откуда:</b> {farmer_region}\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n\n"
         "<b>ШАГ 1/5:</b> Укажите <b>регион/город назначения</b>\n\n"
@@ -12278,18 +13657,19 @@ async def select_pull_for_logistics_legacy(
     if not pull:
         await callback.answer("❌ Пул не найден", show_alert=True)
         return
+    current_volume = get_safe_float(pull.get("current_volume"), 0)
 
     await state.update_data(
         pull_id=pull_id,
         culture=pull.get("culture", "Культура"),
-        volume=pull.get("current_volume", 0),
+        volume=current_volume,
         port=pull.get("port", ""),
     )
 
     await callback.message.edit_text(
         "🚚 <b>Заявка на логистику</b>\n\n"
         "<b>Шаг 1 из 4</b>\n\n"
-        f"Пул: #{pull_id} • {pull.get('culture', 'Культура')} • {pull.get('current_volume', 0):.0f} т\n"
+        f"Пул: #{pull_id} • {pull.get('culture', 'Культура')} • {current_volume:.0f} т\n"
         f"Порт: {pull.get('port', '')}\n\n"
         "Откуда (регион/город погрузки):",
         parse_mode="HTML",
@@ -12370,7 +13750,7 @@ async def farmer_select_transport(callback: types.CallbackQuery, state: FSMConte
 async def farmer_enter_price(message: types.Message, state: FSMContext):
     """ШАГ 5: Подтверждение."""
     try:
-        price = float(message.text.strip().replace(",", "."))
+        price = parse_price(message.text)
         if price <= 0:
             raise ValueError
     except ValueError:
@@ -12634,13 +14014,19 @@ async def expeditor_respond_farmer_request(
     if not request:
         await callback.answer("❌ Заявка не найдена", show_alert=True)
         return
-    request_owner_id = request.get("farmer_id")
+    request_owner_id = request.get("farmer_id") or request.get("user_id")
     if same_id(request_owner_id, expeditor_id):
         await callback.answer(
             "❌ Нельзя откликнуться на собственную заявку", show_alert=True
         )
         return
-    if not is_request_open_for_expeditor(request.get("status")):
+    request_status = get_effective_request_status(
+        request_id,
+        "farmer",
+        request,
+        request_owner_id=request_owner_id,
+    )
+    if not is_request_open_for_expeditor(request_status):
         await callback.answer("❌ Заявка уже не принимает отклики", show_alert=True)
         return
     if has_assigned_expeditor(request):
@@ -12733,13 +14119,19 @@ async def expeditor_respond_transport(callback: types.CallbackQuery, state: FSMC
     if not request:
         await callback.answer("❌ Заявка не найдена", show_alert=True)
         return
-    request_owner_id = request.get("farmer_id")
+    request_owner_id = request.get("farmer_id") or request.get("user_id")
     if same_id(request_owner_id, expeditor_id):
         await callback.answer(
             "❌ Нельзя откликнуться на собственную заявку", show_alert=True
         )
         return
-    if not is_request_open_for_expeditor(request.get("status")):
+    request_status = get_effective_request_status(
+        request_id,
+        "farmer",
+        request,
+        request_owner_id=request_owner_id,
+    )
+    if not is_request_open_for_expeditor(request_status):
         await callback.answer("❌ Заявка уже не принимает отклики", show_alert=True)
         return
     if has_assigned_expeditor(request):
@@ -12902,7 +14294,7 @@ async def farmer_view_expeditor_offers(callback: types.CallbackQuery):
     if has_assigned_expeditor(request):
         await callback.answer("❌ По заявке уже выбран экспедитор", show_alert=True)
         return
-    farmer_id = request.get("farmer_id")
+    farmer_id = request.get("farmer_id") or request.get("user_id")
     if not same_id(callback.from_user.id, farmer_id):
         await callback.answer("❌ Это не ваша заявка", show_alert=True)
         return
@@ -12982,7 +14374,7 @@ async def farmer_view_expeditor_offer(callback: types.CallbackQuery):
     if has_assigned_expeditor(request):
         await callback.answer("❌ По заявке уже выбран экспедитор", show_alert=True)
         return
-    farmer_id = request.get("farmer_id")
+    farmer_id = request.get("farmer_id") or request.get("user_id")
     if not same_id(callback.from_user.id, farmer_id):
         await callback.answer("❌ Это не ваша заявка", show_alert=True)
         return
@@ -13045,12 +14437,23 @@ async def farmer_view_expeditor_offer(callback: types.CallbackQuery):
     if username:
         text += f"   • Telegram: @{username}\n"
 
+    delivery_guard_state = get_request_delivery_guard_state(
+        request_id,
+        "farmer",
+        request_owner_id=farmer_id,
+    )
+
     keyboard = InlineKeyboardMarkup(row_width=1)
     offer_status = normalize_transition_status(offer.get("status") or "pending")
     offer_status_text = {
         "pending": "⏳ Ожидает решения",
+        "open": "🟢 Активно",
+        "new": "🟢 Активно",
         "active": "🟢 Активно",
         "accepted": "✅ Выбрано",
+        "assigned": "✅ Выбрано",
+        "selected": "✅ Выбрано",
+        "reserved": "✅ Выбрано",
         "in_progress": "🚚 В работе",
         "completed": "✅ Завершено",
         "rejected": "❌ Отклонено",
@@ -13058,7 +14461,7 @@ async def farmer_view_expeditor_offer(callback: types.CallbackQuery):
     }.get(offer_status, offer.get("status", "—"))
     text += f"\n📊 <b>Статус отклика:</b> {offer_status_text}\n"
 
-    if offer_status in {"pending", "active"}:
+    if offer_status in MUTABLE_EXPEDITOR_OFFER_STATUSES and delivery_guard_state is None:
         keyboard.add(
             InlineKeyboardButton(
                 "✅ Выбрать этого экспедитора",
@@ -13100,11 +14503,17 @@ async def farmer_choose_expeditor(callback: types.CallbackQuery):
     if has_assigned_expeditor(request):
         await callback.answer("❌ По заявке уже выбран экспедитор", show_alert=True)
         return
-    farmer_id = request.get("farmer_id")
+    farmer_id = request.get("farmer_id") or request.get("user_id")
     if not same_id(callback.from_user.id, farmer_id):
         await callback.answer("❌ Это не ваша заявка", show_alert=True)
         return
-    if not is_request_open_for_expeditor(request.get("status")):
+    request_status = get_effective_request_status(
+        request_id,
+        "farmer",
+        request,
+        request_owner_id=farmer_id,
+    )
+    if not is_request_open_for_expeditor(request_status):
         await callback.answer(
             "❌ Заявка уже не в статусе выбора экспедитора", show_alert=True
         )
@@ -13131,13 +14540,72 @@ async def farmer_choose_expeditor(callback: types.CallbackQuery):
         return
 
     offer_status = normalize_transition_status(offer.get("status") or "pending")
-    if offer_status not in {"pending", "active"}:
+    if offer_status not in MUTABLE_EXPEDITOR_OFFER_STATUSES:
         await callback.answer("❌ Этот отклик уже обработан", show_alert=True)
         return
 
     exp_id = offer.get("expeditor_id")
     if not exp_id:
         await callback.answer("❌ У отклика нет экспедитора", show_alert=True)
+        return
+
+    # Защита от повторного назначения по уже закрытой доставке.
+    has_closed_delivery = False
+    for delivery in deliveries.values():
+        if not isinstance(delivery, dict):
+            continue
+        if not same_id(delivery.get("request_id"), request_id):
+            continue
+        delivery_source = str(delivery.get("source") or "").strip().lower()
+        if delivery_source == "logistic":
+            delivery_source = "logistics"
+        if delivery_source not in {"exporter", "farmer", "logistics"}:
+            source_candidates = set()
+            request_key = request_id if isinstance(request_id, str) else str(request_id)
+            if request_id in shipping_requests or request_key in shipping_requests:
+                source_candidates.add("exporter")
+            if request_id in logistics_requests or request_key in logistics_requests:
+                source_candidates.add("logistics")
+            if (
+                request_id in farmer_shipping_requests
+                or request_key in farmer_shipping_requests
+                or request_id in farmer_logistics_requests
+                or request_key in farmer_logistics_requests
+            ):
+                source_candidates.add("farmer")
+            if len(source_candidates) == 1:
+                delivery_source = next(iter(source_candidates))
+            else:
+                inferred_source = infer_logistic_offer_source(request_id)
+                if (
+                    inferred_source in {"exporter", "farmer", "logistics"}
+                    and (not source_candidates or inferred_source in source_candidates)
+                ):
+                    delivery_source = inferred_source
+                else:
+                    continue
+        if delivery_source != "farmer":
+            continue
+        if farmer_id and not same_id(
+            delivery.get("farmer_id") or delivery.get("user_id"), farmer_id
+        ):
+            continue
+        delivery_effective_status = get_effective_delivery_status(
+            delivery,
+            request if isinstance(request, dict) else None,
+        )
+        if delivery_effective_status in {"completed", "cancelled"}:
+            has_closed_delivery = True
+            break
+        if delivery_effective_status in {"in_progress", "expeditor_selected"}:
+            await callback.answer(
+                "❌ По заявке уже есть доставка в работе", show_alert=True
+            )
+            return
+    if has_closed_delivery:
+        await callback.answer(
+            "❌ По заявке уже есть закрытая доставка", show_alert=True
+        )
         return
 
     now_sql = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -13150,12 +14618,16 @@ async def farmer_choose_expeditor(callback: types.CallbackQuery):
     for i, o in enumerate(offers):
         if not isinstance(o, dict):
             continue
+        status_norm = normalize_transition_status(o.get("status") or "pending")
         if same_id(o.get("id"), selected_offer_id) or i == selected_offer_idx:
-            o["status"] = "accepted"
-            o["accepted_at"] = now_sql
+            if status_norm != "in_progress":
+                o["status"] = "accepted"
+            o.setdefault("accepted_at", now_sql)
         else:
-            status_norm = normalize_transition_status(o.get("status") or "pending")
-            if status_norm in {"pending", "active"}:
+            if (
+                status_norm in MUTABLE_EXPEDITOR_OFFER_STATUSES
+                and status_norm != "in_progress"
+            ):
                 o["status"] = "rejected"
                 o["rejected_at"] = now_sql
                 o["rejection_reason"] = "Выбран другой экспедитор"
@@ -13197,13 +14669,29 @@ async def farmer_choose_expeditor(callback: types.CallbackQuery):
                     continue
         if delivery_source != "farmer":
             continue
-        if farmer_id and not same_id(delivery.get("farmer_id"), farmer_id):
+        if farmer_id and not same_id(
+            delivery.get("farmer_id") or delivery.get("user_id"), farmer_id
+        ):
             continue
-        delivery_status = normalize_transition_status(delivery.get("status"))
+        delivery_status = get_effective_delivery_status(
+            delivery,
+            request if isinstance(request, dict) else None,
+        )
         if delivery_status in {"completed", "cancelled"}:
             continue
         delivery["expeditor_id"] = exp_id
-        if delivery_status in {"pending", "assigned", "new"}:
+        if delivery_status in {
+            "",
+            "pending",
+            "assigned",
+            "new",
+            "active",
+            "open",
+            "accepted",
+            "reserved",
+            "selected",
+            "expeditor_selected",
+        }:
             delivery["status"] = "expeditor_selected"
         delivery["accepted_at"] = now_sql
         matched_delivery = True
@@ -13282,7 +14770,7 @@ async def farmer_my_requests_menu(callback: types.CallbackQuery, state: FSMConte
         ):
             if not isinstance(req, dict):
                 continue
-            if not same_id(req.get("farmer_id"), user_id):
+            if not same_id(req.get("farmer_id") or req.get("user_id"), user_id):
                 continue
             req_id = req.get("id")
             dedup_key = str(req_id) if req_id is not None else str(id(req))
@@ -13304,12 +14792,38 @@ async def farmer_my_requests_menu(callback: types.CallbackQuery, state: FSMConte
             await callback.answer()
             return
 
-        # Группируем по статусам
-        active = [r for r in my_requests if is_request_open_for_offers(r.get("status"))]
+        # Активными считаем не только открытые, но и уже назначенные/в работе заявки.
+        active_statuses = {
+            "pending",
+            "active",
+            "has_offers",
+            "assigned",
+            "expeditor_selected",
+            "in_progress",
+            "new",
+            "open",
+        }
+        active = [
+            r
+            for r in my_requests
+            if get_effective_request_status(
+                r.get("id"),
+                "farmer",
+                r,
+                request_owner_id=r.get("farmer_id") or r.get("user_id"),
+            )
+            in active_statuses
+        ]
         completed = [
             r
             for r in my_requests
-            if normalize_transition_status(r.get("status")) == "completed"
+            if get_effective_request_status(
+                r.get("id"),
+                "farmer",
+                r,
+                request_owner_id=r.get("farmer_id") or r.get("user_id"),
+            )
+            == "completed"
         ]
 
         text = "📬 <b>МОИ ЗАЯВКИ</b>\n\n"
@@ -13373,7 +14887,7 @@ async def farmer_my_requests_text(message: types.Message, state: FSMContext):
     ):
         if not isinstance(req, dict):
             continue
-        if not same_id(req.get("farmer_id"), user_id):
+        if not same_id(req.get("farmer_id") or req.get("user_id"), user_id):
             continue
         req_id = req.get("id")
         dedup_key = str(req_id) if req_id is not None else str(id(req))
@@ -13394,11 +14908,37 @@ async def farmer_my_requests_text(message: types.Message, state: FSMContext):
         )
         return
 
-    active = [r for r in my_requests if is_request_open_for_offers(r.get("status"))]
+    active_statuses = {
+        "pending",
+        "active",
+        "has_offers",
+        "assigned",
+        "expeditor_selected",
+        "in_progress",
+        "new",
+        "open",
+    }
+    active = [
+        r
+        for r in my_requests
+        if get_effective_request_status(
+            r.get("id"),
+            "farmer",
+            r,
+            request_owner_id=r.get("farmer_id") or r.get("user_id"),
+        )
+        in active_statuses
+    ]
     completed = [
         r
         for r in my_requests
-        if normalize_transition_status(r.get("status")) == "completed"
+        if get_effective_request_status(
+            r.get("id"),
+            "farmer",
+            r,
+            request_owner_id=r.get("farmer_id") or r.get("user_id"),
+        )
+        == "completed"
     ]
 
     text = f"📬 <b>МОИ ЗАЯВКИ</b>\n\n🟢 Активных: {len(active)}\n✅ Завершённых: {len(completed)}\n\n"
@@ -13458,7 +14998,7 @@ async def farmer_request_view(callback: types.CallbackQuery, state: FSMContext):
 
     user_id = callback.from_user.id
 
-    if not same_id(request.get("farmer_id"), user_id):
+    if not same_id(request.get("farmer_id") or request.get("user_id"), user_id):
         await callback.answer("❌ Это не ваша заявка", show_alert=True)
         return
 
@@ -13503,7 +15043,7 @@ async def farmer_request_view(callback: types.CallbackQuery, state: FSMContext):
             if isinstance(d, dict)
             and same_id(d.get("request_id"), display_id)
             and str(d.get("source") or "farmer").strip().lower() == "farmer"
-            and same_id(d.get("farmer_id"), user_id)
+            and same_id(d.get("farmer_id") or d.get("user_id"), user_id)
             and normalize_transition_status(d.get("status")) != "cancelled"
         ),
         None,
@@ -13581,7 +15121,9 @@ async def edit_request_start(callback: types.CallbackQuery, state: FSMContext):
     request_id = int(request_ref) if str(request_ref).isdigit() else request_ref
     user_id = callback.from_user.id
     resolved_request_id, request = find_farmer_request_by_id(request_id)
-    if not request or not same_id(request.get("farmer_id"), user_id):
+    if not request or not same_id(
+        request.get("farmer_id") or request.get("user_id"), user_id
+    ):
         await callback.answer("❌ Заявка не найдена, либо не ваша", show_alert=True)
         return
     request_id = resolved_request_id
@@ -13643,7 +15185,9 @@ async def edit_field_value_choice(callback: types.CallbackQuery, state: FSMConte
     request_id = int(request_id) if str(request_id).isdigit() else request_id
     user_id = callback.from_user.id
     resolved_request_id, request = find_farmer_request_by_id(request_id)
-    if not request or not same_id(request.get("farmer_id"), user_id):
+    if not request or not same_id(
+        request.get("farmer_id") or request.get("user_id"), user_id
+    ):
         await callback.answer("❌ Доступ запрещён", show_alert=True)
         return
     request_id = resolved_request_id
@@ -13684,7 +15228,9 @@ async def process_custom_value(message: types.Message, state: FSMContext):
     request_id = user_data.get("request_id")
     new_value = message.text.strip()
     resolved_request_id, request = find_farmer_request_by_id(request_id)
-    if not request or not same_id(request.get("farmer_id"), message.from_user.id):
+    if not request or not same_id(
+        request.get("farmer_id") or request.get("user_id"), message.from_user.id
+    ):
         await message.answer("❌ Доступ запрещён")
         await state.finish()
         return
@@ -13709,25 +15255,30 @@ async def process_number_field(message: types.Message, state: FSMContext):
     user_data = await state.get_data()
     field = user_data.get("edit_field")
     request_id = user_data.get("request_id")
-    value = message.text.strip().replace(",", ".")
+    raw_value = message.text.strip()
     try:
-        value = float(value)
+        if field == "price_per_ton":
+            value = parse_price(raw_value)
+        else:
+            value = float(raw_value.replace(",", "."))
         if value <= 0:
             raise ValueError
     except ValueError:
         await message.answer("❌ Введите корректное положительное число!")
         return
     resolved_request_id, request = find_farmer_request_by_id(request_id)
-    if not request or not same_id(request.get("farmer_id"), message.from_user.id):
+    if not request or not same_id(
+        request.get("farmer_id") or request.get("user_id"), message.from_user.id
+    ):
         await message.answer("❌ Доступ запрещён")
         await state.finish()
         return
     request_id = resolved_request_id
     request[field] = value
     if field == "volume":
-        request["total_sum"] = value * float(request.get("price_per_ton", 0))
+        request["total_sum"] = value * get_safe_float(request.get("price_per_ton"), 0)
     if field == "price_per_ton":
-        request["total_sum"] = float(request.get("volume", 0)) * value
+        request["total_sum"] = get_safe_float(request.get("volume"), 0) * value
     save_farmers_logistics()
     keyboard = InlineKeyboardMarkup().add(
         InlineKeyboardButton(
@@ -13779,7 +15330,7 @@ async def confirm_delete_request(callback: types.CallbackQuery, state: FSMContex
     user_id = callback.from_user.id
 
     # Проверка владельца
-    if not same_id(request.get("farmer_id"), user_id):
+    if not same_id(request.get("farmer_id") or request.get("user_id"), user_id):
         await callback.answer("❌ Это не ваша заявка", show_alert=True)
         return
 
@@ -13792,7 +15343,7 @@ async def confirm_delete_request(callback: types.CallbackQuery, state: FSMContex
 📋 <b>Заявка #{request['id']}</b>
 🌾 {request.get('culture', 'Не указано')} - {request.get('volume', 0)} т
 📍 {request.get('farmer_region', 'Не указано')} → {request.get('port_to', 'Не указано')}
-💰 Цена доставки: {request.get('desired_price', 0):,} ₽/т
+💰 Цена доставки: {get_safe_float(request.get('desired_price'), 0):,.0f} ₽/т
 📞 Откликов: {count_logistic_offers_for_request(request.get('id'), 'farmer')}
 
 ❗️ <b>Это действие нельзя отменить!</b>
@@ -13839,7 +15390,7 @@ async def delete_request_final(callback: types.CallbackQuery, state: FSMContext)
     user_id = callback.from_user.id
 
     # Проверка владельца
-    if not same_id(request.get("farmer_id"), user_id):
+    if not same_id(request.get("farmer_id") or request.get("user_id"), user_id):
         await callback.answer("❌ Это не ваша заявка", show_alert=True)
         return
 
@@ -13857,6 +15408,13 @@ async def delete_request_final(callback: types.CallbackQuery, state: FSMContext)
         }
     )
     expeditor_ids = set()
+    embedded_expeditor_offers = ensure_farmer_expeditor_offer_ids(request)
+    for embedded_offer in embedded_expeditor_offers:
+        if not isinstance(embedded_offer, dict):
+            continue
+        expeditor_id = embedded_offer.get("expeditor_id")
+        if expeditor_id:
+            expeditor_ids.add(expeditor_id)
     for exp_offer in expeditor_request_offers.values():
         if not isinstance(exp_offer, dict):
             continue
@@ -13944,7 +15502,7 @@ async def delete_request_final(callback: types.CallbackQuery, state: FSMContext)
         exp_route["cancelled_at"] = now_sql
         touched_expeditor_routes = True
 
-    farmer_id = request.get("farmer_id")
+    farmer_id = request.get("farmer_id") or request.get("user_id")
     for delivery in deliveries.values():
         if not isinstance(delivery, dict):
             continue
@@ -13961,9 +15519,14 @@ async def delete_request_final(callback: types.CallbackQuery, state: FSMContext)
                 continue
         if delivery_source != "farmer":
             continue
-        if farmer_id and not same_id(delivery.get("farmer_id"), farmer_id):
+        if farmer_id and not same_id(
+            delivery.get("farmer_id") or delivery.get("user_id"), farmer_id
+        ):
             continue
-        if normalize_transition_status(delivery.get("status")) in {"completed", "cancelled"}:
+        if get_effective_delivery_status(
+            delivery,
+            request if isinstance(request, dict) else None,
+        ) in {"completed", "cancelled"}:
             continue
         delivery["status"] = "cancelled"
         delivery["cancelled_at"] = now_sql
@@ -13985,9 +15548,16 @@ async def delete_request_final(callback: types.CallbackQuery, state: FSMContext)
                 continue
         if deal_source != "farmer":
             continue
-        if farmer_id and not same_id(deal.get("farmer_id"), farmer_id):
+        deal_farmer_ids = deal.get("farmer_ids") or []
+        legacy_farmer_id = deal.get("farmer_id")
+        if legacy_farmer_id not in {None, ""} and not any(
+            same_id(legacy_farmer_id, fid) for fid in deal_farmer_ids
+        ):
+            deal_farmer_ids = [*deal_farmer_ids, legacy_farmer_id]
+        if farmer_id and not any(same_id(fid, farmer_id) for fid in deal_farmer_ids):
             continue
-        if normalize_transition_status(deal.get("status")) in {"completed", "cancelled"}:
+        deal_effective_status = get_effective_deal_status(deal)
+        if deal_effective_status in {"completed", "cancelled"}:
             continue
         deal["status"] = "cancelled"
         deal["cancelled_at"] = now_sql
@@ -14052,7 +15622,7 @@ async def delete_request_final(callback: types.CallbackQuery, state: FSMContext)
     ):
         if not isinstance(req, dict):
             continue
-        if not same_id(req.get("farmer_id"), user_id):
+        if not same_id(req.get("farmer_id") or req.get("user_id"), user_id):
             continue
         req_id = req.get("id")
         dedup_key = str(req_id) if req_id is not None else str(id(req))
@@ -14068,11 +15638,37 @@ async def delete_request_final(callback: types.CallbackQuery, state: FSMContext)
             InlineKeyboardButton("🏠 Главное меню", callback_data="farmer_main_menu")
         )
     else:
-        active = [r for r in my_requests if is_request_open_for_offers(r.get("status"))]
+        active_statuses = {
+            "pending",
+            "active",
+            "has_offers",
+            "assigned",
+            "expeditor_selected",
+            "in_progress",
+            "new",
+            "open",
+        }
+        active = [
+            r
+            for r in my_requests
+            if get_effective_request_status(
+                r.get("id"),
+                "farmer",
+                r,
+                request_owner_id=r.get("farmer_id") or r.get("user_id"),
+            )
+            in active_statuses
+        ]
         completed = [
             r
             for r in my_requests
-            if normalize_transition_status(r.get("status")) == "completed"
+            if get_effective_request_status(
+                r.get("id"),
+                "farmer",
+                r,
+                request_owner_id=r.get("farmer_id") or r.get("user_id"),
+            )
+            == "completed"
         ]
 
         text = f"📬 <b>МОИ ЗАЯВКИ</b>\n\n✅ <b>Заявка #{request_id} удалена!</b>\n\n"
@@ -14124,7 +15720,7 @@ async def farmer_view_offers(callback: types.CallbackQuery, state: FSMContext):
         return
 
     user_id = callback.from_user.id
-    if not same_id(request.get("farmer_id"), user_id):
+    if not same_id(request.get("farmer_id") or request.get("user_id"), user_id):
         await callback.answer("❌ Это не ваша заявка", show_alert=True)
         return
 
@@ -14209,8 +15805,12 @@ async def farmer_contact_logist(callback: types.CallbackQuery, state: FSMContext
 
     try:
         parts = callback.data.split(":")
-        request_id = int(parts[1]) if str(parts[1]).isdigit() else parts[1]
-        logist_id = int(parts[2])
+        request_id_raw = parts[1]
+        request_id = (
+            int(request_id_raw) if str(request_id_raw).isdigit() else str(request_id_raw).strip()
+        )
+        logist_id_raw = parts[2]
+        logist_id = int(logist_id_raw) if str(logist_id_raw).isdigit() else logist_id_raw
     except (IndexError, ValueError):
         await callback.answer("❌ Ошибка", show_alert=True)
         return
@@ -14222,7 +15822,7 @@ async def farmer_contact_logist(callback: types.CallbackQuery, state: FSMContext
         return
 
     user_id = callback.from_user.id
-    if not same_id(request.get("farmer_id"), user_id):
+    if not same_id(request.get("farmer_id") or request.get("user_id"), user_id):
         await callback.answer("❌ Это не ваша заявка", show_alert=True)
         return
 
@@ -14281,10 +15881,16 @@ async def farmer_contact_logist(callback: types.CallbackQuery, state: FSMContext
         InlineKeyboardButton("💬 Написать в Telegram", url=f"tg://user?id={logist_id}")
     )
     offer_status = normalize_transition_status(offer.get("status") or "pending")
+    request_status = get_effective_request_status(
+        request_id,
+        "farmer",
+        request,
+        request_owner_id=request.get("farmer_id") or request.get("user_id"),
+    )
     can_choose_logist = (
         selected_offer_id is not None
-        and offer_status in {"pending", "active"}
-        and is_request_open_for_offers(request.get("status"))
+        and offer_status in OPEN_LOGISTIC_OFFER_STATUSES
+        and is_request_open_for_offers(request_status)
         and not has_assigned_logist(request)
     )
     if can_choose_logist:
@@ -14329,9 +15935,9 @@ async def farmer_confirm_request_button(
     # Создаём заявку в farmer_logistics_requests
     request_id = next_numeric_id(farmer_logistics_requests)
 
-    volume = float(data.get("volume", 0) or 0)
-    price_per_ton = float(data.get("price", 0) or 0)
-    desired_price = float(data.get("delivery_price", 0) or 0)
+    volume = get_safe_float(data.get("volume"), 0)
+    price_per_ton = get_safe_float(data.get("price"), 0)
+    desired_price = get_safe_float(data.get("delivery_price"), 0)
     departure = data.get("departure", "Не указан")
     destination = data.get("destination", "Не указан")
     transport = data.get("transport", "Не указан")
@@ -14435,7 +16041,13 @@ async def logist_respond_farmer_request(
         await callback.answer("❌ Заявка не найдена", show_alert=True)
         return
 
-    if not is_request_open_for_offers(request.get("status")):
+    request_status = get_effective_request_status(
+        request_id,
+        "farmer",
+        request,
+        request_owner_id=request.get("farmer_id") or request.get("user_id"),
+    )
+    if not is_request_open_for_offers(request_status):
         await callback.answer("❌ Заявка уже не принимает отклики", show_alert=True)
         return
 
@@ -14488,10 +16100,8 @@ async def show_logistics_for_pull(callback: types.CallbackQuery):
     if status not in {"filled", "closed"}:
         await callback.answer("⚠️ Пулл ещё не собран", show_alert=True)
         return
-    if not has_assigned_logist(pull):
-        await callback.answer(
-            "⚠️ Сначала выберите логиста для пулла", show_alert=True
-        )
+    if has_assigned_logist(pull):
+        await callback.answer("❌ По пулу уже выбран логист", show_alert=True)
         return
     if has_assigned_expeditor(pull):
         await callback.answer("❌ По пулу уже выбран экспедитор", show_alert=True)
@@ -14547,7 +16157,7 @@ async def show_logistics_for_pull(callback: types.CallbackQuery):
     # 3. Формируем сообщение со списком
     text = f"🚚 <b>Выбор логиста для пулла #{pull_id}</b>\n\n"
     text += (
-        f"🌾 {pull.get('culture', 'Культура')} • {pull.get('target_volume', 0):.1f} т\n"
+        f"🌾 {pull.get('culture', 'Культура')} • {get_safe_float(pull.get('target_volume'), 0):.1f} т\n"
     )
     text += f"🚢 Порт: {port}\n\n"
     text += f"<b>Доступно логистов: {len(available_logistics)}</b>\n"
@@ -14583,9 +16193,9 @@ async def show_logistics_for_pull(callback: types.CallbackQuery):
 async def view_logistic_card_for_selection(callback: types.CallbackQuery):
     """Просмотр карточки логиста при выборе логиста под пул."""
     try:
-        _, pull_id_str, log_id_str = callback.data.split(":")
-        pull_id = int(pull_id_str)
-        log_id = int(log_id_str)
+        _, pull_id_raw, log_id_raw = callback.data.split(":", 2)
+        pull_id = int(pull_id_raw) if str(pull_id_raw).isdigit() else pull_id_raw
+        log_id = int(log_id_raw) if str(log_id_raw).isdigit() else log_id_raw
     except (ValueError, IndexError):
         await callback.answer("❌ Ошибка данных", show_alert=True)
         return
@@ -14612,7 +16222,7 @@ async def view_logistic_card_for_selection(callback: types.CallbackQuery):
         return
 
     # Берём карточку логиста в первую очередь из logistics_cards
-    card = logistics_cards.get(log_id)
+    card = logistics_cards.get(log_id) or logistics_cards.get(str(log_id))
     user = get_user_by_id(log_id) or {}
 
     if not card:
@@ -14722,9 +16332,9 @@ async def view_logistic_card_for_selection(callback: types.CallbackQuery):
 async def confirm_select_logistic(callback: types.CallbackQuery):
     """Подтвердить выбор логиста для пулла и отправить уведомления."""
     try:
-        _, pull_id_str, log_id_str = callback.data.split(":")
-        pull_id = int(pull_id_str)
-        log_id = int(log_id_str)
+        _, pull_id_raw, log_id_raw = callback.data.split(":", 2)
+        pull_id = int(pull_id_raw) if str(pull_id_raw).isdigit() else pull_id_raw
+        log_id = int(log_id_raw) if str(log_id_raw).isdigit() else log_id_raw
     except (ValueError, IndexError):
         await callback.answer("❌ Ошибка данных", show_alert=True)
         return
@@ -14755,7 +16365,11 @@ async def confirm_select_logistic(callback: types.CallbackQuery):
         await callback.answer("❌ Пользователь не является логистом", show_alert=True)
         return
 
-    card = logistics_cards.get(log_id) or user_data.get("logistics_card", {})
+    card = (
+        logistics_cards.get(log_id)
+        or logistics_cards.get(str(log_id))
+        or user_data.get("logistics_card", {})
+    )
 
     company = (
         card.get("company")
@@ -14777,7 +16391,7 @@ async def confirm_select_logistic(callback: types.CallbackQuery):
             (
                 "🎉 <b>Вы выбраны логистом по пуллу!</b>\n\n"
                 f"📦 Пулл #{pull_id}\n"
-                f"🌾 {pull.get('culture', 'Культура')} • {pull.get('target_volume', 0):.1f} т\n"
+                f"🌾 {pull.get('culture', 'Культура')} • {get_safe_float(pull.get('target_volume'), 0):.1f} т\n"
                 f"🚢 Порт: {pull.get('port', 'Не указан')}\n\n"
                 "Экспортёр свяжется с вами для уточнения деталей."
             ),
@@ -14832,6 +16446,14 @@ async def show_expeditors_for_pull(callback: types.CallbackQuery):
     if status not in {"filled", "closed"}:
         await callback.answer("⚠️ Пулл ещё не собран", show_alert=True)
         return
+    if not has_assigned_logist(pull):
+        await callback.answer(
+            "⚠️ Сначала выберите логиста для пулла", show_alert=True
+        )
+        return
+    if has_assigned_expeditor(pull):
+        await callback.answer("❌ По пулу уже выбран экспедитор", show_alert=True)
+        return
 
     port = pull.get("port")
     if not port:
@@ -14866,7 +16488,7 @@ async def show_expeditors_for_pull(callback: types.CallbackQuery):
 
     text = f"📄 <b>Выбор экспедитора для пулла #{pull_id}</b>\n\n"
     text += (
-        f"🌾 {pull.get('culture', 'Культура')} • {pull.get('target_volume', 0):.1f} т\n"
+        f"🌾 {pull.get('culture', 'Культура')} • {get_safe_float(pull.get('target_volume'), 0):.1f} т\n"
     )
     text += f"🚢 Порт: {port}\n\n"
     text += f"<b>Доступно экспедиторов: {len(available_expeditors)}</b>\n"
@@ -14904,18 +16526,19 @@ async def show_expeditors_for_pull(callback: types.CallbackQuery):
 async def view_expeditor_card_for_selection(callback: types.CallbackQuery):
     """Просмотр карточки экспедитора и создание предложения по пуллу."""
     try:
-        _, pull_id_str, exp_id_str = callback.data.split(":")
-        pull_id = int(pull_id_str)
-        exp_id = int(exp_id_str)
+        _, pull_id_raw, exp_id_raw = callback.data.split(":", 2)
+        pull_id = int(pull_id_raw) if str(pull_id_raw).isdigit() else pull_id_raw
+        exp_id = int(exp_id_raw) if str(exp_id_raw).isdigit() else exp_id_raw
     except (ValueError, IndexError):
         await callback.answer("❌ Ошибка данных", show_alert=True)
         return
 
-    if exp_id not in expeditor_cards:
+    card = expeditor_cards.get(exp_id) or expeditor_cards.get(str(exp_id))
+    if not isinstance(card, dict):
         await callback.answer("❌ Карточка экспедитора не найдена", show_alert=True)
         return
-    all_pulls = pulls.get("pulls", {})
-    pull = all_pulls.get(pull_id) or all_pulls.get(str(pull_id))
+    resolved_pull_id, pull = find_pull_by_id(pull_id)
+    pull_id = resolved_pull_id if resolved_pull_id is not None else pull_id
     if not pull:
         await callback.answer("❌ Пулл не найден", show_alert=True)
         return
@@ -14929,7 +16552,6 @@ async def view_expeditor_card_for_selection(callback: types.CallbackQuery):
         await callback.answer("❌ Доступно только владельцу пула", show_alert=True)
         return
 
-    card = expeditor_cards[exp_id]
     exp_user = get_user_by_id(exp_id) or {}
 
     company = (
@@ -14980,8 +16602,8 @@ async def view_expeditor_card_for_selection(callback: types.CallbackQuery):
     keyboard = InlineKeyboardMarkup(row_width=1)
     keyboard.add(
         InlineKeyboardButton(
-            "💼 Сделать предложение по пуллу",
-            callback_data=f"exp_offer_start:{pull_id}:{exp_id}",
+            "📄 Открыть предложения по пуллу",
+            callback_data=f"view_expeditor_offers_for_pull:{pull_id}",
         )
     )
     keyboard.add(
@@ -15009,9 +16631,9 @@ async def exp_offer_start(callback: types.CallbackQuery, state: FSMContext):
         return
 
     try:
-        _, pull_id_str, exp_id_str = callback.data.split(":")
-        pull_id = int(pull_id_str)
-        exp_id = int(exp_id_str)
+        _, pull_id_raw, exp_id_raw = callback.data.split(":", 2)
+        pull_id = int(pull_id_raw) if str(pull_id_raw).isdigit() else pull_id_raw
+        exp_id = int(exp_id_raw) if str(exp_id_raw).isdigit() else exp_id_raw
     except (ValueError, IndexError):
         await callback.answer("❌ Ошибка данных", show_alert=True)
         return
@@ -15025,14 +16647,31 @@ async def exp_offer_start(callback: types.CallbackQuery, state: FSMContext):
     if not pull:
         await callback.answer("❌ Пулл не найден", show_alert=True)
         return
-    if is_pull_open_status(pull.get("status")):
+    pull_status = normalize_transition_status(pull.get("status") or "active")
+    if is_pull_open_status(pull_status):
         await callback.answer("⚠️ Пулл ещё не собран", show_alert=True)
+        return
+    if pull_status in {"cancelled", "sold", "completed"}:
+        await callback.answer("❌ По закрытому пуллу нельзя отправить отклик", show_alert=True)
+        return
+    if not has_assigned_logist(pull):
+        await callback.answer(
+            "⚠️ Экспортёр ещё не выбрал логиста по этому пуллу",
+            show_alert=True,
+        )
+        return
+    if has_assigned_expeditor(pull):
+        selected_expeditor_id = get_assigned_expeditor_id(pull)
+        if same_id(selected_expeditor_id, expeditor_id):
+            await callback.answer("ℹ️ Вы уже выбраны экспедитором по этому пуллу", show_alert=True)
+        else:
+            await callback.answer("❌ По пуллу уже выбран другой экспедитор", show_alert=True)
         return
     await state.update_data(pull_id=pull_id, expeditor_id=expeditor_id)
 
     text = (
         f"💼 <b>Ваше предложение по пуллу #{pull_id}</b>\n\n"
-        f"🌾 {pull.get('culture','Культура')} • {pull.get('target_volume',0):.1f} т\n"
+        f"🌾 {pull.get('culture','Культура')} • {get_safe_float(pull.get('target_volume'), 0):.1f} т\n"
         f"🚢 Порт: {pull.get('port','Не указан')}\n\n"
         "Опишите, какие услуги вы готовы оказать по этому пуллу\n"
         "(оформление ДТ, сопровождение, фрахт, склад и т.д.):"
@@ -15058,8 +16697,7 @@ async def exp_offer_enter_terms(message: types.Message, state: FSMContext):
 @dp.message_handler(state=ExpeditorOfferForPullStates.enter_price)
 async def exp_offer_enter_price(message: types.Message, state: FSMContext):
     try:
-        price_text = message.text.replace(" ", "").replace(",", ".")
-        price = float(price_text)
+        price = parse_price(message.text)
         if price < 0:
             raise ValueError
     except ValueError:
@@ -15157,7 +16795,11 @@ async def notify_exporter_about_expeditor_offer(pull: dict, offer: dict):
         return
 
     exp_user = get_user_by_id(offer.get("expeditor_id")) or {}
-    volume = pull.get("current_volume") or pull.get("target_volume") or 0
+    volume = get_safe_float(
+        pull.get("current_volume") or pull.get("target_volume"),
+        0,
+    )
+    offer_price = get_safe_float(offer.get("price"), 0)
     port = pull.get("port", "—")
 
     msg = (
@@ -15168,7 +16810,7 @@ async def notify_exporter_about_expeditor_offer(pull: dict, offer: dict):
         f"🚢 Порт: <b>{port}</b>\n\n"
         f"🛠 <b>Услуги:</b> {offer.get('services','—')}\n"
         f"💬 <b>Условия:</b> {offer.get('terms','—')}\n"
-        f"💰 <b>Ставка экспедитора:</b> {offer.get('price',0):,.0f} ₽/т\n\n"
+        f"💰 <b>Ставка экспедитора:</b> {offer_price:,.0f} ₽/т\n\n"
         f"👤 <b>Экспедитор:</b> {exp_user.get('name','Не указано')} "
         f"({offer.get('company','Экспедитор')})\n"
         f"📞 <code>{exp_user.get('phone','Не указан')}</code>\n"
@@ -15194,7 +16836,8 @@ async def notify_exporter_about_expeditor_offer(pull: dict, offer: dict):
 async def view_expeditor_offers_for_pull(callback: types.CallbackQuery):
     """Экспортёр смотрит все предложения экспедиторов по пуллу."""
     try:
-        pull_id = int(callback.data.split(":")[1])
+        pull_id_raw = callback.data.split(":", 1)[1]
+        pull_id = int(pull_id_raw) if str(pull_id_raw).isdigit() else pull_id_raw
     except (ValueError, IndexError):
         await callback.answer("❌ Ошибка данных", show_alert=True)
         return
@@ -15233,9 +16876,29 @@ async def view_expeditor_offers_for_pull(callback: types.CallbackQuery):
             seen_offer_ids.add(canonical_key)
         offers_all.append(o)
     if not offers_all:
-        await callback.answer(
-            "Пока нет предложений экспедиторов по этому пуллу", show_alert=True
+        text = (
+            f"📄 <b>Предложения экспедиторов по пуллу #{pull_id}</b>\n\n"
+            "Пока нет откликов экспедиторов по этому пуллу.\n\n"
+            "Вы можете просмотреть карточки экспедиторов и ожидать отклики."
         )
+        keyboard = InlineKeyboardMarkup(row_width=1)
+        keyboard.add(
+            InlineKeyboardButton(
+                "👥 Карточки экспедиторов",
+                callback_data=f"select_expeditor_for_pull:{pull_id}",
+            )
+        )
+        keyboard.add(
+            InlineKeyboardButton(
+                "🔄 Обновить",
+                callback_data=f"view_expeditor_offers_for_pull:{pull_id}",
+            )
+        )
+        keyboard.add(
+            InlineKeyboardButton("⬅️ К пуллу", callback_data=f"view_pull:{pull_id}")
+        )
+        await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+        await callback.answer()
         return
 
     # По умолчанию показываем только актуальные офферы.
@@ -15249,7 +16912,7 @@ async def view_expeditor_offers_for_pull(callback: types.CallbackQuery):
 
     text = (
         f"📄 <b>Предложения экспедиторов по пуллу #{pull_id}</b>\n\n"
-        f"🌾 {pull.get('culture','—')} • {pull.get('target_volume',0):.1f} т\n"
+        f"🌾 {pull.get('culture','—')} • {get_safe_float(pull.get('target_volume'), 0):.1f} т\n"
         f"🚢 Порт: {pull.get('port','—')}\n\n"
         f"Всего предложений: <b>{len(offers)}</b>\n"
     )
@@ -15270,7 +16933,7 @@ async def view_expeditor_offers_for_pull(callback: types.CallbackQuery):
             or exp_user.get("name")
             or "Экспедитор"
         )
-        price = offer.get("price", 0)
+        price = get_safe_float(offer.get("price"), 0)
         label = f"{company} • {price:,.0f} ₽/т".replace(",", " ")
         keyboard.add(
             InlineKeyboardButton(
@@ -15321,7 +16984,11 @@ async def view_expeditor_offer_for_pull(callback: types.CallbackQuery):
 
     exp_user = get_user_by_id(offer.get("expeditor_id")) or {}
 
-    volume = pull.get("current_volume") or pull.get("target_volume") or 0
+    volume = get_safe_float(
+        pull.get("current_volume") or pull.get("target_volume"),
+        0,
+    )
+    offer_price = get_safe_float(offer.get("price"), 0)
     port = pull.get("port", "—")
 
     text = (
@@ -15331,7 +16998,7 @@ async def view_expeditor_offer_for_pull(callback: types.CallbackQuery):
         f"🚢 Порт: <b>{port}</b>\n\n"
         f"🛠 <b>Услуги:</b> {offer.get('services','—')}\n"
         f"💬 <b>Условия:</b> {offer.get('terms','—')}\n"
-        f"💰 <b>Ставка:</b> {offer.get('price',0):,.0f} ₽/т\n"
+        f"💰 <b>Ставка:</b> {offer_price:,.0f} ₽/т\n"
         f"📅 <b>Отклик:</b> {offer.get('created_at','—')}\n\n"
         f"👤 <b>Экспедитор:</b> {exp_user.get('name','Не указано')}\n"
         f"🏢 <b>Компания:</b> {offer.get('company','Экспедитор')}\n"
@@ -15341,11 +17008,16 @@ async def view_expeditor_offer_for_pull(callback: types.CallbackQuery):
     if exp_user.get("username"):
         text += f"💬 Telegram: @{exp_user['username']}\n"
 
-    offer_status = normalize_transition_status(offer.get("status") or "active")
+    offer_status = normalize_transition_status(offer.get("status") or "pending")
     offer_status_text = {
         "pending": "⏳ Ожидает решения",
+        "open": "🟢 Активно",
+        "new": "🟢 Активно",
         "active": "🟢 Активно",
         "accepted": "✅ Выбрано",
+        "assigned": "✅ Выбрано",
+        "selected": "✅ Выбрано",
+        "reserved": "✅ Выбрано",
         "in_progress": "🚚 В работе",
         "completed": "✅ Завершено",
         "rejected": "❌ Отклонено",
@@ -15356,7 +17028,7 @@ async def view_expeditor_offer_for_pull(callback: types.CallbackQuery):
     keyboard = InlineKeyboardMarkup(row_width=1)
     pull_status = normalize_transition_status(pull.get("status") or "active")
     can_choose_offer = (
-        offer_status in {"active", "pending"}
+        offer_status in MUTABLE_EXPEDITOR_OFFER_STATUSES
         and not has_assigned_expeditor(pull)
         and has_assigned_logist(pull)
         and pull_status not in {"cancelled", "sold", "completed"}
@@ -15428,7 +17100,10 @@ async def choose_expeditor_offer_for_pull(callback: types.CallbackQuery):
     if not is_expeditor_role((get_user_by_id(expeditor_id) or {}).get("role")):
         await callback.answer("❌ Пользователь не является экспедитором", show_alert=True)
         return
-    if normalize_transition_status(offer.get("status") or "active") not in {"active", "pending"}:
+    if (
+        normalize_transition_status(offer.get("status") or "pending")
+        not in MUTABLE_EXPEDITOR_OFFER_STATUSES
+    ):
         await callback.answer("❌ Это предложение уже обработано", show_alert=True)
         return
     if has_assigned_expeditor(pull):
@@ -15456,10 +17131,16 @@ async def choose_expeditor_offer_for_pull(callback: types.CallbackQuery):
             continue
         if same_id(o.get("pull_id"), pull_id):
             if same_id(o.get("id"), offer_id):
-                o["status"] = "accepted"
-                o["accepted_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                selected_status = normalize_transition_status(o.get("status") or "pending")
+                if selected_status != "in_progress":
+                    o["status"] = "accepted"
+                o.setdefault("accepted_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
             else:
-                if normalize_transition_status(o.get("status")) in {"active", "pending"}:
+                if (
+                    normalize_transition_status(o.get("status"))
+                    in MUTABLE_EXPEDITOR_OFFER_STATUSES
+                    and normalize_transition_status(o.get("status")) != "in_progress"
+                ):
                     o["status"] = "rejected"
                     o["rejected_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     o["rejection_reason"] = "Выбрано другое предложение экспедитора"
@@ -15490,7 +17171,7 @@ async def choose_expeditor_offer_for_pull(callback: types.CallbackQuery):
             expeditor_id,
             "🎉 <b>Вы выбраны экспедитором по пуллу!</b>\n\n"
             f"📦 Пул #{pull_id}\n"
-            f"🌾 {pull.get('culture','Культура')} • {pull.get('target_volume',0):.1f} т\n"
+            f"🌾 {pull.get('culture','Культура')} • {get_safe_float(pull.get('target_volume'), 0):.1f} т\n"
             f"🚢 Порт: {pull.get('port','Не указан')}\n\n"
             "Экспортёр свяжется с вами для уточнения деталей.",
             parse_mode="HTML",
@@ -15555,7 +17236,7 @@ async def search_max_volume(message: types.Message, state: FSMContext):
 async def search_min_price(message: types.Message, state: FSMContext):
     """Ввод минимальной цены при поиске"""
     try:
-        min_price = float(message.text.strip().replace(",", "."))
+        min_price = parse_price(message.text)
         if min_price < 0:
             raise ValueError
 
@@ -15574,9 +17255,7 @@ async def search_max_price(message: types.Message, state: FSMContext):
     """Завершение комплексного поиска"""
     try:
         max_price_text = message.text.strip()
-        max_price = (
-            float(max_price_text.replace(",", ".")) if max_price_text != "0" else 0
-        )
+        max_price = parse_price(max_price_text) if max_price_text != "0" else 0
 
         if max_price < 0:
             raise ValueError
@@ -15635,66 +17314,90 @@ async def perform_search(message, search_params):
             found_batches.append(prepared_batch)
 
     if not found_batches:
+        keyboard = InlineKeyboardMarkup(row_width=1)
+        keyboard.add(InlineKeyboardButton("🔍 Назад к поиску", callback_data="back_to_search"))
         await message.answer(
             "🔍 <b>Результаты поиска</b>\n\n"
             "По вашему запросу ничего не найдено.\n\n"
             "Попробуйте изменить критерии поиска.",
             parse_mode="HTML",
+            reply_markup=keyboard,
         )
         return
-    found_batches.sort(key=lambda x: x["price"])
+    found_batches.sort(key=lambda x: get_safe_float(x.get("price"), 0))
 
     text = "🔍 <b>Результаты поиска</b>\n\n"
     text += f"Найдено партий: {len(found_batches)}\n\n"
 
     for i, batch in enumerate(found_batches[:10], 1):  # Ограничиваем показ
-        text += f"{i}. <b>Партия #{batch['id']}</b>\n"
-        text += f"   🌾 {batch['culture']} • {batch['volume']} т\n"
-        text += f"   💰 {batch['price']:,.0f} ₽/т\n"
+        text += f"{i}. <b>Партия #{batch.get('id', '—')}</b>\n"
+        text += f"   🌾 {batch.get('culture', '?')} • {batch.get('volume', 0)} т\n"
+        text += f"   💰 {get_safe_float(batch.get('price'), 0):,.0f} ₽/т\n"
         text += f"   📍 {batch.get('region', 'Не указан')}\n"
         text += f"   ⭐ {batch.get('quality_class', 'Не указано')}\n"
-        text += f"   👤 {batch['farmer_name']}\n\n"
+        text += f"   👤 {batch.get('farmer_name', 'Неизвестно')}\n\n"
 
     if len(found_batches) > 10:
         text += f"<i>... и ещё {len(found_batches) - 10} партий</i>\n\n"
 
-    text += "💡 <b>Для просмотра деталей свяжитесь с фермером.</b>"
+    text += "💡 <b>Выберите партию для просмотра деталей.</b>"
 
-    await message.answer(text, parse_mode="HTML")
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    for batch in found_batches[:10]:
+        batch_id = batch.get("id")
+        if batch_id is None:
+            continue
+        culture = batch.get("culture", "Партия")
+        volume = get_safe_float(batch.get("volume"), 0)
+        price = get_safe_float(batch.get("price"), 0)
+        keyboard.add(
+            InlineKeyboardButton(
+                f"📦 {culture} • {volume:.0f} т • {price:,.0f} ₽/т",
+                callback_data=f"view_batch:{batch_id}",
+            )
+        )
+    keyboard.add(InlineKeyboardButton("🔍 Назад к поиску", callback_data="back_to_search"))
+
+    await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
 
 
 def matches_search_criteria(batch, search_params):
     """Проверка соответствия партии критериям поиска"""
+    batch_culture = str(batch.get("culture", "")).strip()
+    batch_region = batch.get("region", "Не указан")
+    batch_volume = get_safe_float(batch.get("volume"), 0)
+    batch_price = get_safe_float(batch.get("price"), 0)
+
     if not status_in_group(
         batch.get("status"),
         {"active", "активна", "available", "доступна", "", "none"},
     ):
         return False
-    if search_params.get("culture") and batch["culture"] != search_params["culture"]:
+    if search_params.get("culture") and batch_culture != search_params["culture"]:
         return False
     if (
         search_params.get("region")
-        and batch.get("region", "Не указан") != search_params["region"]
+        and batch_region != search_params["region"]
     ):
         return False
     if (
         search_params.get("min_volume", 0) > 0
-        and batch["volume"] < search_params["min_volume"]
+        and batch_volume < search_params["min_volume"]
     ):
         return False
     if (
         search_params.get("max_volume", 0) > 0
-        and search_params["max_volume"] < batch["volume"]
+        and search_params["max_volume"] < batch_volume
     ):
         return False
     if (
         search_params.get("min_price", 0) > 0
-        and batch["price"] < search_params["min_price"]
+        and batch_price < search_params["min_price"]
     ):
         return False
     if (
         search_params.get("max_price", 0) > 0
-        and search_params["max_price"] < batch["price"]
+        and search_params["max_price"] < batch_price
     ):
         return False
     if search_params.get("quality_class") and batch.get(
@@ -15926,8 +17629,8 @@ async def back_to_pulls(callback: types.CallbackQuery):
                 culture_icon = culture_emoji.get(culture, "🌾")
                 status = normalize_transition_status(pull.get("status", "active"))
                 status_icon = status_map.get(status, "⚪").split()[0]
-                current = pull.get("current_volume", 0)
-                target = pull.get("target_volume", 1)
+                current = get_safe_float(pull.get("current_volume"), 0)
+                target = get_safe_float(pull.get("target_volume"), 1)
                 progress = (current / target * 100) if target > 0 else 0
 
                 # Формат кнопки точно как в основном меню
@@ -15980,15 +17683,17 @@ async def back_to_pulls(callback: types.CallbackQuery):
             keyboard = InlineKeyboardMarkup(row_width=1)
 
             for pull_id, pull in open_pulls[:10]:
+                current_volume = get_safe_float(pull.get("current_volume"), 0)
+                target_volume = get_safe_float(pull.get("target_volume"), 0)
                 progress = (
-                    pull.get("current_volume", 0) / pull.get("target_volume", 1) * 100
-                    if pull.get("target_volume", 1) > 0
+                    (current_volume / target_volume * 100)
+                    if target_volume > 0
                     else 0
                 )
 
                 button_text = (
                     f"🌾 {pull.get('culture', '?')} - "
-                    f"{pull.get('current_volume', 0):.0f}/{pull.get('target_volume', 0):.0f} т "
+                    f"{current_volume:.0f}/{target_volume:.0f} т "
                     f"({progress:.0f}%)"
                 )
                 keyboard.add(
@@ -16376,7 +18081,10 @@ async def edit_batch_new_value(message: types.Message, state: FSMContext):
     new_value = message.text.strip()
     try:
         if field in ["price", "volume", "humidity", "impurity"]:
-            new_value_float = float(new_value.replace(",", "."))
+            if field == "price":
+                new_value_float = parse_price(new_value)
+            else:
+                new_value_float = float(new_value.replace(",", "."))
             if field == "price" and new_value_float <= 0:
                 await message.answer(
                     "❌ Цена должна быть больше 0. Попробуйте ещё раз:"
@@ -16466,12 +18174,10 @@ async def delete_batch_start(callback: types.CallbackQuery, state: FSMContext):
         return
 
     user_id = callback.from_user.id
-    batch_exists = False
-    if user_id in batches:
-        for b in batches[user_id]:
-            if b["id"] == batch_id:
-                batch_exists = True
-                break
+    batch_exists = any(
+        isinstance(b, dict) and same_id(b.get("id"), batch_id)
+        for b in get_user_batches(user_id)
+    )
 
     if not batch_exists:
         await callback.answer("❌ Партия не найдена", show_alert=True)
@@ -16503,8 +18209,11 @@ async def delete_batch_confirmed(callback: types.CallbackQuery, state: FSMContex
     await state.finish()
 
     try:
-        batch_id = int(callback.data.split(":")[-1])
-    except (IndexError, ValueError):
+        batch_id = parse_callback_id(callback.data)
+    except Exception:
+        await callback.answer("❌ Ошибка!", show_alert=True)
+        return
+    if batch_id is None:
         await callback.answer("❌ Ошибка!", show_alert=True)
         return
 
@@ -16512,19 +18221,38 @@ async def delete_batch_confirmed(callback: types.CallbackQuery, state: FSMContex
 
     # Находим партию в batches
     batch = None
-    if user_id in batches:
-        for b in batches[user_id]:
-            if same_id(b.get("id"), batch_id):
+    user_batch_keys = []
+    if isinstance(batches, dict):
+        if user_id in batches:
+            user_batch_keys.append(user_id)
+        if str(user_id) in batches:
+            user_batch_keys.append(str(user_id))
+    for batch_key in user_batch_keys:
+        user_batches = batches.get(batch_key, [])
+        for b in user_batches:
+            if isinstance(b, dict) and same_id(b.get("id"), batch_id):
                 batch = b
                 break
+        if batch:
+            break
 
     if not batch:
         await callback.answer("❌ Партия не найдена!", show_alert=True)
         return
 
     # Удаляем партию из batches
-    if user_id in batches:
-        batches[user_id] = [b for b in batches[user_id] if not same_id(b.get("id"), batch_id)]
+    removed_from_batches = False
+    for batch_key in user_batch_keys:
+        user_batches = batches.get(batch_key, [])
+        updated_batches = [
+            b
+            for b in user_batches
+            if not (isinstance(b, dict) and same_id(b.get("id"), batch_id))
+        ]
+        if len(updated_batches) != len(user_batches):
+            batches[batch_key] = updated_batches
+            removed_from_batches = True
+    if removed_from_batches:
         save_batches_to_pickle()
         logging.info(f"✅ Партия #{batch_id} удалена из batches")
 
@@ -16560,8 +18288,10 @@ async def delete_batch_confirmed(callback: types.CallbackQuery, state: FSMContex
             logging.info(f"📉 Обновлен current_volume: {pull.get('current_volume')}")
 
             # Восстанавливаем статус, если пул больше не заполнен
-            if normalize_transition_status(pull.get("status")) == "filled" and pull["current_volume"] < pull.get(
-                "target_volume", 0
+            target_volume = get_safe_float(pull.get("target_volume"), 0)
+            if (
+                normalize_transition_status(pull.get("status")) == "filled"
+                and get_safe_float(pull.get("current_volume"), 0) < target_volume
             ):
                 pull["status"] = "open"
                 logging.info(f"✅ Пул #{pull_id} возвращен в статус 'open'")
@@ -16600,7 +18330,7 @@ async def delete_batch_confirmed(callback: types.CallbackQuery, state: FSMContex
                     for p in pullparticipants[key]
                     if not (
                         same_id(p.get("batch_id"), batch_id)
-                        and same_id(p.get("farmer_id"), user_id)
+                        and same_id(p.get("farmer_id") or p.get("user_id"), user_id)
                     )
                 ]
                 new_len = len(pullparticipants[key])
@@ -16644,7 +18374,9 @@ async def edit_crop_field(callback: types.CallbackQuery, state: FSMContext):
     await state.finish()
 
     try:
-        batch_id = int(callback.data.split("_")[2])
+        parts = callback.data.split("_")
+        batch_id_raw = parts[2]
+        batch_id = int(batch_id_raw) if str(batch_id_raw).isdigit() else batch_id_raw
     except (IndexError, ValueError) as e:
         logger.error(f"Ошибка парсинга batch_id: {e}")
         await callback.answer("❌ Ошибка", show_alert=True)
@@ -16698,7 +18430,8 @@ async def set_crop_value(callback: types.CallbackQuery, state: FSMContext):
 
     try:
         parts = callback.data.split("_")
-        batch_id = int(parts[1])
+        batch_id_raw = parts[1]
+        batch_id = int(batch_id_raw) if str(batch_id_raw).isdigit() else batch_id_raw
         new_crop = "_".join(parts[2:])
     except (IndexError, ValueError) as e:
         logger.error(f"Ошибка парсинга: {e}")
@@ -16744,7 +18477,8 @@ async def cancel_edit_crop(callback: types.CallbackQuery, state: FSMContext):
     await state.finish()
 
     try:
-        batch_id = int(callback.data.split("_", 1)[1])
+        batch_id_raw = callback.data.split("_", 1)[1]
+        batch_id = int(batch_id_raw) if str(batch_id_raw).isdigit() else batch_id_raw
     except (IndexError, ValueError):
         await callback.answer("❌ Ошибка", show_alert=True)
         return
@@ -16814,7 +18548,8 @@ async def edit_pull_field_selected(callback: types.CallbackQuery, state: FSMCont
         await callback.answer("❌ Пул не найден", show_alert=True)
         await state.finish()
         return
-    if not same_id(pull.get("exporter_id"), callback.from_user.id):
+    pull_owner_id = pull.get("exporter_id") or pull.get("creator_id")
+    if not same_id(pull_owner_id, callback.from_user.id):
         await callback.answer("❌ Нет доступа", show_alert=True)
         await state.finish()
         return
@@ -16885,7 +18620,8 @@ async def edit_pull_culture(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer("❌ Пул не найден", show_alert=True)
         await state.finish()
         return
-    if not same_id(pull.get("exporter_id"), callback.from_user.id):
+    pull_owner_id = pull.get("exporter_id") or pull.get("creator_id")
+    if not same_id(pull_owner_id, callback.from_user.id):
         await callback.answer("❌ Нет доступа", show_alert=True)
         await state.finish()
         return
@@ -16961,7 +18697,8 @@ async def edit_pull_port(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer("❌ Пул не найден", show_alert=True)
         await state.finish()
         return
-    if not same_id(pull.get("exporter_id"), callback.from_user.id):
+    pull_owner_id = pull.get("exporter_id") or pull.get("creator_id")
+    if not same_id(pull_owner_id, callback.from_user.id):
         await callback.answer("❌ Нет доступа", show_alert=True)
         await state.finish()
         return
@@ -17033,7 +18770,10 @@ async def edit_pull_numeric_field(
 ):
     """Универсальная функция для редактирования числовых полей пула"""
     try:
-        new_value = float(message.text.strip().replace(",", "."))
+        if field == "price":
+            new_value = parse_price(message.text)
+        else:
+            new_value = float(message.text.strip().replace(",", "."))
 
         if new_value < min_val:
             await message.answer(f"❌ Значение должно быть не менее {min_val}")
@@ -17058,7 +18798,8 @@ async def edit_pull_numeric_field(
             await message.answer("❌ Пул не найден")
             await state.finish()
             return
-        if not same_id(pull.get("exporter_id"), message.from_user.id):
+        pull_owner_id = pull.get("exporter_id") or pull.get("creator_id")
+        if not same_id(pull_owner_id, message.from_user.id):
             await message.answer("❌ Нет доступа")
             await state.finish()
             return
@@ -17162,7 +18903,7 @@ async def notify_logistic_pull_closed(pullid: int):
             f"🔔 <b>Пул #{pullid} закрыт и готов к логистике</b>\n\n"
             f"🌾 <b>Культура:</b> {pull.get('culture', 'Н/Д')}\n"
             f"📦 <b>Объём:</b> {pull.get('target_volume', pull.get('targetvolume', 0))} тонн\n"
-            f"💰 <b>Цена FOB:</b> ₽{pull.get('price', 0):,.0f}/тонна\n"
+            f"💰 <b>Цена FOB:</b> ₽{get_safe_float(pull.get('price'), 0):,.0f}/тонна\n"
             f"🚢 <b>Порт:</b> {pull.get('port', 'Н/Д')}\n\n"
             "📋 Вы можете подать заявку на логистику этого пула."
         )
@@ -17207,7 +18948,8 @@ async def deletepullstart_callback(callback: types.CallbackQuery, state: FSMCont
         await callback.answer("❌ Пул не найден", show_alert=True)
         return
 
-    if not same_id(pull.get("exporter_id"), userid):
+    pull_owner_id = pull.get("exporter_id") or pull.get("creator_id")
+    if not same_id(pull_owner_id, userid):
         await callback.answer(
             "❌ Только создатель пула может его удалить", show_alert=True
         )
@@ -17228,7 +18970,7 @@ async def deletepullstart_callback(callback: types.CallbackQuery, state: FSMCont
         f"❓ Вы уверены, что хотите удалить пул №{pullid}?\n\n"
         f"🌾 <b>Культура:</b> {pull.get('culture', 'Н/Д')}\n"
         f"📦 <b>Объём:</b> {pull.get('target_volume', 0)} тонн\n"
-        f"💰 <b>Цена FOB:</b> ₽{pull.get('price', 0):,.0f}/тонна\n\n"
+        f"💰 <b>Цена FOB:</b> ₽{get_safe_float(pull.get('price'), 0):,.0f}/тонна\n\n"
         "<b>⚠️ Это действие нельзя отменить!</b>",
         reply_markup=keyboard,
         parse_mode="HTML",
@@ -17264,7 +19006,8 @@ async def deletepullconfirmed_callback(
         await callback.answer("❌ Пул не найден", show_alert=True)
         return
 
-    if not same_id(pull.get("exporter_id"), userid):
+    pull_owner_id = pull.get("exporter_id") or pull.get("creator_id")
+    if not same_id(pull_owner_id, userid):
         await callback.answer(
             "❌ У вас нет прав на удаление этого пула", show_alert=True
         )
@@ -17272,8 +19015,8 @@ async def deletepullconfirmed_callback(
 
     # Сохраняем данные для логирования
     pull_culture = pull.get("culture", "Н/Д")
-    pull_volume = pull.get("target_volume", 0)
-    pull_price = pull.get("price", 0)
+    pull_volume = get_safe_float(pull.get("target_volume"), 0)
+    pull_price = get_safe_float(pull.get("price"), 0)
 
     # Сохраняем ID партий участников, чтобы снять резерв после удаления пула.
     participant_batch_ids = set()
@@ -17456,8 +19199,8 @@ async def canceldeletepull_callback(callback: types.CallbackQuery, state: FSMCon
 ❌ <i>Удаление отменено</i>
 
 🌾 <b>Культура:</b> {pull.get('culture', '?')}
-📦 <b>Объём:</b> {pull.get('current_volume', 0):.0f}/{pull.get('target_volume', 0):.0f} т
-💰 <b>Цена FOB:</b> ₽{pull.get('price', 0):,.0f}/т
+📦 <b>Объём:</b> {get_safe_float(pull.get('current_volume'), 0):.0f}/{get_safe_float(pull.get('target_volume'), 0):.0f} т
+💰 <b>Цена FOB:</b> ₽{get_safe_float(pull.get('price'), 0):,.0f}/т
 """
 
             await callback.message.edit_text(
@@ -17476,7 +19219,8 @@ async def canceldeletepull_callback(callback: types.CallbackQuery, state: FSMCon
 async def close_pull_confirm(callback: types.CallbackQuery):
     """Подтверждение закрытия пула (НОВАЯ ФУНКЦИЯ)"""
     try:
-        pull_id = int(callback.data.split(":")[1])
+        pull_id_raw = callback.data.split(":", 1)[1]
+        pull_id = int(pull_id_raw) if str(pull_id_raw).isdigit() else pull_id_raw
     except (IndexError, ValueError):
         await callback.answer("❌ Ошибка обработки данных", show_alert=True)
         return
@@ -17493,8 +19237,8 @@ async def close_pull_confirm(callback: types.CallbackQuery):
         await callback.answer("⚠️ Только владелец может закрыть пул", show_alert=True)
         return
 
-    current_volume = pull.get("current_volume", 0)
-    target_volume = pull.get("target_volume", 0)
+    current_volume = get_safe_float(pull.get("current_volume"), 0)
+    target_volume = get_safe_float(pull.get("target_volume"), 0)
     percent = (current_volume / target_volume * 100) if target_volume > 0 else 0
 
     text = (
@@ -17524,7 +19268,8 @@ async def close_pull_confirm(callback: types.CallbackQuery):
 async def confirm_close_pull_callback(callback_query: types.CallbackQuery):
     """Совместимость: закрытие пула через единый обработчик статусов."""
     try:
-        pull_id = int(callback_query.data.split("_")[1])
+        pull_id_raw = callback_query.data.split("_", 1)[1]
+        pull_id = int(pull_id_raw) if str(pull_id_raw).isdigit() else pull_id_raw
     except (IndexError, ValueError):
         await callback_query.answer("❌ Ошибка: неверный ID пула", show_alert=True)
         return
@@ -17553,9 +19298,15 @@ async def get_partner_contacts_handler(callback: types.CallbackQuery):
     for deal_id, deal in deals.items():
         if not isinstance(deal, dict):
             continue
-        if same_id(deal.get("logistic_id"), user_id):
+        pull_id = deal.get("pull_id")
+        all_pulls = pulls.get("pulls", {}) if isinstance(pulls, dict) else {}
+        pull = all_pulls.get(pull_id) or all_pulls.get(str(pull_id), {})
+        deal_exporter_id = (
+            deal.get("exporter_id") or pull.get("exporter_id") or pull.get("creator_id")
+        )
+        if same_id(get_assigned_logist_id(deal), user_id):
             # Логист - получаем контакты экспортёра
-            exporter_id = deal.get("exporter_id")
+            exporter_id = deal_exporter_id
             exporter = get_user_by_id(exporter_id) or {}
             if exporter:
                 partner_info = "📦 <b>Контакты экспортёра:</b>\n\n"
@@ -17565,9 +19316,9 @@ async def get_partner_contacts_handler(callback: types.CallbackQuery):
                 partner_info += f"📍 {exporter.get('region', 'Не указан')}\n"
                 break
 
-        elif same_id(deal.get("expeditor_id"), user_id):
+        elif same_id(get_assigned_expeditor_id(deal), user_id):
             # Экспедитор - получаем контакты экспортёра
-            exporter_id = deal.get("exporter_id")
+            exporter_id = deal_exporter_id
             exporter = get_user_by_id(exporter_id) or {}
             if exporter:
                 partner_info = "📦 <b>Контакты экспортёра:</b>\n\n"
@@ -17599,27 +19350,40 @@ async def contact_partner_by_deal(callback: types.CallbackQuery):
         return
     deal_id = resolved_deal_id
     user_id = callback.from_user.id
-    farmer_ids = deal.get("farmer_ids", [])
+    pull_id = deal.get("pull_id")
+    all_pulls = pulls.get("pulls", {}) if isinstance(pulls, dict) else {}
+    pull = all_pulls.get(pull_id) or all_pulls.get(str(pull_id), {})
+    deal_exporter_id = (
+        deal.get("exporter_id") or pull.get("exporter_id") or pull.get("creator_id")
+    )
+    farmer_ids = deal.get("farmer_ids") or []
+    legacy_farmer_id = deal.get("farmer_id")
+    if legacy_farmer_id not in {None, ""} and not any(
+        same_id(legacy_farmer_id, fid) for fid in farmer_ids
+    ):
+        farmer_ids = [*farmer_ids, legacy_farmer_id]
     is_farmer_participant = any(same_id(user_id, farmer_id) for farmer_id in farmer_ids)
     role = (get_user_by_id(user_id) or {}).get("role")
     is_participant = (
-        same_id(user_id, deal.get("exporter_id"))
+        same_id(user_id, deal_exporter_id)
         or is_farmer_participant
-        or same_id(user_id, deal.get("logistic_id"))
-        or same_id(user_id, deal.get("expeditor_id"))
+        or same_id(user_id, get_assigned_logist_id(deal))
+        or same_id(user_id, get_assigned_expeditor_id(deal))
     )
     if not (is_participant or role == "admin"):
         await callback.answer("❌ Нет доступа к контактам сделки", show_alert=True)
         return
 
     participant_ids = []
-    if deal.get("exporter_id"):
-        participant_ids.append(deal["exporter_id"])
-    participant_ids.extend(deal.get("farmer_ids", []))
-    if deal.get("logistic_id"):
-        participant_ids.append(deal["logistic_id"])
-    if deal.get("expeditor_id"):
-        participant_ids.append(deal["expeditor_id"])
+    if deal_exporter_id:
+        participant_ids.append(deal_exporter_id)
+    participant_ids.extend(farmer_ids)
+    assigned_logist_id = get_assigned_logist_id(deal)
+    if assigned_logist_id:
+        participant_ids.append(assigned_logist_id)
+    assigned_expeditor_id = get_assigned_expeditor_id(deal)
+    if assigned_expeditor_id:
+        participant_ids.append(assigned_expeditor_id)
 
     partner_ids = [pid for pid in participant_ids if not same_id(pid, user_id)]
     if not partner_ids:
@@ -17654,14 +19418,32 @@ async def complete_deal(callback: types.CallbackQuery):
         return
     deal_id = resolved_deal_id
     user_id = callback.from_user.id
-    farmer_ids = deal.get("farmer_ids", [])
-    is_farmer_participant = any(same_id(user_id, farmer_id) for farmer_id in farmer_ids)
-    if (
-        not same_id(user_id, deal.get("exporter_id"))
-        and not is_farmer_participant
+    pull_id = deal.get("pull_id")
+    all_pulls = pulls.get("pulls", {}) if isinstance(pulls, dict) else {}
+    pull = all_pulls.get(pull_id) or all_pulls.get(str(pull_id), {})
+    deal_exporter_id = (
+        deal.get("exporter_id") or pull.get("exporter_id") or pull.get("creator_id")
+    )
+    farmer_ids = deal.get("farmer_ids") or []
+    legacy_farmer_id = deal.get("farmer_id")
+    if legacy_farmer_id not in {None, ""} and not any(
+        same_id(legacy_farmer_id, fid) for fid in farmer_ids
     ):
+        farmer_ids = [*farmer_ids, legacy_farmer_id]
+    is_farmer_participant = any(same_id(user_id, farmer_id) for farmer_id in farmer_ids)
+    if not same_id(user_id, deal_exporter_id) and not is_farmer_participant:
         await callback.answer(
             "⚠️ Только участники сделки могут её завершить", show_alert=True
+        )
+        return
+    effective_status = get_effective_deal_status(deal)
+    if effective_status in {"completed", "cancelled"}:
+        await callback.answer("ℹ️ Сделка уже закрыта", show_alert=True)
+        return
+    if effective_status != "in_progress":
+        await callback.answer(
+            "⚠️ Сделку можно завершить только после начала перевозки",
+            show_alert=True,
         )
         return
 
@@ -17703,8 +19485,19 @@ async def confirm_complete_deal(callback: types.CallbackQuery):
         return
     deal_id = resolved_deal_id
     user_id = callback.from_user.id
-    farmer_ids = deal.get("farmer_ids", [])
-    can_complete = same_id(user_id, deal.get("exporter_id")) or any(
+    pull_id = deal.get("pull_id")
+    all_pulls = pulls.get("pulls", {}) if isinstance(pulls, dict) else {}
+    pull = all_pulls.get(pull_id) or all_pulls.get(str(pull_id), {})
+    deal_exporter_id = (
+        deal.get("exporter_id") or pull.get("exporter_id") or pull.get("creator_id")
+    )
+    farmer_ids = deal.get("farmer_ids") or []
+    legacy_farmer_id = deal.get("farmer_id")
+    if legacy_farmer_id not in {None, ""} and not any(
+        same_id(legacy_farmer_id, fid) for fid in farmer_ids
+    ):
+        farmer_ids = [*farmer_ids, legacy_farmer_id]
+    can_complete = same_id(user_id, deal_exporter_id) or any(
         same_id(user_id, farmer_id) for farmer_id in farmer_ids
     )
     if not can_complete:
@@ -17712,8 +19505,15 @@ async def confirm_complete_deal(callback: types.CallbackQuery):
             "⚠️ Только участники сделки могут её завершить", show_alert=True
         )
         return
-    if normalize_transition_status(deal.get("status")) in {"completed", "cancelled"}:
+    effective_status = get_effective_deal_status(deal)
+    if effective_status in {"completed", "cancelled"}:
         await callback.answer("ℹ️ Сделка уже закрыта", show_alert=True)
+        return
+    if effective_status != "in_progress":
+        await callback.answer(
+            "⚠️ Сделку можно завершить только после начала перевозки",
+            show_alert=True,
+        )
         return
 
     deal["status"] = "completed"
@@ -17745,9 +19545,34 @@ async def cancel_deal(callback: types.CallbackQuery):
         return
     deal_id = resolved_deal_id
     user_id = callback.from_user.id
-    if not same_id(deal.get("exporter_id"), user_id):
+    pull_id = deal.get("pull_id")
+    all_pulls = pulls.get("pulls", {}) if isinstance(pulls, dict) else {}
+    pull = all_pulls.get(pull_id) or all_pulls.get(str(pull_id), {})
+    deal_exporter_id = (
+        deal.get("exporter_id") or pull.get("exporter_id") or pull.get("creator_id")
+    )
+    if not same_id(deal_exporter_id, user_id):
         await callback.answer(
             "❌ Только экспортёр может отменить сделку", show_alert=True
+        )
+        return
+    effective_status = get_effective_deal_status(deal)
+    if effective_status in {"completed", "cancelled"}:
+        await callback.answer("ℹ️ Сделка уже закрыта", show_alert=True)
+        return
+    if effective_status not in {
+        "pending",
+        "matched",
+        "new",
+        "active",
+        "open",
+        "accepted",
+        "assigned",
+        "expeditor_selected",
+    }:
+        await callback.answer(
+            "⚠️ После старта перевозки сделку нельзя отменить вручную",
+            show_alert=True,
         )
         return
 
@@ -17789,13 +19614,35 @@ async def confirm_cancel_deal(callback: types.CallbackQuery):
         return
     deal_id = resolved_deal_id
     user_id = callback.from_user.id
-    if not same_id(deal.get("exporter_id"), user_id):
+    pull_id = deal.get("pull_id")
+    all_pulls = pulls.get("pulls", {}) if isinstance(pulls, dict) else {}
+    pull = all_pulls.get(pull_id) or all_pulls.get(str(pull_id), {})
+    deal_exporter_id = (
+        deal.get("exporter_id") or pull.get("exporter_id") or pull.get("creator_id")
+    )
+    if not same_id(deal_exporter_id, user_id):
         await callback.answer(
             "❌ Только экспортёр может отменить сделку", show_alert=True
         )
         return
-    if normalize_transition_status(deal.get("status")) in {"completed", "cancelled"}:
+    effective_status = get_effective_deal_status(deal)
+    if effective_status in {"completed", "cancelled"}:
         await callback.answer("ℹ️ Сделка уже закрыта", show_alert=True)
+        return
+    if effective_status not in {
+        "pending",
+        "matched",
+        "new",
+        "active",
+        "open",
+        "accepted",
+        "assigned",
+        "expeditor_selected",
+    }:
+        await callback.answer(
+            "⚠️ После старта перевозки сделку нельзя отменить вручную",
+            show_alert=True,
+        )
         return
 
     deal["status"] = "cancelled"
@@ -17828,14 +19675,28 @@ async def notify_deal_participants(deal_id: int, message: str):
         return
 
     participants = []
-    if deal.get("exporter_id"):
-        participants.append(deal["exporter_id"])
-    if deal.get("farmer_ids"):
-        participants.extend(deal["farmer_ids"])
-    if deal.get("logistic_id"):
-        participants.append(deal["logistic_id"])
-    if deal.get("expeditor_id"):
-        participants.append(deal["expeditor_id"])
+    pull_id = deal.get("pull_id")
+    all_pulls = pulls.get("pulls", {}) if isinstance(pulls, dict) else {}
+    pull = all_pulls.get(pull_id) or all_pulls.get(str(pull_id), {})
+    deal_exporter_id = (
+        deal.get("exporter_id") or pull.get("exporter_id") or pull.get("creator_id")
+    )
+    if deal_exporter_id:
+        participants.append(deal_exporter_id)
+    farmer_ids = deal.get("farmer_ids") or []
+    legacy_farmer_id = deal.get("farmer_id")
+    if legacy_farmer_id not in {None, ""} and not any(
+        same_id(legacy_farmer_id, fid) for fid in farmer_ids
+    ):
+        farmer_ids = [*farmer_ids, legacy_farmer_id]
+    if farmer_ids:
+        participants.extend(farmer_ids)
+    assigned_logist_id = get_assigned_logist_id(deal)
+    if assigned_logist_id:
+        participants.append(assigned_logist_id)
+    assigned_expeditor_id = get_assigned_expeditor_id(deal)
+    if assigned_expeditor_id:
+        participants.append(assigned_expeditor_id)
     seen_participants = set()
     for user_id in participants:
         if user_id is None:
@@ -17869,10 +19730,41 @@ async def deal_logistics(callback: types.CallbackQuery):
         return
     deal_id = resolved_deal_id
 
-    text = f"🚚 <b>Логистика сделки #{deal_id}</b>\n\n"
+    user_id = callback.from_user.id
+    user = get_user_by_id(user_id) or {}
+    user_role = str(user.get("role", "")).strip().lower()
+    is_admin = user_role == "admin" or user_id == ADMIN_ID
+    pull_id = deal.get("pull_id")
+    all_pulls = pulls.get("pulls", {}) if isinstance(pulls, dict) else {}
+    pull = all_pulls.get(pull_id) or all_pulls.get(str(pull_id), {})
+    deal_exporter_id = (
+        deal.get("exporter_id") or pull.get("exporter_id") or pull.get("creator_id")
+    )
+    farmer_ids = deal.get("farmer_ids") or []
+    legacy_farmer_id = deal.get("farmer_id")
+    if legacy_farmer_id not in {None, ""} and not any(
+        same_id(legacy_farmer_id, fid) for fid in farmer_ids
+    ):
+        farmer_ids = [*farmer_ids, legacy_farmer_id]
 
-    if deal.get("logistic_id"):
-        logistic = get_user_by_id(deal["logistic_id"]) or {}
+    if not (
+        is_admin
+        or same_id(deal_exporter_id, user_id)
+        or any(same_id(fid, user_id) for fid in farmer_ids)
+        or same_id(get_assigned_logist_id(deal), user_id)
+        or same_id(get_assigned_expeditor_id(deal), user_id)
+        or same_id(deal.get("created_by"), user_id)
+    ):
+        await callback.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    effective_status = get_effective_deal_status(deal)
+    text = f"🚚 <b>Логистика сделки #{deal_id}</b>\n\n"
+    text += f"📊 Статус сделки: <b>{DEAL_STATUSES.get(effective_status, effective_status)}</b>\n\n"
+
+    logist_id = get_assigned_logist_id(deal)
+    if logist_id:
+        logistic = get_user_by_id(logist_id) or {}
         if logistic:
             text += "✅ <b>Логист назначен:</b>\n"
             text += f"👤 {logistic.get('name', 'Неизвестно')}\n"
@@ -17887,8 +19779,9 @@ async def deal_logistics(callback: types.CallbackQuery):
         text += "🤷‍♂️ <b>Логист не назначен</b>\n\n"
         text += "Для назначения логиста создайте заявку на логистику.\n"
 
-    if deal.get("expeditor_id"):
-        expeditor = get_user_by_id(deal["expeditor_id"]) or {}
+    expeditor_id = get_assigned_expeditor_id(deal)
+    if expeditor_id:
+        expeditor = get_user_by_id(expeditor_id) or {}
         if expeditor:
             text += "\n✅ <b>Экспедитор назначен:</b>\n"
             text += f"👤 {expeditor.get('name', 'Неизвестно')}\n"
@@ -17954,7 +19847,7 @@ async def show_pullparticipants(callback: types.CallbackQuery):
     user_role = (get_user_by_id(user_id) or {}).get("role")
     pull_owner_id = pull.get("exporter_id") or pull.get("creator_id")
     is_participant = any(
-        isinstance(p, dict) and same_id(p.get("farmer_id"), user_id)
+        isinstance(p, dict) and same_id(p.get("farmer_id") or p.get("user_id"), user_id)
         for p in participants
     )
     if not (user_role == "admin" or same_id(pull_owner_id, user_id) or is_participant):
@@ -17970,7 +19863,7 @@ async def show_pullparticipants(callback: types.CallbackQuery):
     else:
         total_participant_volume = 0
         for i, participant in enumerate(participants, 1):
-            farmer_id = participant.get("farmer_id")
+            farmer_id = participant.get("farmer_id") or participant.get("user_id")
             farmer = get_user_by_id(farmer_id) or {}
             batch_id = participant.get("batch_id")
             volume = participant.get("volume", 0)
@@ -18015,7 +19908,7 @@ async def show_pullparticipants(callback: types.CallbackQuery):
             else:
                 text += "   📞 Телефон: <i>скрыт</i>\n\n"
 
-        target_volume = pull.get("target_volume", 1)
+        target_volume = get_safe_float(pull.get("target_volume"), 1)
         fill_percentage = (
             (total_participant_volume / target_volume * 100) if target_volume > 0 else 0
         )
@@ -18056,8 +19949,8 @@ async def pull_logistics_menu(callback: types.CallbackQuery):
     # ✅ ПРОВЕРКА: Пул должен быть готов для логистики
     status = pull.get("status", "active")
     status_norm = normalize_transition_status(status)
-    current_volume = pull.get("current_volume", 0)
-    target_volume = pull.get("target_volume", 0)
+    current_volume = get_safe_float(pull.get("current_volume"), 0)
+    target_volume = get_safe_float(pull.get("target_volume"), 0)
 
     if status_norm in {"cancelled", "sold", "completed"}:
         await callback.answer(
@@ -18084,7 +19977,25 @@ async def pull_logistics_menu(callback: types.CallbackQuery):
 
     if is_ready:
         # ✅ Пул готов - показываем кнопку создания заявки
-        text += "✅ <b>Пул готов для создания заявки на логистику</b>"
+        text += "✅ <b>Пул готов для логистических действий</b>"
+        if has_assigned_logist(pull):
+            selected_logist_id = get_assigned_logist_id(pull)
+            selected_logist = get_user_by_id(selected_logist_id) or {}
+            selected_name = (
+                selected_logist.get("company_name")
+                or selected_logist.get("company_details")
+                or selected_logist.get("name")
+                or "Назначен"
+            )
+            text += f"\n🚚 Выбран логист: <b>{selected_name}</b>"
+        else:
+            text += "\n⚠️ Логист по пулу ещё не выбран."
+            keyboard.add(
+                InlineKeyboardButton(
+                    "👤 Выбрать логиста",
+                    callback_data=f"select_logistics_for_pull:{pull_id}",
+                )
+            )
         keyboard.add(
             InlineKeyboardButton(
                 "📋 Создать заявку на логистику",
@@ -18124,7 +20035,8 @@ async def pull_logistics_menu(callback: types.CallbackQuery):
 async def create_shipping_from_pull(callback: types.CallbackQuery, state: FSMContext):
     """Создание заявки на логистику из пула"""
     try:
-        pull_id = int(callback.data.split(":")[1])
+        pull_id_raw = callback.data.split(":", 1)[1]
+        pull_id = int(pull_id_raw) if str(pull_id_raw).isdigit() else pull_id_raw
     except (IndexError, ValueError):
         await callback.answer("❌ Ошибка обработки данных", show_alert=True)
         return
@@ -18146,8 +20058,8 @@ async def create_shipping_from_pull(callback: types.CallbackQuery, state: FSMCon
     # ✅ ДВОЙНАЯ ПРОВЕРКА: Пул должен быть готов
     status = pull.get("status", "active")
     status_norm = normalize_transition_status(status)
-    current_volume = pull.get("current_volume", 0)
-    target_volume = pull.get("target_volume", 0)
+    current_volume = get_safe_float(pull.get("current_volume"), 0)
+    target_volume = get_safe_float(pull.get("target_volume"), 0)
 
     is_closed = status_norm == "closed"
     is_full = current_volume >= target_volume and target_volume > 0
@@ -18166,9 +20078,32 @@ async def create_shipping_from_pull(callback: types.CallbackQuery, state: FSMCon
     has_open_request_for_pull = any(
         isinstance(req, dict)
         and same_id(req.get("pull_id"), pull_id)
-        and (pull_owner_id is None or same_id(req.get("exporter_id"), pull_owner_id))
+        and (
+            pull_owner_id is None
+            or same_id(
+                req.get("exporter_id")
+                or req.get("customer_id")
+                or req.get("created_by"),
+                pull_owner_id,
+            )
+        )
         and str(req.get("source") or "").strip().lower() in {"", "exporter"}
-        and normalize_transition_status(req.get("status")) not in {"completed", "cancelled", "rejected"}
+        and get_effective_request_status(
+            req.get("id", req.get("request_id", pull_id)),
+            "exporter",
+            req,
+            request_owner_id=(
+                req.get("exporter_id")
+                or req.get("customer_id")
+                or req.get("created_by")
+            ),
+            request_exporter_id=(
+                req.get("exporter_id")
+                or req.get("customer_id")
+                or req.get("created_by")
+            ),
+        )
+        not in {"completed", "cancelled", "rejected"}
         for req in shipping_requests.values()
     )
     if has_open_request_for_pull:
@@ -18183,7 +20118,7 @@ async def create_shipping_from_pull(callback: types.CallbackQuery, state: FSMCon
 
     await callback.message.edit_text(
         f"🚚 <b>Заявка на логистику для пула #{pull_id}</b>\n\n"
-        f"🌾 {pull.get('culture', '')} • {pull.get('current_volume', 0):.0f} т • {pull.get('port', '')}\n\n"
+        f"🌾 {pull.get('culture', '')} • {get_safe_float(pull.get('current_volume'), 0):.0f} т • {pull.get('port', '')}\n\n"
         "<b>Шаг 1 из 5</b>\n\n"
         "Введите пункт отправки (город/регион):",
         parse_mode="HTML",
@@ -18283,28 +20218,50 @@ async def show_logistics_card(message: types.Message):
     if is_logistic_role(role):
         # Считаем заявки логиста по всем источникам
         logist_assigned_requests = [
-            req
+            ("exporter", req)
             for req in shipping_requests.values()
             if same_id(get_assigned_logist_id(req), user_id)
         ]
         logist_assigned_requests.extend(
             [
-                req
+                ("farmer", req)
                 for req in farmer_logistics_requests.values()
                 if same_id(get_assigned_logist_id(req), user_id)
             ]
         )
         logist_assigned_requests.extend(
             [
-                req
+                ("logistics", req)
                 for req in logistics_requests.values()
                 if same_id(get_assigned_logist_id(req), user_id)
             ]
         )
         active_requests = [
             req
-            for req in logist_assigned_requests
-            if normalize_transition_status(req.get("status"))
+            for source, req in logist_assigned_requests
+            if get_effective_request_status(
+                req.get("id"),
+                source,
+                req,
+                request_owner_id=(
+                    (req.get("farmer_id") or req.get("user_id"))
+                    if source == "farmer"
+                    else (
+                        req.get("customer_id")
+                        or req.get("created_by")
+                        or req.get("exporter_id")
+                    )
+                    if source == "logistics"
+                    else None
+                ),
+                request_exporter_id=(
+                    req.get("exporter_id")
+                    or req.get("customer_id")
+                    or req.get("created_by")
+                )
+                if source == "exporter"
+                else None,
+            )
             not in {"completed", "cancelled", "rejected"}
         ]
         text += "📊 <b>Статистика:</b>\n"
@@ -18331,23 +20288,23 @@ async def show_logistics_card(message: types.Message):
             1
             for o in my_request_offers
             if normalize_transition_status(o.get("status") or "pending")
-            in {"pending", "active", "accepted", "assigned", "in_progress"}
+            in MUTABLE_EXPEDITOR_OFFER_STATUSES
         )
         active_pull_offers = sum(
             1
             for o in my_pull_offers
             if normalize_transition_status(o.get("status") or "pending")
-            in {"pending", "active", "accepted", "assigned", "in_progress"}
+            in MUTABLE_EXPEDITOR_OFFER_STATUSES
         )
         in_progress_deliveries = sum(
             1
             for d in my_deliveries
-            if normalize_transition_status(d.get("status")) in {"in_progress", "expeditor_selected"}
+            if get_effective_delivery_status(d) in {"in_progress", "expeditor_selected"}
         )
         completed_deliveries = sum(
             1
             for d in my_deliveries
-            if normalize_transition_status(d.get("status")) == "completed"
+            if get_effective_delivery_status(d) == "completed"
         )
         text += "📊 <b>Статистика:</b>\n"
         text += f"  • Офферов по заявкам: {len(my_request_offers)}\n"
@@ -18395,7 +20352,18 @@ async def show_active_requests(message: types.Message, state: FSMContext):
         for req_id, req in shipping_requests.items():
             if not isinstance(req, dict):
                 continue
-            status = req.get("status", "pending")
+            request_owner_id = (
+                req.get("exporter_id")
+                or req.get("customer_id")
+                or req.get("created_by")
+            )
+            status = get_effective_request_status(
+                req.get("id", req_id),
+                "exporter",
+                req,
+                request_owner_id=request_owner_id,
+                request_exporter_id=request_owner_id,
+            )
             assigned_logist = get_assigned_logist_id(req)
             # Показываем только свободные заявки в открытых статусах
             if not is_request_open_for_offers(status) or assigned_logist:
@@ -18422,8 +20390,15 @@ async def show_active_requests(message: types.Message, state: FSMContext):
         for req_id, req in farmer_shipping_requests.items():
             if not isinstance(req, dict):
                 continue
-            status = req.get("status", "active")
-            if not is_request_open_for_offers(status):
+            request_owner_id = req.get("farmer_id") or req.get("user_id")
+            status = get_effective_request_status(
+                req.get("id", req_id),
+                "farmer",
+                req,
+                request_owner_id=request_owner_id,
+            )
+            assigned_logist = get_assigned_logist_id(req)
+            if not is_request_open_for_offers(status) or assigned_logist:
                 continue
             canonical_id = req.get("id", req_id)
             canonical_key = str(canonical_id)
@@ -18446,8 +20421,15 @@ async def show_active_requests(message: types.Message, state: FSMContext):
         for req_id, req in farmer_logistics_requests.items():
             if not isinstance(req, dict):
                 continue
-            status = req.get("status", "active")
-            if not is_request_open_for_offers(status):
+            request_owner_id = req.get("farmer_id") or req.get("user_id")
+            status = get_effective_request_status(
+                req.get("id", req_id),
+                "farmer",
+                req,
+                request_owner_id=request_owner_id,
+            )
+            assigned_logist = get_assigned_logist_id(req)
+            if not is_request_open_for_offers(status) or assigned_logist:
                 continue
             canonical_id = req.get("id", req_id)
             canonical_key = str(canonical_id)
@@ -18471,7 +20453,18 @@ async def show_active_requests(message: types.Message, state: FSMContext):
         for req_id, req in logistics_requests.items():
             if not isinstance(req, dict):
                 continue
-            status = req.get("status", "active")
+            request_owner_id = (
+                req.get("customer_id")
+                or req.get("created_by")
+                or req.get("exporter_id")
+            )
+            status = get_effective_request_status(
+                req.get("id", req_id),
+                "logistics",
+                req,
+                request_owner_id=request_owner_id,
+                request_exporter_id=req.get("exporter_id"),
+            )
             assigned_logist = get_assigned_logist_id(req)
             if not is_request_open_for_offers(status) or assigned_logist:
                 continue
@@ -18555,7 +20548,10 @@ async def show_active_requests(message: types.Message, state: FSMContext):
         for req_id, req in shipping_requests.items():
             if not isinstance(req, dict):
                 continue
-            if not same_id(req.get("exporter_id"), user_id):
+            request_owner_id = (
+                req.get("exporter_id") or req.get("customer_id") or req.get("created_by")
+            )
+            if not same_id(request_owner_id, user_id):
                 continue
             canonical_id = req.get("id", req_id)
             canonical_key = f"exporter:{canonical_id}"
@@ -18592,20 +20588,50 @@ async def show_active_requests(message: types.Message, state: FSMContext):
         for req_id, req in shipping_requests.items():
             if not isinstance(req, dict):
                 continue
-            if not is_request_open_for_expeditor(req.get("status")):
-                continue
-            if has_assigned_expeditor(req):
-                continue
-            if not has_assigned_logist(req):
-                continue
             request_owner_id = (
                 req.get("customer_id")
                 or req.get("created_by")
                 or req.get("exporter_id")
                 or req.get("farmer_id")
-                or req.get("logist_id")
+                or req.get("user_id")
+                or (
+                    req.get("logist_id")
+                    if not (req.get("assigned_logist_id") or req.get("selected_logistic"))
+                    else None
+                )
             )
+            status = get_effective_request_status(
+                req.get("id", req_id),
+                "exporter",
+                req,
+                request_owner_id=request_owner_id,
+                request_exporter_id=(
+                    req.get("exporter_id")
+                    or req.get("customer_id")
+                    or req.get("created_by")
+                ),
+            )
+            if not is_request_open_for_expeditor(status):
+                continue
+            if has_assigned_expeditor(req):
+                continue
+            if not has_assigned_logist(req):
+                continue
             if same_id(request_owner_id, user_id):
+                continue
+            if (
+                get_request_delivery_guard_state(
+                    req.get("id", req_id),
+                    "exporter",
+                    request_owner_id=request_owner_id,
+                    request_exporter_id=(
+                        req.get("exporter_id")
+                        or req.get("customer_id")
+                        or req.get("created_by")
+                    ),
+                )
+                is not None
+            ):
                 continue
             canonical_id = req.get("id", req_id)
             canonical_key = f"exporter:{canonical_id}"
@@ -18618,20 +20644,42 @@ async def show_active_requests(message: types.Message, state: FSMContext):
         for req_id, req in logistics_requests.items():
             if not isinstance(req, dict):
                 continue
-            if not is_request_open_for_expeditor(req.get("status")):
-                continue
-            if has_assigned_expeditor(req):
-                continue
-            if not has_assigned_logist(req):
-                continue
             request_owner_id = (
                 req.get("customer_id")
                 or req.get("created_by")
                 or req.get("exporter_id")
                 or req.get("farmer_id")
-                or req.get("logist_id")
+                or req.get("user_id")
+                or (
+                    req.get("logist_id")
+                    if not (req.get("assigned_logist_id") or req.get("selected_logistic"))
+                    else None
+                )
             )
+            status = get_effective_request_status(
+                req.get("id", req_id),
+                "logistics",
+                req,
+                request_owner_id=request_owner_id,
+                request_exporter_id=req.get("exporter_id"),
+            )
+            if not is_request_open_for_expeditor(status):
+                continue
+            if has_assigned_expeditor(req):
+                continue
+            if not has_assigned_logist(req):
+                continue
             if same_id(request_owner_id, user_id):
+                continue
+            if (
+                get_request_delivery_guard_state(
+                    req.get("id", req_id),
+                    "logistics",
+                    request_owner_id=request_owner_id,
+                    request_exporter_id=req.get("exporter_id"),
+                )
+                is not None
+            ):
                 continue
             canonical_id = req.get("id", req_id)
             canonical_key = f"logistics:{canonical_id}"
@@ -18644,20 +20692,40 @@ async def show_active_requests(message: types.Message, state: FSMContext):
         for req_id, req in farmer_shipping_requests.items():
             if not isinstance(req, dict):
                 continue
-            if not is_request_open_for_expeditor(req.get("status")):
+            request_owner_id = (
+                req.get("farmer_id")
+                or req.get("user_id")
+                or req.get("created_by")
+                or req.get("customer_id")
+                or req.get("exporter_id")
+                or (
+                    req.get("logist_id")
+                    if not (req.get("assigned_logist_id") or req.get("selected_logistic"))
+                    else None
+                )
+            )
+            status = get_effective_request_status(
+                req.get("id", req_id),
+                "farmer",
+                req,
+                request_owner_id=request_owner_id,
+            )
+            if not is_request_open_for_expeditor(status):
                 continue
             if has_assigned_expeditor(req):
                 continue
             if not has_assigned_logist(req):
                 continue
-            request_owner_id = (
-                req.get("farmer_id")
-                or req.get("created_by")
-                or req.get("customer_id")
-                or req.get("exporter_id")
-                or req.get("logist_id")
-            )
             if same_id(request_owner_id, user_id):
+                continue
+            if (
+                get_request_delivery_guard_state(
+                    req.get("id", req_id),
+                    "farmer",
+                    request_owner_id=request_owner_id,
+                )
+                is not None
+            ):
                 continue
             canonical_id = req.get("id", req_id)
             canonical_key = f"farmer:{canonical_id}"
@@ -18670,20 +20738,40 @@ async def show_active_requests(message: types.Message, state: FSMContext):
         for req_id, req in farmer_logistics_requests.items():
             if not isinstance(req, dict):
                 continue
-            if not is_request_open_for_expeditor(req.get("status")):
+            request_owner_id = (
+                req.get("farmer_id")
+                or req.get("user_id")
+                or req.get("created_by")
+                or req.get("customer_id")
+                or req.get("exporter_id")
+                or (
+                    req.get("logist_id")
+                    if not (req.get("assigned_logist_id") or req.get("selected_logistic"))
+                    else None
+                )
+            )
+            status = get_effective_request_status(
+                req.get("id", req_id),
+                "farmer",
+                req,
+                request_owner_id=request_owner_id,
+            )
+            if not is_request_open_for_expeditor(status):
                 continue
             if has_assigned_expeditor(req):
                 continue
             if not has_assigned_logist(req):
                 continue
-            request_owner_id = (
-                req.get("farmer_id")
-                or req.get("created_by")
-                or req.get("customer_id")
-                or req.get("exporter_id")
-                or req.get("logist_id")
-            )
             if same_id(request_owner_id, user_id):
+                continue
+            if (
+                get_request_delivery_guard_state(
+                    req.get("id", req_id),
+                    "farmer",
+                    request_owner_id=request_owner_id,
+                )
+                is not None
+            ):
                 continue
             canonical_id = req.get("id", req_id)
             canonical_key = f"farmer:{canonical_id}"
@@ -18831,14 +20919,32 @@ async def expeditor_respond_exporter_request(
         or req.get("created_by")
         or req.get("exporter_id")
         or req.get("farmer_id")
-        or req.get("logist_id")
+        or req.get("user_id")
     )
+    if not request_owner_id:
+        legacy_logist_owner_id = req.get("logist_id")
+        has_assigned_logist_id = bool(
+            req.get("assigned_logist_id") or req.get("selected_logistic")
+        )
+        if legacy_logist_owner_id and not has_assigned_logist_id:
+            request_owner_id = legacy_logist_owner_id
     if same_id(request_owner_id, expeditor_id):
         await callback.answer(
             "❌ Нельзя откликнуться на собственную заявку", show_alert=True
         )
         return
-    if not is_request_open_for_expeditor(req.get("status")):
+    request_status = get_effective_request_status(
+        request_id,
+        request_source,
+        req,
+        request_owner_id=request_owner_id,
+        request_exporter_id=(
+            req.get("exporter_id")
+            or req.get("customer_id")
+            or req.get("created_by")
+        ),
+    )
+    if not is_request_open_for_expeditor(request_status):
         await callback.answer("❌ Заявка уже не принимает отклики", show_alert=True)
         return
     if has_assigned_expeditor(req):
@@ -18849,26 +20955,63 @@ async def expeditor_respond_exporter_request(
             "❌ Сначала выберите логиста по заявке", show_alert=True
         )
         return
+    for d in deliveries.values():
+        if not isinstance(d, dict):
+            continue
+        if not same_id(d.get("request_id"), request_id):
+            continue
+        d_source = str(d.get("source") or "").strip().lower()
+        if d_source == "logistic":
+            d_source = "logistics"
+        if d_source not in {"exporter", "farmer", "logistics"}:
+            inferred_source = infer_logistic_offer_source(d.get("request_id"))
+            if inferred_source in {"exporter", "farmer", "logistics"}:
+                d_source = inferred_source
+            else:
+                continue
+        if request_source == "exporter":
+            if d_source not in {"", "exporter"}:
+                continue
+            d_owner_id = d.get("exporter_id") or d.get("customer_id") or d.get("created_by")
+        else:
+            if d_source != "logistics":
+                continue
+            d_owner_id = (
+                d.get("customer_id")
+                or d.get("created_by")
+                or d.get("exporter_id")
+            )
+            if not d_owner_id:
+                legacy_logist_owner_id = d.get("logist_id")
+                has_assigned_logist_id = bool(
+                    d.get("assigned_logist_id") or d.get("selected_logistic")
+                )
+                if legacy_logist_owner_id and not has_assigned_logist_id:
+                    d_owner_id = legacy_logist_owner_id
+        if (
+            request_owner_id
+            and d_owner_id not in {None, ""}
+            and not same_id(d_owner_id, request_owner_id)
+        ):
+            continue
+        delivery_status = normalize_transition_status(d.get("status"))
+        if delivery_status in {"completed", "cancelled"}:
+            await callback.answer(
+                "❌ По заявке уже есть закрытая доставка", show_alert=True
+            )
+            return
+        if delivery_status in {"in_progress", "expeditor_selected"}:
+            await callback.answer(
+                "❌ По заявке уже есть доставка в работе", show_alert=True
+            )
+            return
     duplicate_offer = next(
         (
             o
-            for o in expeditor_request_offers.values()
-            if same_id(o.get("request_id"), request_id)
-            and same_id(o.get("expeditor_id"), expeditor_id)
-            and (
-                (
-                    str(o.get("source") or "").strip().lower() == "logistic"
-                    and request_source == "logistics"
-                )
-                or (
-                    (
-                        str(o.get("source") or "").strip().lower()
-                        if str(o.get("source") or "").strip().lower() != "logistic"
-                        else "logistics"
-                    )
-                    == request_source
-                )
+            for _, _, o in iter_request_related_expeditor_offers(
+                request_id, request_source
             )
+            if same_id(o.get("expeditor_id"), expeditor_id)
             and normalize_transition_status(o.get("status"))
             not in {"cancelled", "rejected", "completed"}
         ),
@@ -18888,10 +21031,11 @@ async def expeditor_respond_exporter_request(
     route_from = req.get("route_from") or req.get("from_city") or "—"
     route_to = req.get("route_to") or req.get("to_city") or "—"
     source_label = "логистики" if request_source == "logistics" else "экспортёра"
+    req_volume = get_safe_float(req.get("volume"), 0)
 
     text = (
         f"💼 <b>Ваше предложение по заявке {source_label} #{request_id}</b>\n\n"
-        f"🌾 {req.get('culture','—')} • {req.get('volume',0):.0f} т\n"
+        f"🌾 {req.get('culture','—')} • {req_volume:.0f} т\n"
         f"📍 {route_from} → {route_to}\n"
         f"🚛 Транспорт: {req.get('transport_type','Не указан')}\n"
         f"💰 Ожидаемая ставка: {req.get('desired_price','—')} ₽/т\n\n"
@@ -18936,7 +21080,7 @@ async def exp_req_enter_price(message: types.Message, state: FSMContext):
         return
 
     try:
-        price = float(message.text.replace(" ", "").replace(",", "."))
+        price = parse_price(message.text)
         if price < 0:
             raise ValueError
     except ValueError:
@@ -18971,7 +21115,24 @@ async def exp_req_enter_price(message: types.Message, state: FSMContext):
         await message.answer("❌ Заявка не найдена")
         await state.finish()
         return
-    if not is_request_open_for_expeditor(req.get("status")):
+    request_status = get_effective_request_status(
+        request_id,
+        request_source,
+        req,
+        request_owner_id=(
+            req.get("customer_id")
+            or req.get("created_by")
+            or req.get("exporter_id")
+            or req.get("farmer_id")
+            or req.get("user_id")
+        ),
+        request_exporter_id=(
+            req.get("exporter_id")
+            or req.get("customer_id")
+            or req.get("created_by")
+        ),
+    )
+    if not is_request_open_for_expeditor(request_status):
         await message.answer("❌ Заявка уже не принимает отклики.")
         await state.finish()
         return
@@ -18988,12 +21149,67 @@ async def exp_req_enter_price(message: types.Message, state: FSMContext):
         or req.get("created_by")
         or req.get("exporter_id")
         or req.get("farmer_id")
-        or req.get("logist_id")
+        or req.get("user_id")
     )
+    if not request_owner_id:
+        legacy_logist_owner_id = req.get("logist_id")
+        has_assigned_logist_id = bool(
+            req.get("assigned_logist_id") or req.get("selected_logistic")
+        )
+        if legacy_logist_owner_id and not has_assigned_logist_id:
+            request_owner_id = legacy_logist_owner_id
     if same_id(request_owner_id, expeditor_id):
         await message.answer("❌ Нельзя откликнуться на собственную заявку.")
         await state.finish()
         return
+    for d in deliveries.values():
+        if not isinstance(d, dict):
+            continue
+        if not same_id(d.get("request_id"), request_id):
+            continue
+        d_source = str(d.get("source") or "").strip().lower()
+        if d_source == "logistic":
+            d_source = "logistics"
+        if d_source not in {"exporter", "farmer", "logistics"}:
+            inferred_source = infer_logistic_offer_source(d.get("request_id"))
+            if inferred_source in {"exporter", "farmer", "logistics"}:
+                d_source = inferred_source
+            else:
+                continue
+        if request_source == "exporter":
+            if d_source not in {"", "exporter"}:
+                continue
+            d_owner_id = d.get("exporter_id") or d.get("customer_id") or d.get("created_by")
+        else:
+            if d_source != "logistics":
+                continue
+            d_owner_id = (
+                d.get("customer_id")
+                or d.get("created_by")
+                or d.get("exporter_id")
+            )
+            if not d_owner_id:
+                legacy_logist_owner_id = d.get("logist_id")
+                has_assigned_logist_id = bool(
+                    d.get("assigned_logist_id") or d.get("selected_logistic")
+                )
+                if legacy_logist_owner_id and not has_assigned_logist_id:
+                    d_owner_id = legacy_logist_owner_id
+        if (
+            request_owner_id
+            and d_owner_id not in {None, ""}
+            and not same_id(d_owner_id, request_owner_id)
+        ):
+            continue
+        delivery_status = normalize_transition_status(d.get("status"))
+        if delivery_status in {"completed", "cancelled"}:
+            await message.answer("❌ По заявке уже есть закрытая доставка.")
+            await state.finish()
+            return
+        if delivery_status in {"in_progress", "expeditor_selected"}:
+            await message.answer("❌ По заявке уже есть доставка в работе.")
+            await state.finish()
+            return
     exp_user = get_user_by_id(expeditor_id) or {}
     if not exp_user:
         await message.answer("❌ Профиль экспедитора не найден.")
@@ -19004,23 +21220,10 @@ async def exp_req_enter_price(message: types.Message, state: FSMContext):
     duplicate_offer = next(
         (
             o
-            for o in expeditor_request_offers.values()
-            if same_id(o.get("request_id"), request_id)
-            and same_id(o.get("expeditor_id"), expeditor_id)
-            and (
-                (
-                    str(o.get("source") or "").strip().lower() == "logistic"
-                    and request_source == "logistics"
-                )
-                or (
-                    (
-                        str(o.get("source") or "").strip().lower()
-                        if str(o.get("source") or "").strip().lower() != "logistic"
-                        else "logistics"
-                    )
-                    == request_source
-                )
+            for _, _, o in iter_request_related_expeditor_offers(
+                request_id, request_source
             )
+            if same_id(o.get("expeditor_id"), expeditor_id)
             and normalize_transition_status(o.get("status"))
             not in {"cancelled", "rejected", "completed"}
         ),
@@ -19065,7 +21268,11 @@ async def exp_req_enter_price(message: types.Message, state: FSMContext):
         "customer_id": req.get("customer_id")
         or req.get("created_by")
         or req.get("exporter_id")
-        or req.get("logist_id"),
+        or (
+            req.get("logist_id")
+            if not (req.get("assigned_logist_id") or req.get("selected_logistic"))
+            else None
+        ),
         "company": company,
         "terms": terms,
         "price": price,
@@ -19093,12 +21300,18 @@ async def exp_req_enter_price(message: types.Message, state: FSMContext):
             req.get("customer_id")
             or req.get("created_by")
             or req.get("exporter_id")
-            or req.get("logist_id")
+            or (
+                req.get("logist_id")
+                if not (req.get("assigned_logist_id") or req.get("selected_logistic"))
+                else None
+            )
         )
         if owner_id and get_user_by_id(owner_id):
             exp_user = get_user_by_id(expeditor_id) or {}
             route_from = req.get("route_from") or req.get("from_city") or "—"
             route_to = req.get("route_to") or req.get("to_city") or "—"
+            req_volume = get_safe_float(req.get("volume"), 0)
+            offer_price = get_safe_float(price, 0)
             owner_kb = InlineKeyboardMarkup(row_width=1)
             owner_kb.add(
                 InlineKeyboardButton(
@@ -19111,9 +21324,9 @@ async def exp_req_enter_price(message: types.Message, state: FSMContext):
                     owner_id,
                     "📬 <b>Новое предложение экспедитора по вашей заявке логистики</b>\n\n"
                     f"🆔 Заявка #{request_id}\n"
-                    f"🌾 {req.get('culture','—')} • {req.get('volume',0):.0f} т\n"
+                    f"🌾 {req.get('culture','—')} • {req_volume:.0f} т\n"
                     f"📍 {route_from} → {route_to}\n"
-                    f"💰 Ставка экспедитора: {price:,.0f} ₽/т\n\n"
+                    f"💰 Ставка экспедитора: {offer_price:,.0f} ₽/т\n\n"
                     f"👤 {exp_user.get('name','Экспедитор')}\n"
                     f"📞 <code>{exp_user.get('phone','Не указан')}</code>",
                     reply_markup=owner_kb,
@@ -19142,15 +21355,17 @@ async def notify_exporter_about_expeditor_request_offer(req: dict, offer: dict):
         return
     route_from = req.get("route_from") or req.get("from_city") or "—"
     route_to = req.get("route_to") or req.get("to_city") or "—"
+    req_volume = get_safe_float(req.get("volume"), 0)
+    offer_price = get_safe_float(offer.get("price"), 0)
     msg = (
         "📬 <b>Новое предложение экспедитора по вашей заявке на логистику</b>\n\n"
         f"🆔 Заявка #{req_id or '—'}\n"
-        f"🌾 {req.get('culture','—')} • {req.get('volume',0):.0f} т\n"
+        f"🌾 {req.get('culture','—')} • {req_volume:.0f} т\n"
         f"📍 {route_from} → {route_to}\n"
         f"🚛 Транспорт: {req.get('transport_type','—')}\n\n"
         f"🛠 <b>Услуги:</b> {offer.get('services','—')}\n"
         f"💬 <b>Условия:</b> {offer.get('terms','—')}\n"
-        f"💰 <b>Ставка экспедитора:</b> {offer.get('price',0):,.0f} ₽/т\n"
+        f"💰 <b>Ставка экспедитора:</b> {offer_price:,.0f} ₽/т\n"
         f"📅 <b>Отклик:</b> {offer.get('created_at','—')}\n\n"
         f"👤 <b>Экспедитор:</b> {exp_user.get('name','Не указано')} "
         f"({offer.get('company','Экспедитор')})\n"
@@ -19215,8 +21430,14 @@ async def view_expeditor_offers_for_request(callback: types.CallbackQuery):
             req.get("customer_id")
             or req.get("created_by")
             or req.get("exporter_id")
-            or req.get("logist_id")
         )
+        if not owner_id:
+            legacy_logist_owner_id = req.get("logist_id")
+            has_assigned_logist_id = bool(
+                req.get("assigned_logist_id") or req.get("selected_logistic")
+            )
+            if legacy_logist_owner_id and not has_assigned_logist_id:
+                owner_id = legacy_logist_owner_id
     else:
         owner_id = req.get("exporter_id") or req.get("customer_id") or req.get(
             "created_by"
@@ -19227,36 +21448,7 @@ async def view_expeditor_offers_for_request(callback: types.CallbackQuery):
         )
         return
 
-    offers_all = []
-    seen_offer_ids = set()
-    for offer_key, offer in expeditor_request_offers.items():
-        if not isinstance(offer, dict):
-            continue
-        if not same_id(offer.get("request_id"), request_id):
-            continue
-        offer_source = str(offer.get("source") or "").strip().lower()
-        if offer_source == "logistic":
-            offer_source = "logistics"
-        if offer_source not in {"exporter", "farmer", "logistics"}:
-            inferred_source = infer_logistic_offer_source(offer.get("request_id"))
-            if inferred_source in {"exporter", "farmer", "logistics"}:
-                offer_source = inferred_source
-            else:
-                continue
-        if offer_source != request_source:
-            continue
-
-        canonical_offer_id = offer.get("id", offer_key)
-        if canonical_offer_id is None:
-            canonical_offer_id = offer_key
-        canonical_key = str(canonical_offer_id)
-        if canonical_key in seen_offer_ids:
-            continue
-        seen_offer_ids.add(canonical_key)
-
-        if offer.get("id") is None and canonical_offer_id is not None:
-            offer["id"] = canonical_offer_id
-        offers_all.append(offer)
+    offers_all = list(iter_request_related_expeditor_offers(request_id, request_source))
 
     if not offers_all:
         await callback.answer(
@@ -19266,19 +21458,20 @@ async def view_expeditor_offers_for_request(callback: types.CallbackQuery):
 
     # По умолчанию показываем только актуальные офферы.
     active_offers = [
-        o
-        for o in offers_all
-        if not is_terminal_expeditor_offer_status(o.get("status") or "pending")
+        offer_info
+        for offer_info in offers_all
+        if not is_terminal_expeditor_offer_status(offer_info[2].get("status") or "pending")
     ]
     offers = active_offers or offers_all
     hidden_count = len(offers_all) - len(offers)
 
     route_from = req.get("route_from") or req.get("from_city") or "—"
     route_to = req.get("route_to") or req.get("to_city") or "—"
+    req_volume = get_safe_float(req.get("volume"), 0)
     source_label = "логистики" if request_source == "logistics" else "экспедиторов"
     text = (
         f"📄 <b>Предложения {source_label} по заявке #{request_id}</b>\n\n"
-        f"🌾 {req.get('culture','—')} • {req.get('volume',0):.0f} т\n"
+        f"🌾 {req.get('culture','—')} • {req_volume:.0f} т\n"
         f"📍 {route_from} → {route_to}\n"
         f"🚛 Транспорт: {req.get('transport_type','—')}\n\n"
         f"Всего предложений: <b>{len(offers)}</b>\n"
@@ -19287,8 +21480,7 @@ async def view_expeditor_offers_for_request(callback: types.CallbackQuery):
         text += f"🗃 В архиве: <b>{hidden_count}</b>\n"
 
     kb = InlineKeyboardMarkup(row_width=1)
-    for offer in offers:
-        offer_id = offer.get("id")
+    for storage_name, offer_id, offer in offers:
         exp_id = offer.get("expeditor_id")
         if offer_id is None:
             continue
@@ -19300,13 +21492,13 @@ async def view_expeditor_offers_for_request(callback: types.CallbackQuery):
             or exp_user.get("name")
             or "Экспедитор"
         )
-        price = offer.get("price", 0)
+        price = get_safe_float(offer.get("price"), 0)
         short_terms = (offer.get("terms") or "—").split("\n")[0][:40]
         label = f"{company} • {price:,.0f} ₽/т • {short_terms}".replace(",", " ")
         kb.add(
             InlineKeyboardButton(
                 label,
-                callback_data=f"view_expeditor_offer_for_request:{request_source}:{offer_id}",
+                callback_data=f"view_expeditor_offer_for_request:{request_source}:{storage_name}_{offer_id}",
             )
         )
 
@@ -19318,7 +21510,7 @@ async def view_expeditor_offers_for_request(callback: types.CallbackQuery):
                 if request_source == "logistics"
                 else (
                     f"view_my_request_{request_id}"
-                    if same_id(req.get("exporter_id"), user_id)
+                    if same_id(owner_id, user_id)
                     else f"view_shipping_request:{request_id}"
                 )
             ),
@@ -19353,8 +21545,9 @@ async def view_expeditor_offer_for_request(callback: types.CallbackQuery):
         await callback.answer("❌ Ошибка данных", show_alert=True)
         return
 
-    offer_id = int(raw_offer_id) if raw_offer_id.isdigit() else raw_offer_id
-    resolved_offer_id, offer = find_expeditor_request_offer_by_id(offer_id)
+    offer_storage, resolved_offer_id, offer = find_request_related_expeditor_offer_by_ref(
+        raw_offer_id
+    )
     if not offer:
         await callback.answer("❌ Предложение не найдено", show_alert=True)
         return
@@ -19396,8 +21589,14 @@ async def view_expeditor_offer_for_request(callback: types.CallbackQuery):
             req.get("customer_id")
             or req.get("created_by")
             or req.get("exporter_id")
-            or req.get("logist_id")
         )
+        if not owner_id:
+            legacy_logist_owner_id = req.get("logist_id")
+            has_assigned_logist_id = bool(
+                req.get("assigned_logist_id") or req.get("selected_logistic")
+            )
+            if legacy_logist_owner_id and not has_assigned_logist_id:
+                owner_id = legacy_logist_owner_id
     else:
         owner_id = req.get("exporter_id") or req.get("customer_id") or req.get(
             "created_by"
@@ -19411,16 +21610,18 @@ async def view_expeditor_offer_for_request(callback: types.CallbackQuery):
 
     route_from = req.get("route_from") or req.get("from_city") or "—"
     route_to = req.get("route_to") or req.get("to_city") or "—"
+    req_volume = get_safe_float(req.get("volume"), 0)
+    offer_price = get_safe_float(offer.get("price"), 0)
 
     text = (
         f"📄 <b>Предложение экспедитора по заявке #{request_id}</b>\n\n"
         f"🌾 Культура: <b>{req.get('culture','—')}</b>\n"
-        f"📊 Объём: <b>{req.get('volume',0):.0f} т</b>\n"
+        f"📊 Объём: <b>{req_volume:.0f} т</b>\n"
         f"📍 Маршрут: <b>{route_from} → {route_to}</b>\n"
         f"🚛 Транспорт: <b>{req.get('transport_type','—')}</b>\n\n"
         f"🛠 <b>Услуги:</b> {offer.get('services','—')}\n"
         f"💬 <b>Условия:</b> {offer.get('terms','—')}\n"
-        f"💰 <b>Ставка:</b> {offer.get('price',0):,.0f} ₽/т\n"
+        f"💰 <b>Ставка:</b> {offer_price:,.0f} ₽/т\n"
         f"📅 <b>Отклик:</b> {offer.get('created_at','—')}\n\n"
         f"👤 <b>Экспедитор:</b> {exp_user.get('name','Не указано')}\n"
         f"🏢 <b>Компания:</b> {offer.get('company','Экспедитор')}\n"
@@ -19433,8 +21634,13 @@ async def view_expeditor_offer_for_request(callback: types.CallbackQuery):
     offer_status = normalize_transition_status(offer.get("status") or "pending")
     offer_status_text = {
         "pending": "⏳ Ожидает решения",
+        "open": "🟢 Активно",
+        "new": "🟢 Активно",
         "active": "🟢 Активно",
         "accepted": "✅ Выбрано",
+        "assigned": "✅ Выбрано",
+        "selected": "✅ Выбрано",
+        "reserved": "✅ Выбрано",
         "in_progress": "🚚 В работе",
         "completed": "✅ Завершено",
         "rejected": "❌ Отклонено",
@@ -19442,18 +21648,33 @@ async def view_expeditor_offer_for_request(callback: types.CallbackQuery):
     }.get(offer_status, offer.get("status", "—"))
     text += f"\n📊 <b>Статус оффера:</b> {offer_status_text}\n"
 
+    delivery_guard_state = get_request_delivery_guard_state(
+        request_id,
+        request_source,
+        request_owner_id=owner_id,
+        request_exporter_id=owner_id if request_source == "exporter" else req.get("exporter_id"),
+    )
+
     kb = InlineKeyboardMarkup(row_width=1)
+    request_status = get_effective_request_status(
+        request_id,
+        request_source,
+        req,
+        request_owner_id=owner_id,
+        request_exporter_id=owner_id if request_source == "exporter" else req.get("exporter_id"),
+    )
     can_choose_offer = (
-        offer_status in {"pending", "active"}
-        and is_request_open_for_expeditor(req.get("status"))
+        offer_status in MUTABLE_EXPEDITOR_OFFER_STATUSES
+        and is_request_open_for_expeditor(request_status)
         and not has_assigned_expeditor(req)
         and has_assigned_logist(req)
+        and delivery_guard_state is None
     )
     if can_choose_offer:
         kb.add(
             InlineKeyboardButton(
                 "✅ Выбрать этого экспедитора",
-                callback_data=f"choose_expeditor_offer_for_request:{request_source}:{offer_id}",
+                callback_data=f"choose_expeditor_offer_for_request:{request_source}:{offer_storage}_{offer_id}",
             )
         )
     kb.add(
@@ -19470,7 +21691,7 @@ async def view_expeditor_offer_for_request(callback: types.CallbackQuery):
                 if request_source == "logistics"
                 else (
                     f"view_my_request_{request_id}"
-                    if same_id(req.get("exporter_id"), user_id)
+                    if same_id(owner_id, user_id)
                     else f"view_shipping_request:{request_id}"
                 )
             ),
@@ -19504,8 +21725,9 @@ async def view_shipping_request(callback: types.CallbackQuery, state: FSMContext
     role = user.get("role")
 
     exporter_id = req.get("exporter_id")
+    exporter_owner_id = exporter_id or req.get("customer_id") or req.get("created_by")
     if not (
-        (role == "exporter" and same_id(exporter_id, user_id))
+        (role == "exporter" and same_id(exporter_owner_id, user_id))
         or is_logistic_role(role)
         or is_expeditor_role(role)
         or role == "admin"
@@ -19513,7 +21735,7 @@ async def view_shipping_request(callback: types.CallbackQuery, state: FSMContext
         await callback.answer("❌ Нет доступа к этой заявке", show_alert=True)
         return
 
-    exporter = get_user_by_id(exporter_id) if exporter_id else {}
+    exporter = get_user_by_id(exporter_owner_id) if exporter_owner_id else {}
 
     culture = req.get("culture", "—")
     volume = req.get("volume", 0)
@@ -19522,7 +21744,13 @@ async def view_shipping_request(callback: types.CallbackQuery, state: FSMContext
     transport_type = req.get("transport_type", "Не указан")
     desired_price = req.get("desired_price", 0)
     loading_date = req.get("loading_date") or req.get("desired_date") or "Не указана"
-    status = normalize_transition_status(req.get("status") or "pending")
+    status = get_effective_request_status(
+        request_id,
+        "exporter",
+        req,
+        request_owner_id=exporter_owner_id,
+        request_exporter_id=exporter_owner_id,
+    )
     if is_logistic_role(role):
         assigned_logist_id = get_assigned_logist_id(req)
         if (
@@ -19581,18 +21809,40 @@ async def view_shipping_request(callback: types.CallbackQuery, state: FSMContext
         f"📧 <code>{exporter.get('email','Не указан')}</code>\n"
     )
 
+    delivery_guard_state = get_request_delivery_guard_state(
+        request_id,
+        "exporter",
+        request_owner_id=exporter_owner_id,
+        request_exporter_id=exporter_owner_id,
+    )
+
     keyboard = InlineKeyboardMarkup(row_width=1)
 
     # Кнопки для экспортёра (владелец заявки)
-    if role == "exporter" and same_id(exporter_id, user_id):
-        # здесь могут быть уже существующие кнопки редактирования/удаления и витрина логистов
-        # ...
-        keyboard.add(
-            InlineKeyboardButton(
-                "📄 Предложения экспедиторов",
-                callback_data=f"view_expeditor_offers_for_request:{request_id}",
-            )
+    if role == "exporter" and same_id(exporter_owner_id, user_id):
+        has_expeditor_offer_history = any(
+            iter_request_related_expeditor_offers(request_id, "exporter")
         )
+        if status in {
+            "assigned",
+            "expeditor_selected",
+            "in_progress",
+            "completed",
+            "cancelled",
+        }:
+            keyboard.add(
+                InlineKeyboardButton(
+                    "📦 Доставка",
+                    callback_data=f"view_delivery_by_request_{request_id}",
+                )
+            )
+        if has_assigned_logist(req) or has_assigned_expeditor(req) or has_expeditor_offer_history:
+            keyboard.add(
+                InlineKeyboardButton(
+                    "📄 Предложения экспедиторов",
+                    callback_data=f"view_expeditor_offers_for_request:{request_id}",
+                )
+            )
 
     can_respond_logistic = is_request_open_for_offers(status) and not (
         has_assigned_logist(req)
@@ -19601,6 +21851,7 @@ async def view_shipping_request(callback: types.CallbackQuery, state: FSMContext
         is_request_open_for_expeditor(status)
         and not has_assigned_expeditor(req)
         and has_assigned_logist(req)
+        and delivery_guard_state is None
     )
 
     # Кнопки для логиста (как было)
@@ -19622,7 +21873,7 @@ async def view_shipping_request(callback: types.CallbackQuery, state: FSMContext
         )
 
     back_callback = "back_to_main"
-    if role == "exporter" and same_id(exporter_id, user_id):
+    if role == "exporter" and same_id(exporter_owner_id, user_id):
         back_callback = "back_to_shipping_requests"
     elif is_logistic_role(role):
         back_callback = "back_to_requests"
@@ -19694,7 +21945,7 @@ async def logistic_exporter_enter_price(message: types.Message, state: FSMContex
         return
 
     try:
-        price = float(message.text.replace(" ", "").replace(",", "."))
+        price = parse_price(message.text)
         if price < 0:
             raise ValueError
     except ValueError:
@@ -19715,7 +21966,19 @@ async def logistic_exporter_enter_price(message: types.Message, state: FSMContex
         await message.answer("❌ Заявка не найдена")
         await state.finish()
         return
-    if not is_request_open_for_offers(req.get("status")):
+    request_owner_id = (
+        req.get("exporter_id")
+        or req.get("customer_id")
+        or req.get("created_by")
+    )
+    request_status = get_effective_request_status(
+        request_id,
+        "exporter",
+        req,
+        request_owner_id=request_owner_id,
+        request_exporter_id=request_owner_id,
+    )
+    if not is_request_open_for_offers(request_status):
         await message.answer("❌ Заявка уже не принимает отклики.")
         await state.finish()
         return
@@ -19783,7 +22046,7 @@ async def logistic_exporter_enter_price(message: types.Message, state: FSMContex
     save_logistic_offers()
 
     req["offers_count"] = count_logistic_offers_for_request(request_id, "exporter")
-    if is_request_open_for_offers(req.get("status")):
+    if is_request_open_for_offers(request_status):
         req["status"] = "has_offers"
     save_shipping_requests()
 
@@ -19811,15 +22074,17 @@ async def notify_exporter_about_logistic_request_offer(req: dict, offer: dict):
         return
     route_from = req.get("route_from") or req.get("from_city") or "—"
     route_to = req.get("route_to") or req.get("to_city") or "—"
+    req_volume = get_safe_float(req.get("volume"), 0)
+    offer_price = get_safe_float(offer.get("price"), 0)
     msg = (
         "📬 <b>Новое предложение логиста по вашей заявке на логистику</b>\n\n"
         f"🆔 Заявка #{req_id or '—'}\n"
-        f"🌾 {req.get('culture','—')} • {req.get('volume',0):.0f} т\n"
+        f"🌾 {req.get('culture','—')} • {req_volume:.0f} т\n"
         f"📍 {route_from} → {route_to}\n"
         f"🚛 Транспорт: {req.get('transport_type','—')}\n\n"
         f"🚚 <b>Тип перевозки:</b> {offer.get('vehicle_type','—')}\n"
         f"💬 <b>Условия логиста:</b> {offer.get('terms','—')}\n"
-        f"💰 <b>Ставка логиста:</b> {offer.get('price',0):,.0f} ₽/т\n"
+        f"💰 <b>Ставка логиста:</b> {offer_price:,.0f} ₽/т\n"
         f"📅 <b>Отклик:</b> {offer.get('created_at','—')}\n\n"
         f"👤 <b>Логист:</b> {logist_user.get('name','Не указано')} "
         f"({offer.get('company','Логист')})\n"
@@ -19864,7 +22129,10 @@ async def view_logistic_offers_for_request(callback: types.CallbackQuery):
         return
     user_id = callback.from_user.id
     user_role = (get_user_by_id(user_id) or {}).get("role")
-    if not (user_role == "admin" or same_id(req.get("exporter_id"), user_id)):
+    request_owner_id = (
+        req.get("exporter_id") or req.get("customer_id") or req.get("created_by")
+    )
+    if not (user_role == "admin" or same_id(request_owner_id, user_id)):
         await callback.answer("❌ Доступно только владельцу заявки", show_alert=True)
         return
 
@@ -19904,9 +22172,10 @@ async def view_logistic_offers_for_request(callback: types.CallbackQuery):
 
     route_from = req.get("route_from") or req.get("from_city") or "—"
     route_to = req.get("route_to") or req.get("to_city") or "—"
+    req_volume = get_safe_float(req.get("volume"), 0)
     text = (
         f"📄 <b>Предложения логистов по заявке #{request_id}</b>\n\n"
-        f"🌾 {req.get('culture','—')} • {req.get('volume',0):.0f} т\n"
+        f"🌾 {req.get('culture','—')} • {req_volume:.0f} т\n"
         f"📍 {route_from} → {route_to}\n"
         f"🚛 Транспорт: {req.get('transport_type','—')}\n\n"
         f"Всего предложений: <b>{len(offers)}</b>\n"
@@ -19920,7 +22189,7 @@ async def view_logistic_offers_for_request(callback: types.CallbackQuery):
         if offer_id is None:
             continue
         company = offer.get("company", "Логист")
-        price = offer.get("price", 0)
+        price = get_safe_float(offer.get("price"), 0)
         short_terms = (offer.get("terms") or "—").split("\n")[0][:40]
         label = f"{company} • {price:,.0f} ₽/т • {short_terms}".replace(",", " ")
         kb.add(
@@ -19973,7 +22242,10 @@ async def view_logistic_offer_for_request(callback: types.CallbackQuery):
             "❌ Предложение не относится к заявке экспортёра", show_alert=True
         )
         return
-    if not (user_role == "admin" or same_id(req.get("exporter_id"), user_id)):
+    request_owner_id = (
+        req.get("exporter_id") or req.get("customer_id") or req.get("created_by")
+    )
+    if not (user_role == "admin" or same_id(request_owner_id, user_id)):
         await callback.answer("❌ Доступно только владельцу заявки", show_alert=True)
         return
 
@@ -19982,16 +22254,18 @@ async def view_logistic_offer_for_request(callback: types.CallbackQuery):
 
     route_from = req.get("route_from") or req.get("from_city") or "—"
     route_to = req.get("route_to") or req.get("to_city") or "—"
+    req_volume = get_safe_float(req.get("volume"), 0)
+    offer_price = get_safe_float(offer.get("price"), 0)
 
     text = (
         f"📄 <b>Предложение логиста по заявке #{request_id}</b>\n\n"
         f"🌾 Культура: <b>{req.get('culture','—')}</b>\n"
-        f"📊 Объём: <b>{req.get('volume',0):.0f} т</b>\n"
+        f"📊 Объём: <b>{req_volume:.0f} т</b>\n"
         f"📍 Маршрут: <b>{route_from} → {route_to}</b>\n"
         f"🚛 Транспорт: <b>{req.get('transport_type','—')}</b>\n\n"
         f"🚚 <b>Тип перевозки:</b> {offer.get('vehicle_type','—')}\n"
         f"💬 <b>Условия логиста:</b> {offer.get('terms','—')}\n"
-        f"💰 <b>Ставка:</b> {offer.get('price',0):,.0f} ₽/т\n"
+        f"💰 <b>Ставка:</b> {offer_price:,.0f} ₽/т\n"
         f"📅 <b>Отклик:</b> {offer.get('created_at','—')}\n\n"
         f"👤 <b>Логист:</b> {logist_user.get('name','Не указано')}\n"
         f"🏢 <b>Компания:</b> {offer.get('company','Логист')}\n"
@@ -20013,10 +22287,17 @@ async def view_logistic_offer_for_request(callback: types.CallbackQuery):
     }.get(offer_status, offer.get("status", "—"))
     text += f"\n📊 <b>Статус оффера:</b> {offer_status_text}\n"
 
+    request_status = get_effective_request_status(
+        request_id,
+        "exporter",
+        req,
+        request_owner_id=request_owner_id,
+        request_exporter_id=request_owner_id,
+    )
     kb = InlineKeyboardMarkup(row_width=1)
     can_choose_offer = (
-        offer_status in {"pending", "active"}
-        and is_request_open_for_offers(req.get("status"))
+        offer_status in OPEN_LOGISTIC_OFFER_STATUSES
+        and is_request_open_for_offers(request_status)
         and not has_assigned_logist(req)
         and not has_assigned_expeditor(req)
     )
@@ -20075,11 +22356,21 @@ async def choose_logistic_offer_for_request(callback: types.CallbackQuery):
 
     user_id = callback.from_user.id
     user_role = (get_user_by_id(user_id) or {}).get("role")
-    if not (user_role == "admin" or same_id(req.get("exporter_id"), user_id)):
+    request_owner_id = (
+        req.get("exporter_id") or req.get("customer_id") or req.get("created_by")
+    )
+    if not (user_role == "admin" or same_id(request_owner_id, user_id)):
         await callback.answer("❌ Нет доступа", show_alert=True)
         return
 
-    if not is_request_open_for_offers(req.get("status")):
+    request_status = get_effective_request_status(
+        request_id,
+        "exporter",
+        req,
+        request_owner_id=request_owner_id,
+        request_exporter_id=request_owner_id,
+    )
+    if not is_request_open_for_offers(request_status):
         await callback.answer(
             "❌ Заявка уже не в статусе выбора логиста", show_alert=True
         )
@@ -20105,12 +22396,57 @@ async def choose_logistic_offer_for_request(callback: types.CallbackQuery):
         )
         return
     offer_status = normalize_transition_status(offer.get("status") or "pending")
-    if offer_status not in {"pending", "active"}:
+    if offer_status not in OPEN_LOGISTIC_OFFER_STATUSES:
         await callback.answer("❌ Это предложение уже обработано", show_alert=True)
         return
 
     now_sql = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    request_exporter_id = (
+        req.get("exporter_id") or req.get("customer_id") or req.get("created_by")
+    )
+    matching_deliveries = [
+        (deliv_key, d)
+        for deliv_key, d in deliveries.items()
+        if isinstance(d, dict)
+        and same_id(d.get("request_id"), request_id)
+        and (
+            not request_exporter_id
+            or (
+                d.get("exporter_id") or d.get("customer_id") or d.get("created_by")
+            )
+            in {None, ""}
+            or same_id(
+                d.get("exporter_id") or d.get("customer_id") or d.get("created_by"),
+                request_exporter_id,
+            )
+        )
+        and str(d.get("source") or "").strip().lower() in {"", "exporter"}
+    ]
+    if any(
+        get_effective_delivery_status(d, req if isinstance(req, dict) else None)
+        in {"completed", "cancelled"}
+        for _, d in matching_deliveries
+    ):
+        await callback.answer(
+            "❌ По заявке уже есть закрытая доставка", show_alert=True
+        )
+        return
+    if any(
+        get_effective_delivery_status(d, req if isinstance(req, dict) else None)
+        in {"in_progress", "expeditor_selected"}
+        for _, d in matching_deliveries
+    ):
+        await callback.answer(
+            "❌ По заявке уже есть доставка в работе", show_alert=True
+        )
+        return
+    active_matching_deliveries = [
+        (deliv_key, d)
+        for deliv_key, d in matching_deliveries
+        if get_effective_delivery_status(d, req if isinstance(req, dict) else None)
+        not in {"completed", "cancelled"}
+    ]
     req["selected_logistic"] = logistic_id
     req["selected_logistic_at"] = now_sql
     req["logistic_offer_id"] = offer_id
@@ -20119,56 +22455,46 @@ async def choose_logistic_offer_for_request(callback: types.CallbackQuery):
     req["status"] = "assigned"
     req["assigned_at"] = now_sql
 
-    request_exporter_id = req.get("exporter_id")
-    existing_delivery = next(
-        (
-            d
-            for d in deliveries.values()
-            if same_id(d.get("request_id"), request_id)
-            and same_id(d.get("exporter_id"), request_exporter_id)
-            and str(d.get("source") or "").strip().lower() in {"", "exporter"}
-        ),
-        None,
-    )
-    if existing_delivery:
-        if normalize_transition_status(existing_delivery.get("status")) in {
-            "completed",
-            "cancelled",
-        }:
-            await callback.answer(
-                "❌ По заявке уже есть закрытая доставка", show_alert=True
+    if active_matching_deliveries:
+        for existing_delivery_key, existing_delivery in active_matching_deliveries:
+            if existing_delivery.get("id") is None:
+                existing_delivery["id"] = (
+                    int(existing_delivery_key)
+                    if str(existing_delivery_key).isdigit()
+                    else existing_delivery_key
+                )
+            existing_delivery["offer_id"] = offer_id
+            existing_delivery["exporter_id"] = request_exporter_id
+            existing_delivery["logist_id"] = logistic_id
+            existing_delivery["pull_id"] = req.get("pull_id")
+            existing_delivery["route_from"] = req.get("route_from") or req.get(
+                "from_city", ""
             )
-            return
-        existing_delivery["offer_id"] = offer_id
-        existing_delivery["exporter_id"] = req.get("exporter_id")
-        existing_delivery["logist_id"] = logistic_id
-        existing_delivery["pull_id"] = req.get("pull_id")
-        existing_delivery["route_from"] = req.get("route_from") or req.get(
-            "from_city", ""
-        )
-        existing_delivery["route_to"] = req.get("route_to") or req.get("to_city", "")
-        existing_delivery["volume"] = req.get("volume", 0)
-        existing_delivery["price"] = offer.get("price", 0)
-        existing_delivery["vehicle_type"] = offer.get("vehicle_type")
-        existing_delivery["delivery_date"] = req.get("desired_date") or req.get(
-            "loading_date"
-        )
-        existing_delivery["status"] = "pending"
-        existing_delivery["source"] = "exporter"
-        existing_delivery["updated_at"] = now_sql
+            existing_delivery["route_to"] = req.get("route_to") or req.get(
+                "to_city", ""
+            )
+            existing_delivery["volume"] = req.get("volume", 0)
+            existing_delivery["price"] = get_safe_float(offer.get("price"), 0)
+            existing_delivery["vehicle_type"] = offer.get("vehicle_type")
+            existing_delivery["delivery_date"] = req.get("desired_date") or req.get(
+                "loading_date"
+            )
+            existing_delivery["status"] = "pending"
+            existing_delivery["source"] = "exporter"
+            existing_delivery["updated_at"] = now_sql
     else:
         delivery_id = next_numeric_id(deliveries)
         deliveries[delivery_id] = {
             "id": delivery_id,
             "request_id": request_id,
             "offer_id": offer_id,
-            "exporter_id": req.get("exporter_id"),
+            "exporter_id": request_exporter_id,
             "logist_id": logistic_id,
             "pull_id": req.get("pull_id"),
             "route_from": req.get("route_from") or req.get("from_city", ""),
             "route_to": req.get("route_to") or req.get("to_city", ""),
             "volume": req.get("volume", 0),
-            "price": offer.get("price", 0),
+            "price": get_safe_float(offer.get("price"), 0),
             "vehicle_type": offer.get("vehicle_type"),
             "delivery_date": req.get("desired_date") or req.get("loading_date"),
             "status": "pending",
@@ -20185,21 +22511,23 @@ async def choose_logistic_offer_for_request(callback: types.CallbackQuery):
             o["status"] = "accepted"
             o["accepted_at"] = now_sql
             continue
-        if normalize_transition_status(o.get("status")) in {"pending", "active"}:
+        if normalize_transition_status(o.get("status")) in OPEN_LOGISTIC_OFFER_STATUSES:
             o["status"] = "rejected"
             o["rejected_at"] = now_sql
             o["rejection_reason"] = "Принято другое предложение"
+    req["offers_count"] = count_open_logistic_offers_for_request(request_id, "exporter")
 
     save_shipping_requests()
     save_logistic_offers()
     save_deliveries()
 
     try:
+        req_volume = get_safe_float(req.get("volume"), 0)
         await bot.send_message(
             logistic_id,
             "🎉 <b>Ваше предложение принято!</b>\n\n"
             f"🆔 Заявка #{request_id}\n"
-            f"🌾 {req.get('culture','—')} • {req.get('volume', 0):.0f} т\n"
+            f"🌾 {req.get('culture','—')} • {req_volume:.0f} т\n"
             "Экспортёр свяжется с вами для деталей.",
             parse_mode="HTML",
         )
@@ -20239,8 +22567,9 @@ async def choose_expeditor_offer_for_request(callback: types.CallbackQuery):
         await callback.answer("❌ Ошибка данных", show_alert=True)
         return
 
-    offer_id = int(raw_offer_id) if raw_offer_id.isdigit() else raw_offer_id
-    resolved_offer_id, offer = find_expeditor_request_offer_by_id(offer_id)
+    selected_offer_storage, resolved_offer_id, offer = find_request_related_expeditor_offer_by_ref(
+        raw_offer_id
+    )
     if not offer:
         await callback.answer("❌ Предложение не найдено", show_alert=True)
         return
@@ -20279,8 +22608,14 @@ async def choose_expeditor_offer_for_request(callback: types.CallbackQuery):
             req.get("customer_id")
             or req.get("created_by")
             or req.get("exporter_id")
-            or req.get("logist_id")
         )
+        if not request_owner_id:
+            legacy_logist_owner_id = req.get("logist_id")
+            has_assigned_logist_id = bool(
+                req.get("assigned_logist_id") or req.get("selected_logistic")
+            )
+            if legacy_logist_owner_id and not has_assigned_logist_id:
+                request_owner_id = legacy_logist_owner_id
     else:
         request_owner_id = req.get("exporter_id") or req.get("customer_id") or req.get(
             "created_by"
@@ -20292,7 +22627,10 @@ async def choose_expeditor_offer_for_request(callback: types.CallbackQuery):
         return
 
     expeditor_id = offer.get("expeditor_id")
-    if normalize_transition_status(offer.get("status") or "pending") not in {"pending", "active"}:
+    if (
+        normalize_transition_status(offer.get("status") or "pending")
+        not in MUTABLE_EXPEDITOR_OFFER_STATUSES
+    ):
         await callback.answer("❌ Это предложение уже обработано", show_alert=True)
         return
     if not expeditor_id:
@@ -20313,16 +22651,106 @@ async def choose_expeditor_offer_for_request(callback: types.CallbackQuery):
             "❌ Сначала выберите логиста по заявке", show_alert=True
         )
         return
-    if not is_request_open_for_expeditor(req.get("status")):
+    request_status = get_effective_request_status(
+        request_id,
+        request_source,
+        req,
+        request_owner_id=request_owner_id,
+        request_exporter_id=(
+            req.get("exporter_id")
+            or req.get("customer_id")
+            or req.get("created_by")
+        ),
+    )
+    if not is_request_open_for_expeditor(request_status):
         await callback.answer(
             "❌ Заявка уже не в статусе выбора экспедитора", show_alert=True
         )
         return
-    if normalize_transition_status(req.get("status")) in {"completed", "cancelled", "rejected"}:
+    if request_status in {"completed", "cancelled", "rejected"}:
         await callback.answer("❌ Нельзя выбрать экспедитора для закрытой заявки", show_alert=True)
         return
 
     now_sql = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # Защита от повторного создания доставки по уже закрытой перевозке этой же заявки.
+    request_exporter_id = (
+        req.get("exporter_id") or req.get("customer_id") or req.get("created_by")
+    )
+    if request_source == "logistics":
+        request_owner_id = (
+            req.get("customer_id")
+            or req.get("created_by")
+            or req.get("exporter_id")
+        )
+        if not request_owner_id:
+            legacy_logist_owner_id = req.get("logist_id")
+            has_assigned_logist_id = bool(
+                req.get("assigned_logist_id") or req.get("selected_logistic")
+            )
+            if legacy_logist_owner_id and not has_assigned_logist_id:
+                request_owner_id = legacy_logist_owner_id
+    else:
+        request_owner_id = req.get("exporter_id") or req.get("customer_id") or req.get(
+            "created_by"
+        )
+    for d in deliveries.values():
+        if not isinstance(d, dict):
+            continue
+        if not same_id(d.get("request_id"), request_id):
+            continue
+        d_source = str(d.get("source") or "").strip().lower()
+        if d_source == "logistic":
+            d_source = "logistics"
+        if d_source not in {"exporter", "farmer", "logistics"}:
+            inferred_source = infer_logistic_offer_source(d.get("request_id"))
+            if inferred_source in {"exporter", "farmer", "logistics"}:
+                d_source = inferred_source
+            else:
+                continue
+        if d_source != request_source:
+            continue
+        if request_source == "exporter":
+            d_owner_id = d.get("exporter_id") or d.get("customer_id") or d.get("created_by")
+            if (
+                request_exporter_id
+                and d_owner_id not in {None, ""}
+                and not same_id(d_owner_id, request_exporter_id)
+            ):
+                continue
+        elif request_source == "logistics":
+            d_owner_id = (
+                d.get("customer_id")
+                or d.get("created_by")
+                or d.get("exporter_id")
+            )
+            if not d_owner_id:
+                legacy_logist_owner_id = d.get("logist_id")
+                has_assigned_logist_id = bool(
+                    d.get("assigned_logist_id") or d.get("selected_logistic")
+                )
+                if legacy_logist_owner_id and not has_assigned_logist_id:
+                    d_owner_id = legacy_logist_owner_id
+            if (
+                request_owner_id
+                and d_owner_id not in {None, ""}
+                and not same_id(d_owner_id, request_owner_id)
+            ):
+                continue
+        delivery_effective_status = get_effective_delivery_status(
+            d,
+            req if isinstance(req, dict) else None,
+        )
+        if delivery_effective_status in {"completed", "cancelled"}:
+            await callback.answer(
+                "❌ По заявке уже есть закрытая доставка", show_alert=True
+            )
+            return
+        if delivery_effective_status in {"in_progress", "expeditor_selected"}:
+            await callback.answer(
+                "❌ По заявке уже есть доставка в работе", show_alert=True
+            )
+            return
 
     # фиксируем выбор
     req["selected_expeditor"] = expeditor_id
@@ -20353,23 +22781,65 @@ async def choose_expeditor_offer_for_request(callback: types.CallbackQuery):
             if o.get("id") is None and canonical_offer_id is not None:
                 o["id"] = canonical_offer_id
 
-            if same_id(canonical_offer_id, offer_id):
-                o["status"] = "accepted"
-                o["accepted_at"] = now_sql
+            if same_id(o.get("expeditor_id"), expeditor_id) and (
+                selected_offer_storage != "request" or same_id(canonical_offer_id, offer_id)
+            ):
+                status_norm = normalize_transition_status(o.get("status") or "pending")
+                if status_norm != "in_progress":
+                    o["status"] = "accepted"
+                o.setdefault("accepted_at", now_sql)
             else:
                 status_norm = normalize_transition_status(o.get("status") or "pending")
-                if status_norm in {"pending", "active"}:
+                if (
+                    status_norm in MUTABLE_EXPEDITOR_OFFER_STATUSES
+                    and status_norm != "in_progress"
+                ):
                     o["status"] = "rejected"
                     o["rejected_at"] = now_sql
                     o["rejection_reason"] = "Выбрано другое предложение экспедитора"
 
-    request_exporter_id = req.get("exporter_id")
-    request_owner_id = (
-        req.get("customer_id")
-        or req.get("created_by")
-        or req.get("exporter_id")
-        or req.get("logist_id")
-    )
+    touched_expeditor_routes = False
+    for route_offer in expeditor_offers.values():
+        if not isinstance(route_offer, dict):
+            continue
+        if not same_id(route_offer.get("request_id"), request_id):
+            continue
+        route_source = str(route_offer.get("source") or "").strip().lower()
+        if route_source == "logistic":
+            route_source = "logistics"
+        if route_source not in {"exporter", "farmer", "logistics"}:
+            inferred_source = infer_logistic_offer_source(route_offer.get("request_id"))
+            if inferred_source in {"exporter", "farmer", "logistics"}:
+                route_source = inferred_source
+            else:
+                continue
+        if request_source == "exporter":
+            if route_source not in {"", "exporter"}:
+                continue
+        elif route_source != request_source:
+            continue
+        route_status = normalize_transition_status(route_offer.get("status") or "pending")
+        if route_status in {"completed", "cancelled", "rejected"}:
+            continue
+        if same_id(route_offer.get("expeditor_id"), expeditor_id):
+            if route_status in MUTABLE_EXPEDITOR_OFFER_STATUSES and (
+                selected_offer_storage != "route"
+                or same_id(route_offer.get("id"), offer_id)
+                or same_id(route_offer.get("id", ""), offer_id)
+            ):
+                if route_status != "in_progress":
+                    route_offer["status"] = "accepted"
+                route_offer.setdefault("accepted_at", now_sql)
+                touched_expeditor_routes = True
+        elif (
+            route_status in MUTABLE_EXPEDITOR_OFFER_STATUSES
+            and route_status != "in_progress"
+        ):
+            route_offer["status"] = "rejected"
+            route_offer["rejected_at"] = now_sql
+            route_offer["rejection_reason"] = "Выбрано другое предложение экспедитора"
+            touched_expeditor_routes = True
+
     matched_delivery = False
     for d in deliveries.values():
         if not isinstance(d, dict):
@@ -20388,22 +22858,51 @@ async def choose_expeditor_offer_for_request(callback: types.CallbackQuery):
         if d_source != request_source:
             continue
         if request_source == "exporter":
-            if request_exporter_id and not same_id(d.get("exporter_id"), request_exporter_id):
+            d_owner_id = d.get("exporter_id") or d.get("customer_id") or d.get("created_by")
+            if (
+                request_exporter_id
+                and d_owner_id not in {None, ""}
+                and not same_id(d_owner_id, request_exporter_id)
+            ):
                 continue
         elif request_source == "logistics":
             d_owner_id = (
                 d.get("customer_id")
                 or d.get("created_by")
                 or d.get("exporter_id")
-                or d.get("logist_id")
             )
-            if request_owner_id and not same_id(d_owner_id, request_owner_id):
+            if not d_owner_id:
+                legacy_logist_owner_id = d.get("logist_id")
+                has_assigned_logist_id = bool(
+                    d.get("assigned_logist_id") or d.get("selected_logistic")
+                )
+                if legacy_logist_owner_id and not has_assigned_logist_id:
+                    d_owner_id = legacy_logist_owner_id
+            if (
+                request_owner_id
+                and d_owner_id not in {None, ""}
+                and not same_id(d_owner_id, request_owner_id)
+            ):
                 continue
-        delivery_status = normalize_transition_status(d.get("status"))
+        delivery_status = get_effective_delivery_status(
+            d,
+            req if isinstance(req, dict) else None,
+        )
         if delivery_status in {"completed", "cancelled"}:
             continue
         d["expeditor_id"] = expeditor_id
-        if delivery_status in {"pending", "assigned", "new"}:
+        if delivery_status in {
+            "",
+            "pending",
+            "assigned",
+            "new",
+            "active",
+            "open",
+            "accepted",
+            "reserved",
+            "selected",
+            "expeditor_selected",
+        }:
             d["status"] = "expeditor_selected"
         d["accepted_at"] = now_sql
         matched_delivery = True
@@ -20419,7 +22918,9 @@ async def choose_expeditor_offer_for_request(callback: types.CallbackQuery):
             "route_from": req.get("route_from") or req.get("from_city", ""),
             "route_to": req.get("route_to") or req.get("to_city", ""),
             "volume": req.get("volume", 0),
-            "price": (selected_logist_offer or {}).get("price", req.get("desired_price", 0)),
+            "price": get_safe_float(
+                (selected_logist_offer or {}).get("price", req.get("desired_price")), 0
+            ),
             "vehicle_type": (selected_logist_offer or {}).get(
                 "vehicle_type", req.get("transport_type")
             ),
@@ -20454,24 +22955,37 @@ async def choose_expeditor_offer_for_request(callback: types.CallbackQuery):
             logging.debug(f"Не удалось сохранить shipping_requests после выбора экспедитора: {e}")
     save_deliveries()
     save_data()
+    if touched_expeditor_routes:
+        save_expeditor_offers()
 
     if request_source == "logistics":
         owner_id = (
             req.get("customer_id")
             or req.get("created_by")
             or req.get("exporter_id")
-            or req.get("logist_id")
         )
+        if not owner_id:
+            legacy_logist_owner_id = req.get("logist_id")
+            has_assigned_logist_id = bool(
+                req.get("assigned_logist_id") or req.get("selected_logistic")
+            )
+            if legacy_logist_owner_id and not has_assigned_logist_id:
+                owner_id = legacy_logist_owner_id
     else:
         owner_id = req.get("exporter_id") or req.get("customer_id") or req.get(
             "created_by"
         )
 
     if owner_id:
+        request_label = (
+            "заявке на логистику"
+            if request_source == "logistics"
+            else "заявке экспортёра"
+        )
         try:
             await bot.send_message(
                 owner_id,
-                "✅ <b>Экспедитор выбран по заявке на логистику</b>\n\n"
+                f"✅ <b>Экспедитор выбран по {request_label}</b>\n\n"
                 f"🆔 Заявка #{request_id}\n"
                 f"🏢 Компания: {offer.get('company','Экспедитор')}\n"
                 f"👤 Имя: {exp_user.get('name','Не указано')}\n"
@@ -20484,11 +22998,12 @@ async def choose_expeditor_offer_for_request(callback: types.CallbackQuery):
             )
 
     try:
+            req_volume = get_safe_float(req.get("volume"), 0)
             await bot.send_message(
                 expeditor_id,
                 "🎉 <b>Вы выбраны экспедитором по заявке!</b>\n\n"
                 f"🆔 Заявка #{request_id}\n"
-                f"🌾 {req.get('culture','—')} • {req.get('volume',0):.0f} т\n"
+                f"🌾 {req.get('culture','—')} • {req_volume:.0f} т\n"
                 f"📍 {(req.get('route_from') or req.get('from_city') or '—')} → {(req.get('route_to') or req.get('to_city') or '—')}\n"
                 f"🚛 Транспорт: {req.get('transport_type','—')}\n\n"
                 "Заказчик свяжется с вами для уточнения деталей.",
@@ -20703,7 +23218,12 @@ async def view_request_details(callback: types.CallbackQuery, state: FSMContext)
     if len(parts) == 2:
         source = "exporter"
         try:
-            request_id = int(parts[1])
+            request_id_raw = parts[1]
+            request_id = (
+                int(request_id_raw)
+                if str(request_id_raw).isdigit()
+                else str(request_id_raw).strip()
+            )
         except ValueError:
             logging.error(f"Invalid request_id in callback.data={callback.data}")
             await callback.answer("❌ Ошибка данных", show_alert=True)
@@ -20711,7 +23231,12 @@ async def view_request_details(callback: types.CallbackQuery, state: FSMContext)
     elif len(parts) == 3:
         source = parts[1]
         try:
-            request_id = int(parts[2])
+            request_id_raw = parts[2]
+            request_id = (
+                int(request_id_raw)
+                if str(request_id_raw).isdigit()
+                else str(request_id_raw).strip()
+            )
         except ValueError:
             logging.error(f"Invalid request_id in callback.data={callback.data}")
             await callback.answer("❌ Ошибка данных", show_alert=True)
@@ -20740,7 +23265,11 @@ async def view_request_details(callback: types.CallbackQuery, state: FSMContext)
         all_pulls = pulls.get("pulls", {}) if isinstance(pulls, dict) else {}
         pull = (all_pulls.get(pull_id) or all_pulls.get(str(pull_id), {})) if pull_id is not None else {}
 
-        owner_id = request.get("exporter_id")
+        owner_id = (
+            request.get("exporter_id")
+            or request.get("customer_id")
+            or request.get("created_by")
+        )
         if not (
             same_id(owner_id, viewer_id)
             or is_logistic_role(viewer_role)
@@ -20749,7 +23278,13 @@ async def view_request_details(callback: types.CallbackQuery, state: FSMContext)
         ):
             await callback.answer("❌ Нет доступа к этой заявке", show_alert=True)
             return
-        request_status_norm = normalize_transition_status(request.get("status"))
+        request_status_norm = get_effective_request_status(
+            request_id,
+            "exporter",
+            request,
+            request_owner_id=owner_id,
+            request_exporter_id=owner_id,
+        )
         if is_logistic_role(viewer_role):
             assigned_logist_id = get_assigned_logist_id(request)
             if (
@@ -20784,11 +23319,12 @@ async def view_request_details(callback: types.CallbackQuery, state: FSMContext)
                 return
         user = get_user_by_id(owner_id) or {}
 
-        price_fob = pull.get("price", 0)
+        request_volume = get_safe_float(request.get("volume"), 0)
+        price_fob = get_safe_float(pull.get("price"), 0)
         price_rub = int(price_fob * 95) if price_fob else 0
 
         # Человекочитаемый статус заявки
-        request_status = get_offer_status_display(request.get("status", "active"))
+        request_status = get_offer_status_display(request_status_norm)
 
         route_from = request.get("route_from") or request.get("from_city") or "—"
         route_to = request.get("route_to") or request.get("to_city") or "—"
@@ -20799,7 +23335,7 @@ async def view_request_details(callback: types.CallbackQuery, state: FSMContext)
 
 <b>Информация о грузе:</b>
 🌾 Культура: {request.get('culture', pull.get('culture', '—'))}
-📦 Объём: {request.get('volume', 0):.0f} т
+📦 Объём: {request_volume:.0f} т
 💰 Цена FOB: {price_rub:,} ₽/т
 🚢 Порт: {pull.get('port', '—')}
 
@@ -20833,7 +23369,7 @@ async def view_request_details(callback: types.CallbackQuery, state: FSMContext)
             logging.error(f"Farmer request {request_id} not found")
             await callback.answer("❌ Заявка не найдена", show_alert=True)
             return
-        owner_id = request.get("farmer_id")
+        owner_id = request.get("farmer_id") or request.get("user_id")
         if not (
             same_id(owner_id, viewer_id)
             or is_logistic_role(viewer_role)
@@ -20842,7 +23378,12 @@ async def view_request_details(callback: types.CallbackQuery, state: FSMContext)
         ):
             await callback.answer("❌ Нет доступа к этой заявке", show_alert=True)
             return
-        request_status_norm = normalize_transition_status(request.get("status"))
+        request_status_norm = get_effective_request_status(
+            request_id,
+            "farmer",
+            request,
+            request_owner_id=owner_id,
+        )
         if is_logistic_role(viewer_role):
             assigned_logist_id = get_assigned_logist_id(request)
             if (
@@ -20876,7 +23417,11 @@ async def view_request_details(callback: types.CallbackQuery, state: FSMContext)
                 return
         user = get_user_by_id(owner_id) or {}
 
-        request_status = get_offer_status_display(request.get("status", "active"))
+        request_status = get_offer_status_display(request_status_norm)
+        request_volume = get_safe_float(request.get("volume"), 0)
+        price_per_ton = get_safe_float(request.get("price_per_ton"), 0)
+        total_sum = get_safe_float(request.get("total_sum"), 0)
+        desired_price = get_safe_float(request.get("desired_price"), 0)
 
         farmer_route_from = (
             request.get("route_from")
@@ -20898,9 +23443,9 @@ async def view_request_details(callback: types.CallbackQuery, state: FSMContext)
 
 <b>Информация о грузе:</b>
 🌾 Культура: {request.get('culture', '—')}
-📦 Объём: {request.get('volume', 0):.0f} т
-💰 Цена: {request.get('price_per_ton', 0):,} ₽/т
-💵 Итого: {request.get('total_sum', 0):,} ₽
+📦 Объём: {request_volume:.0f} т
+💰 Цена: {price_per_ton:,.0f} ₽/т
+💵 Итого: {total_sum:,.0f} ₽
 
 
 
@@ -20913,7 +23458,7 @@ async def view_request_details(callback: types.CallbackQuery, state: FSMContext)
 
 
 <b>Стоимость доставки:</b>
-💳 Ожидаемая цена: {request.get('desired_price', 0):,} ₽/т
+💳 Ожидаемая цена: {desired_price:,.0f} ₽/т
 
 
 
@@ -20966,7 +23511,9 @@ async def view_request_details(callback: types.CallbackQuery, state: FSMContext)
         }
 
         assigned_logist = get_assigned_logist_id(request)
-        can_create_new_offer = is_request_open_for_offers(request.get("status")) and not assigned_logist
+        can_create_new_offer = (
+            is_request_open_for_offers(request_status_norm) and not assigned_logist
+        )
 
         if offers_for_pair:
             # Берём ПОСЛЕДНИЙ оффер по времени создания
@@ -20982,7 +23529,7 @@ async def view_request_details(callback: types.CallbackQuery, state: FSMContext)
 
             text += "\n\n✅ <b>Ваше последнее предложение по этой заявке:</b>\n"
             text += f"🚛 Транспорт: {latest_offer.get('vehicle_type', '—')}\n"
-            text += f"💰 Цена: {latest_offer.get('price', 0):,} ₽\n"
+            text += f"💰 Цена: {get_safe_float(latest_offer.get('price'), 0):,.0f} ₽\n"
             text += f"📅 Дата доставки: {latest_offer.get('delivery_date', '—')}\n"
             text += f"📊 Статус: {offer_status}"
 
@@ -20999,20 +23546,76 @@ async def view_request_details(callback: types.CallbackQuery, state: FSMContext)
 
     # Ветка фермера: витрина откликов экспедиторов
     if source == "farmer" and (same_id(owner_id, viewer_id) or viewer_role == "admin"):
-        keyboard.add(
-            InlineKeyboardButton(
-                "📄 Отклики экспедиторов",
-                callback_data=f"farmer_view_expeditor_offers:{request_id}",
+        farmer_expeditor_offers = ensure_farmer_expeditor_offer_ids(request)
+        if request_status_norm in {
+            "assigned",
+            "expeditor_selected",
+            "in_progress",
+            "completed",
+            "cancelled",
+        }:
+            keyboard.add(
+                InlineKeyboardButton(
+                    "📦 Доставка",
+                    callback_data=f"view_delivery_by_request_{request_id}",
+                )
             )
+        if (
+            has_assigned_logist(request)
+            or has_assigned_expeditor(request)
+            or farmer_expeditor_offers
+        ):
+            keyboard.add(
+                InlineKeyboardButton(
+                    "📄 Отклики экспедиторов",
+                    callback_data=f"farmer_view_expeditor_offers:{request_id}",
+                )
+            )
+
+    if source == "exporter" and (same_id(owner_id, viewer_id) or viewer_role == "admin"):
+        has_expeditor_offer_history = any(
+            iter_request_related_expeditor_offers(request_id, "exporter")
         )
+        if request_status_norm in {
+            "assigned",
+            "expeditor_selected",
+            "in_progress",
+            "completed",
+            "cancelled",
+        }:
+            keyboard.add(
+                InlineKeyboardButton(
+                    "📦 Доставка",
+                    callback_data=f"view_delivery_by_request_{request_id}",
+                )
+            )
+        if (
+            has_assigned_logist(request)
+            or has_assigned_expeditor(request)
+            or has_expeditor_offer_history
+        ):
+            keyboard.add(
+                InlineKeyboardButton(
+                    "📄 Предложения экспедиторов",
+                    callback_data=f"view_expeditor_offers_for_request:{request_id}",
+                )
+            )
+
+    delivery_guard_state = get_request_delivery_guard_state(
+        request_id,
+        source,
+        request_owner_id=owner_id,
+        request_exporter_id=owner_id if source == "exporter" else request.get("exporter_id"),
+    )
 
     # Экспедитор может откликнуться по заявке экспортёра только после выбора логиста
     if (
         source == "exporter"
         and is_expeditor_role(viewer_role)
-        and is_request_open_for_expeditor(request.get("status"))
+        and is_request_open_for_expeditor(request_status_norm)
         and not has_assigned_expeditor(request)
         and has_assigned_logist(request)
+        and delivery_guard_state is None
     ):
         keyboard.add(
             InlineKeyboardButton(
@@ -21134,20 +23737,50 @@ async def expeditor_view_available_requests(message: types.Message, state: FSMCo
     for req_id, req in shipping_requests.items():
         if not isinstance(req, dict):
             continue
-        if not is_request_open_for_expeditor(req.get("status")):
-            continue
-        if has_assigned_expeditor(req):
-            continue
-        if not has_assigned_logist(req):
-            continue
         request_owner_id = (
             req.get("customer_id")
             or req.get("created_by")
             or req.get("exporter_id")
             or req.get("farmer_id")
-            or req.get("logist_id")
+            or req.get("user_id")
+            or (
+                req.get("logist_id")
+                if not (req.get("assigned_logist_id") or req.get("selected_logistic"))
+                else None
+            )
         )
+        status = get_effective_request_status(
+            req.get("id", req_id),
+            "exporter",
+            req,
+            request_owner_id=request_owner_id,
+            request_exporter_id=(
+                req.get("exporter_id")
+                or req.get("customer_id")
+                or req.get("created_by")
+            ),
+        )
+        if not is_request_open_for_expeditor(status):
+            continue
+        if has_assigned_expeditor(req):
+            continue
+        if not has_assigned_logist(req):
+            continue
         if same_id(request_owner_id, user_id):
+            continue
+        if (
+            get_request_delivery_guard_state(
+                req.get("id", req_id),
+                "exporter",
+                request_owner_id=request_owner_id,
+                request_exporter_id=(
+                    req.get("exporter_id")
+                    or req.get("customer_id")
+                    or req.get("created_by")
+                ),
+            )
+            is not None
+        ):
             continue
         canonical_id = req.get("id", req_id)
         canonical_key = f"exporter:{canonical_id}"
@@ -21158,20 +23791,42 @@ async def expeditor_view_available_requests(message: types.Message, state: FSMCo
     for req_id, req in logistics_requests.items():
         if not isinstance(req, dict):
             continue
-        if not is_request_open_for_expeditor(req.get("status")):
-            continue
-        if has_assigned_expeditor(req):
-            continue
-        if not has_assigned_logist(req):
-            continue
         request_owner_id = (
             req.get("customer_id")
             or req.get("created_by")
             or req.get("exporter_id")
             or req.get("farmer_id")
-            or req.get("logist_id")
+            or req.get("user_id")
+            or (
+                req.get("logist_id")
+                if not (req.get("assigned_logist_id") or req.get("selected_logistic"))
+                else None
+            )
         )
+        status = get_effective_request_status(
+            req.get("id", req_id),
+            "logistics",
+            req,
+            request_owner_id=request_owner_id,
+            request_exporter_id=req.get("exporter_id"),
+        )
+        if not is_request_open_for_expeditor(status):
+            continue
+        if has_assigned_expeditor(req):
+            continue
+        if not has_assigned_logist(req):
+            continue
         if same_id(request_owner_id, user_id):
+            continue
+        if (
+            get_request_delivery_guard_state(
+                req.get("id", req_id),
+                "logistics",
+                request_owner_id=request_owner_id,
+                request_exporter_id=req.get("exporter_id"),
+            )
+            is not None
+        ):
             continue
         canonical_id = req.get("id", req_id)
         canonical_key = f"logistics:{canonical_id}"
@@ -21182,20 +23837,40 @@ async def expeditor_view_available_requests(message: types.Message, state: FSMCo
     for req_id, req in farmer_shipping_requests.items():
         if not isinstance(req, dict):
             continue
-        if not is_request_open_for_expeditor(req.get("status")):
+        request_owner_id = (
+            req.get("farmer_id")
+            or req.get("user_id")
+            or req.get("created_by")
+            or req.get("customer_id")
+            or req.get("exporter_id")
+            or (
+                req.get("logist_id")
+                if not (req.get("assigned_logist_id") or req.get("selected_logistic"))
+                else None
+            )
+        )
+        status = get_effective_request_status(
+            req.get("id", req_id),
+            "farmer",
+            req,
+            request_owner_id=request_owner_id,
+        )
+        if not is_request_open_for_expeditor(status):
             continue
         if has_assigned_expeditor(req):
             continue
         if not has_assigned_logist(req):
             continue
-        request_owner_id = (
-            req.get("farmer_id")
-            or req.get("created_by")
-            or req.get("customer_id")
-            or req.get("exporter_id")
-            or req.get("logist_id")
-        )
         if same_id(request_owner_id, user_id):
+            continue
+        if (
+            get_request_delivery_guard_state(
+                req.get("id", req_id),
+                "farmer",
+                request_owner_id=request_owner_id,
+            )
+            is not None
+        ):
             continue
         canonical_id = req.get("id", req_id)
         canonical_key = f"farmer:{canonical_id}"
@@ -21206,20 +23881,40 @@ async def expeditor_view_available_requests(message: types.Message, state: FSMCo
     for req_id, req in farmer_logistics_requests.items():
         if not isinstance(req, dict):
             continue
-        if not is_request_open_for_expeditor(req.get("status")):
+        request_owner_id = (
+            req.get("farmer_id")
+            or req.get("user_id")
+            or req.get("created_by")
+            or req.get("customer_id")
+            or req.get("exporter_id")
+            or (
+                req.get("logist_id")
+                if not (req.get("assigned_logist_id") or req.get("selected_logistic"))
+                else None
+            )
+        )
+        status = get_effective_request_status(
+            req.get("id", req_id),
+            "farmer",
+            req,
+            request_owner_id=request_owner_id,
+        )
+        if not is_request_open_for_expeditor(status):
             continue
         if has_assigned_expeditor(req):
             continue
         if not has_assigned_logist(req):
             continue
-        request_owner_id = (
-            req.get("farmer_id")
-            or req.get("created_by")
-            or req.get("customer_id")
-            or req.get("exporter_id")
-            or req.get("logist_id")
-        )
         if same_id(request_owner_id, user_id):
+            continue
+        if (
+            get_request_delivery_guard_state(
+                req.get("id", req_id),
+                "farmer",
+                request_owner_id=request_owner_id,
+            )
+            is not None
+        ):
             continue
         canonical_id = req.get("id", req_id)
         canonical_key = f"farmer:{canonical_id}"
@@ -21305,7 +24000,18 @@ async def expeditor_view_request_details(
     if not (is_expeditor_role(user_role) or user_role == "admin"):
         await callback.answer("❌ Доступно только экспедиторам", show_alert=True)
         return
-    request_status_norm = normalize_transition_status(request.get("status"))
+    request_owner_id = (
+        request.get("exporter_id")
+        or request.get("customer_id")
+        or request.get("created_by")
+    )
+    request_status_norm = get_effective_request_status(
+        request_id,
+        "exporter",
+        request,
+        request_owner_id=request_owner_id,
+        request_exporter_id=request_owner_id,
+    )
     assigned_expeditor_id = get_assigned_expeditor_id(request)
     if user_role != "admin":
         if not has_assigned_logist(request):
@@ -21326,7 +24032,7 @@ async def expeditor_view_request_details(
     pull_id = request.get("pull_id")
     all_pulls = pulls.get("pulls", {}) if isinstance(pulls, dict) else {}
     pull = all_pulls.get(pull_id) or all_pulls.get(str(pull_id), {})
-    exporter_id = request.get("exporter_id")
+    exporter_id = request_owner_id
     exporter = get_user_by_id(exporter_id) or {}
     route_from = request.get("route_from") or request.get("from_city") or "—"
     route_to = request.get("route_to") or request.get("to_city") or "—"
@@ -21337,7 +24043,7 @@ async def expeditor_view_request_details(
     logist = get_user_by_id(logist_id) if logist_id else {}
 
     # Конвертируем цену
-    price_fob = pull.get("price", 0)
+    price_fob = get_safe_float(pull.get("price"), 0)
     price_rub = int(price_fob * 95) if price_fob else 0
 
     # Формируем детали заявки
@@ -21345,7 +24051,7 @@ async def expeditor_view_request_details(
         f"🚚 <b>Заявка на доставку #{request_id}</b>\n\n"
         "<b>Информация о грузе:</b>\n"
         f"🌾 Культура: {request.get('culture', '—')}\n"
-        f"📦 Объём: {request.get('volume', 0):.0f} т\n"
+        f"📦 Объём: {get_safe_float(request.get('volume'), 0):.0f} т\n"
         f"💰 Цена FOB: {price_rub:,} ₽/т\n"
         f"🚢 Порт: {pull.get('port', '—')}\n\n"
         "<b>Маршрут:</b>\n"
@@ -21368,6 +24074,13 @@ async def expeditor_view_request_details(
 
     text += f"📅 Создана: {request.get('created_at', '—')}"
 
+    delivery_guard_state = get_request_delivery_guard_state(
+        request_id,
+        "exporter",
+        request_owner_id=request_owner_id,
+        request_exporter_id=request_owner_id,
+    )
+
     keyboard = InlineKeyboardMarkup(row_width=1)
 
     # Кнопки связи
@@ -21386,15 +24099,28 @@ async def expeditor_view_request_details(
         )
 
     request_open_for_offer = (
-        is_request_open_for_expeditor(request.get("status"))
+        is_request_open_for_expeditor(request_status_norm)
         and not has_assigned_expeditor(request)
         and has_assigned_logist(request)
+        and delivery_guard_state is None
     )
     if request_open_for_offer:
         keyboard.add(
             InlineKeyboardButton(
                 "💼 Отправить предложение",
                 callback_data=f"expeditor_respond_exporter_request:{request_id}",
+            )
+        )
+    if request_status_norm in {
+        "expeditor_selected",
+        "in_progress",
+        "completed",
+        "cancelled",
+    } and (assigned_expeditor_id or user_role == "admin"):
+        keyboard.add(
+            InlineKeyboardButton(
+                "📦 Доставка",
+                callback_data=f"view_delivery_by_request_{request_id}",
             )
         )
     keyboard.add(
@@ -21432,7 +24158,19 @@ async def expeditor_accept_request(callback: types.CallbackQuery, state: FSMCont
             show_alert=True,
         )
         return
-    if not is_request_open_for_expeditor(request.get("status")):
+    request_owner_id = (
+        request.get("exporter_id")
+        or request.get("customer_id")
+        or request.get("created_by")
+    )
+    request_status = get_effective_request_status(
+        request_id,
+        "exporter",
+        request,
+        request_owner_id=request_owner_id,
+        request_exporter_id=request_owner_id,
+    )
+    if not is_request_open_for_expeditor(request_status):
         await callback.answer("❌ Заявка уже неактивна", show_alert=True)
         return
     if has_assigned_expeditor(request):
@@ -21451,6 +24189,7 @@ async def expeditor_accept_request(callback: types.CallbackQuery, state: FSMCont
     request["selected_expeditor_id"] = expeditor_id
     request["selected_expeditor_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     request["accepted_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    request.setdefault("started_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
     offers_updated = 0
     for offer in logistic_offers.values():
@@ -21458,11 +24197,7 @@ async def expeditor_accept_request(callback: types.CallbackQuery, state: FSMCont
             continue
         if not logistic_offer_matches_request(offer, request_id, "exporter"):
             continue
-        if normalize_transition_status(offer.get("status")) in {
-            "accepted",
-            "assigned",
-            "in_progress",
-        }:
+        if normalize_transition_status(offer.get("status")) in SELECTED_LOGISTIC_OFFER_STATUSES:
             offer["status"] = "in_progress"
             offer["started_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             offers_updated += 1
@@ -21506,23 +24241,100 @@ async def expeditor_accept_request(callback: types.CallbackQuery, state: FSMCont
         status_norm = normalize_transition_status(offer.get("status") or "pending")
         if status_norm in {"completed", "cancelled", "rejected"}:
             continue
+        offer_changed = False
         if same_id(offer.get("expeditor_id"), expeditor_id):
-            offer["status"] = "accepted"
-            offer["accepted_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        elif status_norm in {"pending", "active"}:
+            if status_norm in MUTABLE_EXPEDITOR_OFFER_STATUSES:
+                offer["status"] = "in_progress"
+                offer["accepted_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                offer["started_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                offer_changed = True
+        elif (
+            status_norm in MUTABLE_EXPEDITOR_OFFER_STATUSES
+            and status_norm != "in_progress"
+        ):
             offer["status"] = "rejected"
             offer["rejected_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             offer["rejection_reason"] = "Выбрано другое предложение экспедитора"
-        expeditor_offers_updated += 1
+            offer_changed = True
+        if offer_changed:
+            expeditor_offers_updated += 1
+    expeditor_routes_updated = 0
+    for route_offer in expeditor_offers.values():
+        if not isinstance(route_offer, dict):
+            continue
+        if not same_id(route_offer.get("request_id"), request_id):
+            continue
+        route_source = str(route_offer.get("source") or "").strip().lower()
+        if route_source == "logistic":
+            route_source = "logistics"
+        if route_source not in {"exporter", "farmer", "logistics"}:
+            source_candidates = set()
+            request_key = request_id if isinstance(request_id, str) else str(request_id)
+            if request_id in shipping_requests or request_key in shipping_requests:
+                source_candidates.add("exporter")
+            if request_id in logistics_requests or request_key in logistics_requests:
+                source_candidates.add("logistics")
+            if (
+                request_id in farmer_shipping_requests
+                or request_key in farmer_shipping_requests
+                or request_id in farmer_logistics_requests
+                or request_key in farmer_logistics_requests
+            ):
+                source_candidates.add("farmer")
+            if len(source_candidates) == 1:
+                route_source = next(iter(source_candidates))
+            else:
+                inferred_source = infer_logistic_offer_source(request_id)
+                if (
+                    inferred_source in {"exporter", "farmer", "logistics"}
+                    and (not source_candidates or inferred_source in source_candidates)
+                ):
+                    route_source = inferred_source
+                else:
+                    continue
+        if route_source not in {"", "exporter"}:
+            continue
+        route_status = normalize_transition_status(route_offer.get("status") or "pending")
+        if route_status in {"completed", "cancelled", "rejected"}:
+            continue
+        route_changed = False
+        if same_id(route_offer.get("expeditor_id"), expeditor_id):
+            if route_status in MUTABLE_EXPEDITOR_OFFER_STATUSES:
+                route_offer["status"] = "in_progress"
+                route_offer["accepted_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                route_offer["started_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                route_changed = True
+        elif (
+            route_status in MUTABLE_EXPEDITOR_OFFER_STATUSES
+            and route_status != "in_progress"
+        ):
+            route_offer["status"] = "rejected"
+            route_offer["rejected_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            route_offer["rejection_reason"] = "Выбрано другое предложение экспедитора"
+            route_changed = True
+        if route_changed:
+            expeditor_routes_updated += 1
 
-    request_exporter_id = request.get("exporter_id")
+    request_exporter_id = (
+        request.get("exporter_id")
+        or request.get("customer_id")
+        or request.get("created_by")
+    )
+    matched_delivery = False
     for delivery in deliveries.values():
         if not isinstance(delivery, dict):
             continue
         if not same_id(delivery.get("request_id"), request_id):
             continue
-        if request_exporter_id and not same_id(
-            delivery.get("exporter_id"), request_exporter_id
+        delivery_owner_id = (
+            delivery.get("exporter_id")
+            or delivery.get("customer_id")
+            or delivery.get("created_by")
+        )
+        if (
+            request_exporter_id
+            and delivery_owner_id not in {None, ""}
+            and not same_id(delivery_owner_id, request_exporter_id)
         ):
             continue
         if str(delivery.get("source") or "").strip().lower() not in {"", "exporter"}:
@@ -21531,9 +24343,42 @@ async def expeditor_accept_request(callback: types.CallbackQuery, state: FSMCont
             delivery.get("expeditor_id"), expeditor_id
         ):
             continue
+        if get_effective_delivery_status(delivery, request) in {"completed", "cancelled"}:
+            continue
         delivery["status"] = "in_progress"
         delivery["expeditor_id"] = expeditor_id
         delivery["accepted_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        delivery.setdefault("started_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        matched_delivery = True
+
+    if not matched_delivery:
+        now_sql = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        delivery_id = next_numeric_id(deliveries)
+        deliveries[delivery_id] = {
+            "id": delivery_id,
+            "request_id": request_id,
+            "offer_id": request.get("logistic_offer_id"),
+            "pull_id": request.get("pull_id"),
+            "exporter_id": request_exporter_id,
+            "logist_id": get_assigned_logist_id(request),
+            "expeditor_id": expeditor_id,
+            "route_from": request.get("route_from")
+            or request.get("from_city")
+            or request.get("from", ""),
+            "route_to": request.get("route_to")
+            or request.get("to_city")
+            or request.get("to", ""),
+            "volume": request.get("volume", 0),
+            "price": get_safe_float(request.get("desired_price"), 0),
+            "vehicle_type": request.get("transport_type") or request.get("vehicle_type"),
+            "delivery_date": request.get("desired_date")
+            or request.get("delivery_date")
+            or request.get("loading_date"),
+            "status": "in_progress",
+            "source": "exporter",
+            "created_at": now_sql,
+            "accepted_at": now_sql,
+        }
 
     # Уведомляем экспедитора
     await callback.message.edit_text(
@@ -21544,7 +24389,11 @@ async def expeditor_accept_request(callback: types.CallbackQuery, state: FSMCont
     )
 
     # Уведомляем экспортёра
-    exporter_id = request.get("exporter_id")
+    exporter_id = (
+        request.get("exporter_id")
+        or request.get("customer_id")
+        or request.get("created_by")
+    )
     if exporter_id:
         try:
             await bot.send_message(
@@ -21578,6 +24427,8 @@ async def expeditor_accept_request(callback: types.CallbackQuery, state: FSMCont
         save_logistic_offers()
     if expeditor_offers_updated:
         save_expeditor_data()
+    if expeditor_routes_updated:
+        save_expeditor_offers()
     save_deliveries()
     await callback.answer("✅ Заявка принята!", show_alert=True)
     logging.info(f"✅ Экспедитор {expeditor_id} принял заявку {request_id}")
@@ -21598,20 +24449,50 @@ async def back_to_exp_requests(callback: types.CallbackQuery, state: FSMContext)
     for req_id, req in shipping_requests.items():
         if not isinstance(req, dict):
             continue
-        if not is_request_open_for_expeditor(req.get("status")):
-            continue
-        if has_assigned_expeditor(req):
-            continue
-        if not has_assigned_logist(req):
-            continue
         request_owner_id = (
             req.get("customer_id")
             or req.get("created_by")
             or req.get("exporter_id")
             or req.get("farmer_id")
-            or req.get("logist_id")
+            or req.get("user_id")
+            or (
+                req.get("logist_id")
+                if not (req.get("assigned_logist_id") or req.get("selected_logistic"))
+                else None
+            )
         )
+        status = get_effective_request_status(
+            req.get("id", req_id),
+            "exporter",
+            req,
+            request_owner_id=request_owner_id,
+            request_exporter_id=(
+                req.get("exporter_id")
+                or req.get("customer_id")
+                or req.get("created_by")
+            ),
+        )
+        if not is_request_open_for_expeditor(status):
+            continue
+        if has_assigned_expeditor(req):
+            continue
+        if not has_assigned_logist(req):
+            continue
         if same_id(request_owner_id, user_id):
+            continue
+        if (
+            get_request_delivery_guard_state(
+                req.get("id", req_id),
+                "exporter",
+                request_owner_id=request_owner_id,
+                request_exporter_id=(
+                    req.get("exporter_id")
+                    or req.get("customer_id")
+                    or req.get("created_by")
+                ),
+            )
+            is not None
+        ):
             continue
         canonical_id = req.get("id", req_id)
         canonical_key = f"exporter:{canonical_id}"
@@ -21622,20 +24503,42 @@ async def back_to_exp_requests(callback: types.CallbackQuery, state: FSMContext)
     for req_id, req in logistics_requests.items():
         if not isinstance(req, dict):
             continue
-        if not is_request_open_for_expeditor(req.get("status")):
-            continue
-        if has_assigned_expeditor(req):
-            continue
-        if not has_assigned_logist(req):
-            continue
         request_owner_id = (
             req.get("customer_id")
             or req.get("created_by")
             or req.get("exporter_id")
             or req.get("farmer_id")
-            or req.get("logist_id")
+            or req.get("user_id")
+            or (
+                req.get("logist_id")
+                if not (req.get("assigned_logist_id") or req.get("selected_logistic"))
+                else None
+            )
         )
+        status = get_effective_request_status(
+            req.get("id", req_id),
+            "logistics",
+            req,
+            request_owner_id=request_owner_id,
+            request_exporter_id=req.get("exporter_id"),
+        )
+        if not is_request_open_for_expeditor(status):
+            continue
+        if has_assigned_expeditor(req):
+            continue
+        if not has_assigned_logist(req):
+            continue
         if same_id(request_owner_id, user_id):
+            continue
+        if (
+            get_request_delivery_guard_state(
+                req.get("id", req_id),
+                "logistics",
+                request_owner_id=request_owner_id,
+                request_exporter_id=req.get("exporter_id"),
+            )
+            is not None
+        ):
             continue
         canonical_id = req.get("id", req_id)
         canonical_key = f"logistics:{canonical_id}"
@@ -21646,20 +24549,40 @@ async def back_to_exp_requests(callback: types.CallbackQuery, state: FSMContext)
     for req_id, req in farmer_shipping_requests.items():
         if not isinstance(req, dict):
             continue
-        if not is_request_open_for_expeditor(req.get("status")):
+        request_owner_id = (
+            req.get("farmer_id")
+            or req.get("user_id")
+            or req.get("created_by")
+            or req.get("customer_id")
+            or req.get("exporter_id")
+            or (
+                req.get("logist_id")
+                if not (req.get("assigned_logist_id") or req.get("selected_logistic"))
+                else None
+            )
+        )
+        status = get_effective_request_status(
+            req.get("id", req_id),
+            "farmer",
+            req,
+            request_owner_id=request_owner_id,
+        )
+        if not is_request_open_for_expeditor(status):
             continue
         if has_assigned_expeditor(req):
             continue
         if not has_assigned_logist(req):
             continue
-        request_owner_id = (
-            req.get("farmer_id")
-            or req.get("created_by")
-            or req.get("customer_id")
-            or req.get("exporter_id")
-            or req.get("logist_id")
-        )
         if same_id(request_owner_id, user_id):
+            continue
+        if (
+            get_request_delivery_guard_state(
+                req.get("id", req_id),
+                "farmer",
+                request_owner_id=request_owner_id,
+            )
+            is not None
+        ):
             continue
         canonical_id = req.get("id", req_id)
         canonical_key = f"farmer:{canonical_id}"
@@ -21670,20 +24593,40 @@ async def back_to_exp_requests(callback: types.CallbackQuery, state: FSMContext)
     for req_id, req in farmer_logistics_requests.items():
         if not isinstance(req, dict):
             continue
-        if not is_request_open_for_expeditor(req.get("status")):
+        request_owner_id = (
+            req.get("farmer_id")
+            or req.get("user_id")
+            or req.get("created_by")
+            or req.get("customer_id")
+            or req.get("exporter_id")
+            or (
+                req.get("logist_id")
+                if not (req.get("assigned_logist_id") or req.get("selected_logistic"))
+                else None
+            )
+        )
+        status = get_effective_request_status(
+            req.get("id", req_id),
+            "farmer",
+            req,
+            request_owner_id=request_owner_id,
+        )
+        if not is_request_open_for_expeditor(status):
             continue
         if has_assigned_expeditor(req):
             continue
         if not has_assigned_logist(req):
             continue
-        request_owner_id = (
-            req.get("farmer_id")
-            or req.get("created_by")
-            or req.get("customer_id")
-            or req.get("exporter_id")
-            or req.get("logist_id")
-        )
         if same_id(request_owner_id, user_id):
+            continue
+        if (
+            get_request_delivery_guard_state(
+                req.get("id", req_id),
+                "farmer",
+                request_owner_id=request_owner_id,
+            )
+            is not None
+        ):
             continue
         canonical_id = req.get("id", req_id)
         canonical_key = f"farmer:{canonical_id}"
@@ -21801,7 +24744,7 @@ async def my_deliveries_handler(message: types.Message, state: FSMContext):
         # Группируем по статусам
         by_status = {"pending": [], "in_progress": [], "completed": [], "cancelled": []}
         for deliv_id, deliv in my_deliveries:
-            status = normalize_transition_status(deliv.get("status", "pending"))
+            status = get_effective_delivery_status(deliv)
             if status not in by_status:
                 status = "pending"
             by_status[status].append((deliv_id, deliv))
@@ -21809,7 +24752,7 @@ async def my_deliveries_handler(message: types.Message, state: FSMContext):
         in_progress = by_status["in_progress"] + by_status["pending"]
         completed = by_status["completed"]
 
-        total_earnings = sum(d.get("price", 0) for _, d in completed)
+        total_earnings = sum(get_safe_float(d.get("price"), 0) for _, d in completed)
 
         text = "🚛 <b>Мои доставки</b>\n\n"
         text += "📊 <b>Статистика:</b>\n"
@@ -21823,8 +24766,8 @@ async def my_deliveries_handler(message: types.Message, state: FSMContext):
             text += f"<b>🟢 В процессе ({len(in_progress)}):</b>\n\n"
             for delivery_id, deliv in in_progress[:5]:
                 route = f"{deliv.get('route_from', '')}→{deliv.get('route_to', '')}"
-                volume = deliv.get("volume", 0)
-                price = deliv.get("price", 0)
+                volume = get_safe_float(deliv.get("volume"), 0)
+                price = get_safe_float(deliv.get("price"), 0)
 
                 text += (
                     f"🚚 <b>#{delivery_id}</b> | "
@@ -21847,7 +24790,7 @@ async def my_deliveries_handler(message: types.Message, state: FSMContext):
                 route = f"{deliv.get('route_from', '')}→{deliv.get('route_to', '')}"
                 text += (
                     f"✔️ #{delivery_id} | {route} | "
-                    f"{deliv.get('price', 0):,.0f} ₽\n".replace(",", " ")
+                    f"{get_safe_float(deliv.get('price'), 0):,.0f} ₽\n".replace(",", " ")
                 )
 
         keyboard.add(
@@ -21916,12 +24859,8 @@ async def my_deliveries_handler(message: types.Message, state: FSMContext):
 
             if not same_id(assigned_expeditor_id, user_id):
                 continue
-            delivery_status_norm = normalize_transition_status(delivery_obj.get("status"))
-            request_status_norm = normalize_transition_status(linked_request.get("status"))
-            effective_status = (
-                request_status_norm
-                if request_status_norm in {"in_progress", "expeditor_selected"}
-                else delivery_status_norm
+            effective_status = get_effective_delivery_status(
+                delivery_obj, linked_request
             )
             if effective_status not in {
                 "in_progress",
@@ -22161,7 +25100,9 @@ async def expeditor_delivery_details(callback: types.CallbackQuery, state: FSMCo
     if delivery_source == "farmer":
         owner_id = (
             request.get("farmer_id")
+            or request.get("user_id")
             or entity.get("farmer_id")
+            or entity.get("user_id")
             or request.get("created_by")
             or entity.get("created_by")
         )
@@ -22173,9 +25114,17 @@ async def expeditor_delivery_details(callback: types.CallbackQuery, state: FSMCo
             or entity.get("created_by")
             or request.get("exporter_id")
             or entity.get("exporter_id")
-            or request.get("logist_id")
-            or entity.get("logist_id")
         )
+        if not owner_id:
+            legacy_logist_owner_id = request.get("logist_id") or entity.get("logist_id")
+            has_assigned_logist_id = bool(
+                request.get("assigned_logist_id")
+                or request.get("selected_logistic")
+                or entity.get("assigned_logist_id")
+                or entity.get("selected_logistic")
+            )
+            if legacy_logist_owner_id and not has_assigned_logist_id:
+                owner_id = legacy_logist_owner_id
     else:
         owner_id = (
             request.get("exporter_id")
@@ -22194,21 +25143,22 @@ async def expeditor_delivery_details(callback: types.CallbackQuery, state: FSMCo
         or entity.get("delivery_date")
         or "—"
     )
-    request_status = normalize_transition_status(
-        (request if isinstance(request, dict) else {}).get("status") or entity.get("status")
+    effective_status = get_effective_delivery_status(
+        delivery if isinstance(delivery, dict) else request,
+        request if isinstance(request, dict) else None,
     )
     status_text = {
         "expeditor_selected": "🚛 Экспедитор выбран",
         "in_progress": "🚚 В работе",
         "completed": "✅ Завершена",
         "cancelled": "❌ Отменена",
-    }.get(request_status, entity.get("status", "—"))
+    }.get(effective_status, entity.get("status", "—"))
 
     text = (
         f"🚛 <b>Доставка #{entity_id}</b>\n\n"
         f"📊 Статус: {status_text}\n"
         f"🌾 Культура: {entity.get('culture', '—')}\n"
-        f"📦 Объём: {entity.get('volume', 0):.0f} т\n"
+        f"📦 Объём: {get_safe_float(entity.get('volume'), 0):.0f} т\n"
         f"📍 Маршрут: {route_from} → {route_to}\n"
         f"📅 Дата: {delivery_date}\n\n"
         "<b>👤 Контакты заказчика:</b>\n"
@@ -22226,7 +25176,7 @@ async def expeditor_delivery_details(callback: types.CallbackQuery, state: FSMCo
             )
         )
 
-    if request_status in {"in_progress", "expeditor_selected"}:
+    if effective_status == "in_progress":
         complete_ref = (
             f"delivery_{entity_id}"
             if delivery is not None
@@ -22448,18 +25398,70 @@ async def expeditor_complete_delivery(callback: types.CallbackQuery, state: FSMC
             return
 
     entity = delivery if isinstance(delivery, dict) else request
-    request_status = normalize_transition_status(
-        (request if isinstance(request, dict) else {}).get("status") or entity.get("status")
+    request_owner_id_for_status = None
+    request_exporter_id_for_status = None
+    if isinstance(request, dict):
+        if delivery_source == "farmer":
+            request_owner_id_for_status = request.get("farmer_id") or request.get("user_id")
+        elif delivery_source == "logistics":
+            request_owner_id_for_status = (
+                request.get("customer_id")
+                or request.get("created_by")
+                or request.get("exporter_id")
+            )
+            if not request_owner_id_for_status:
+                legacy_logist_owner_id = request.get("logist_id")
+                has_assigned_logist_id = bool(
+                    request.get("assigned_logist_id") or request.get("selected_logistic")
+                )
+                if legacy_logist_owner_id and not has_assigned_logist_id:
+                    request_owner_id_for_status = legacy_logist_owner_id
+        else:
+            request_exporter_id_for_status = (
+                request.get("exporter_id")
+                or request.get("customer_id")
+                or request.get("created_by")
+            )
+    request_status = (
+        get_effective_request_status(
+            request_id,
+            delivery_source,
+            request,
+            request_owner_id=request_owner_id_for_status,
+            request_exporter_id=request_exporter_id_for_status,
+        )
+        if isinstance(request, dict)
+        else normalize_transition_status(entity.get("status"))
     )
+    delivery_status = (
+        get_effective_delivery_status(
+            delivery,
+            request if isinstance(request, dict) else None,
+        )
+        if isinstance(delivery, dict)
+        else request_status
+    )
+    if delivery_status == "completed":
+        await callback.answer("ℹ️ Доставка уже завершена", show_alert=True)
+        return
+    if delivery_status == "cancelled":
+        await callback.answer("❌ Доставка уже отменена", show_alert=True)
+        return
     if request_status == "completed":
         await callback.answer("ℹ️ Доставка уже завершена", show_alert=True)
         return
     if request_status == "cancelled":
         await callback.answer("❌ Заявка уже отменена", show_alert=True)
         return
-    if request_status not in {"in_progress", "expeditor_selected"}:
+    if request_status != "in_progress":
         await callback.answer(
             "❌ Завершение доступно только для заявки в работе", show_alert=True
+        )
+        return
+    if isinstance(delivery, dict) and delivery_status != "in_progress":
+        await callback.answer(
+            "❌ Завершение доступно только для активной доставки",
+            show_alert=True,
         )
         return
 
@@ -22488,13 +25490,24 @@ async def expeditor_complete_delivery(callback: types.CallbackQuery, state: FSMC
 
     request_exporter_id = None
     if isinstance(request, dict):
-        request_exporter_id = request.get("exporter_id")
+        request_exporter_id = (
+            request.get("exporter_id")
+            or request.get("customer_id")
+            or request.get("created_by")
+        )
     if request_exporter_id is None and isinstance(delivery, dict):
-        request_exporter_id = delivery.get("exporter_id")
+        request_exporter_id = (
+            delivery.get("exporter_id")
+            or delivery.get("customer_id")
+            or delivery.get("created_by")
+        )
 
     if delivery_source == "farmer":
-        request_owner_id = (request if isinstance(request, dict) else {}).get("farmer_id") or (delivery or {}).get(
-            "farmer_id"
+        request_owner_id = (
+            (request if isinstance(request, dict) else {}).get("farmer_id")
+            or (request if isinstance(request, dict) else {}).get("user_id")
+            or (delivery or {}).get("farmer_id")
+            or (delivery or {}).get("user_id")
         )
     elif delivery_source == "logistics":
         request_owner_id = (
@@ -22511,8 +25524,8 @@ async def expeditor_complete_delivery(callback: types.CallbackQuery, state: FSMC
 
     # Если есть logistic_offers, помечаем все офферы по этой заявке как завершённые
     try:
-        active_offer_statuses = {"accepted", "assigned", "in_progress"}
-        pending_offer_statuses = {"pending", "active", "new", "open"}
+        active_offer_statuses = SELECTED_LOGISTIC_OFFER_STATUSES
+        pending_offer_statuses = OPEN_LOGISTIC_OFFER_STATUSES
         for _, offer in logistic_offers.items():
             if not isinstance(offer, dict):
                 continue
@@ -22576,18 +25589,12 @@ async def expeditor_complete_delivery(callback: types.CallbackQuery, state: FSMC
             if status_norm in {"completed", "cancelled", "rejected"}:
                 continue
             if same_id(offer.get("expeditor_id"), user_id):
-                if status_norm not in {"accepted", "assigned", "in_progress"}:
+                if status_norm not in SELECTED_EXPEDITOR_OFFER_STATUSES:
                     continue
                 offer["status"] = "completed"
                 offer["completed_at"] = now_sql
             else:
-                if status_norm not in {
-                    "accepted",
-                    "assigned",
-                    "in_progress",
-                    "pending",
-                    "active",
-                }:
+                if status_norm not in MUTABLE_EXPEDITOR_OFFER_STATUSES:
                     continue
                 offer["status"] = "rejected"
                 offer["rejected_at"] = now_sql
@@ -22640,11 +25647,11 @@ async def expeditor_complete_delivery(callback: types.CallbackQuery, state: FSMC
             if route_status in {"completed", "cancelled", "rejected"}:
                 continue
             if same_id(route_offer.get("expeditor_id"), user_id):
-                if route_status in {"accepted", "assigned", "in_progress"}:
+                if route_status in SELECTED_EXPEDITOR_OFFER_STATUSES:
                     route_offer["status"] = "completed"
                     route_offer["completed_at"] = now_sql
                     touched_expeditor_routes = True
-            elif route_status in {"accepted", "assigned", "in_progress", "pending", "active", "new", "open"}:
+            elif route_status in MUTABLE_EXPEDITOR_OFFER_STATUSES:
                 route_offer["status"] = "rejected"
                 route_offer["rejected_at"] = now_sql
                 route_offer["rejection_reason"] = "Заявка завершена экспедитором"
@@ -22691,12 +25698,32 @@ async def expeditor_complete_delivery(callback: types.CallbackQuery, state: FSMC
                     continue
         if delivery_obj_source != delivery_source:
             continue
-        if delivery_source == "exporter" and request_exporter_id and not same_id(
-            delivery_obj.get("exporter_id"), request_exporter_id
+        if (
+            delivery_source == "exporter"
+            and request_exporter_id
+            and (
+                delivery_obj.get("exporter_id")
+                or delivery_obj.get("customer_id")
+                or delivery_obj.get("created_by")
+            )
+            not in {None, ""}
+            and not same_id(
+                delivery_obj.get("exporter_id")
+                or delivery_obj.get("customer_id")
+                or delivery_obj.get("created_by"),
+                request_exporter_id,
+            )
         ):
             continue
-        if delivery_source == "farmer" and request_owner_id and not same_id(
-            delivery_obj.get("farmer_id"), request_owner_id
+        if (
+            delivery_source == "farmer"
+            and request_owner_id
+            and (delivery_obj.get("farmer_id") or delivery_obj.get("user_id"))
+            not in {None, ""}
+            and not same_id(
+                delivery_obj.get("farmer_id") or delivery_obj.get("user_id"),
+                request_owner_id,
+            )
         ):
             continue
         if delivery_source == "logistics" and request_owner_id:
@@ -22706,7 +25733,9 @@ async def expeditor_complete_delivery(callback: types.CallbackQuery, state: FSMC
                 or delivery_obj.get("exporter_id")
                 or delivery_obj.get("logist_id")
             )
-            if not same_id(delivery_owner_id, request_owner_id):
+            if delivery_owner_id not in {None, ""} and not same_id(
+                delivery_owner_id, request_owner_id
+            ):
                 continue
         if delivery_obj.get("expeditor_id") and not same_id(
             delivery_obj.get("expeditor_id"), user_id
@@ -22723,6 +25752,7 @@ async def expeditor_complete_delivery(callback: types.CallbackQuery, state: FSMC
 
     # Закрываем связанные сделки
     updated_deals = 0
+    all_pulls = pulls.get("pulls", {}) if isinstance(pulls, dict) else {}
     for deal in deals.values():
         if not isinstance(deal, dict):
             continue
@@ -22760,12 +25790,38 @@ async def expeditor_complete_delivery(callback: types.CallbackQuery, state: FSMC
                     continue
         if deal_source != delivery_source:
             continue
-        if delivery_source == "exporter" and request_exporter_id and not same_id(
-            deal.get("exporter_id"), request_exporter_id
+        deal_pull_id = deal.get("pull_id")
+        deal_pull = all_pulls.get(deal_pull_id) or all_pulls.get(str(deal_pull_id), {})
+        deal_exporter_id = (
+            deal.get("exporter_id")
+            or deal_pull.get("exporter_id")
+            or deal_pull.get("creator_id")
+        )
+        if (
+            delivery_source == "exporter"
+            and request_exporter_id
+            and deal_exporter_id not in {None, ""}
+            and not same_id(deal_exporter_id, request_exporter_id)
         ):
             continue
-        if delivery_source == "farmer" and request_owner_id and not same_id(
-            deal.get("farmer_id"), request_owner_id
+        if (
+            delivery_source == "farmer"
+            and request_owner_id
+            and (
+                (deal.get("farmer_ids") or [])
+                or (deal.get("farmer_id") not in {None, ""})
+            )
+            and not any(
+                same_id(fid, request_owner_id)
+                for fid in [
+                    *(deal.get("farmer_ids") or []),
+                    *(
+                        []
+                        if deal.get("farmer_id") in {None, ""}
+                        else [deal.get("farmer_id")]
+                    ),
+                ]
+            )
         ):
             continue
         if delivery_source == "logistics" and request_owner_id:
@@ -22775,9 +25831,12 @@ async def expeditor_complete_delivery(callback: types.CallbackQuery, state: FSMC
                 or deal.get("exporter_id")
                 or deal.get("logist_id")
             )
-            if not same_id(deal_owner_id, request_owner_id):
+            if deal_owner_id not in {None, ""} and not same_id(
+                deal_owner_id, request_owner_id
+            ):
                 continue
-        if normalize_transition_status(deal.get("status")) in {"completed", "cancelled"}:
+        deal_effective_status = get_effective_deal_status(deal)
+        if deal_effective_status in {"completed", "cancelled"}:
             continue
         deal["status"] = "completed"
         deal["completed_at"] = now_sql
@@ -22795,7 +25854,12 @@ async def expeditor_complete_delivery(callback: types.CallbackQuery, state: FSMC
                 req.get("exporter_id"), request_exporter_id
             ):
                 continue
-            req_status = normalize_transition_status(req.get("status"))
+            req_status = get_effective_request_status(
+                req.get("id"),
+                "exporter",
+                req,
+                request_exporter_id=request_exporter_id,
+            )
             if req_status not in {"completed", "cancelled", "rejected"}:
                 has_open_pull_requests = True
                 break
@@ -22859,18 +25923,12 @@ async def expeditor_complete_delivery(callback: types.CallbackQuery, state: FSMC
                 if pull_offer_status in {"completed", "cancelled", "rejected"}:
                     continue
                 if same_id(pull_offer.get("expeditor_id"), user_id):
-                    if pull_offer_status not in {"accepted", "assigned", "in_progress"}:
+                    if pull_offer_status not in SELECTED_EXPEDITOR_OFFER_STATUSES:
                         continue
                     pull_offer["status"] = "completed"
                     pull_offer["completed_at"] = now_sql
                 else:
-                    if pull_offer_status not in {
-                        "accepted",
-                        "assigned",
-                        "in_progress",
-                        "pending",
-                        "active",
-                    }:
+                    if pull_offer_status not in MUTABLE_EXPEDITOR_OFFER_STATUSES:
                         continue
                     pull_offer["status"] = "rejected"
                     pull_offer["rejected_at"] = now_sql
@@ -22993,7 +26051,7 @@ async def save_completed_deal_to_sheets(pull_id: int, request_id: int) -> bool:
 
         # 3. Достаём IDs участников
         exporter_id = pull.get("exporter_id") or pull.get("creator_id")
-        farmer_id = request.get("farmer_id")
+        farmer_id = request.get("farmer_id") or request.get("user_id")
         logist_id = get_assigned_logist_id(request)
         expeditor_id = get_assigned_expeditor_id(request)
 
@@ -23013,11 +26071,17 @@ async def save_completed_deal_to_sheets(pull_id: int, request_id: int) -> bool:
         port = pull.get("port", "")
         doc_type = pull.get("doc_type", "")
         documents = pull.get("documents", "")
-        pull_price = pull.get("price") or pull.get("price_per_ton") or 0
-        pull_volume = pull.get("target_volume") or 0
+        pull_price = get_safe_float(
+            pull.get("price") or pull.get("price_per_ton"), 0
+        )
+        pull_volume = get_safe_float(pull.get("target_volume"), 0)
 
-        shipped_volume = request.get("volume") or request.get("shipped_volume") or 0
-        freight_price = request.get("price") or request.get("freight_price") or 0
+        shipped_volume = get_safe_float(
+            request.get("volume") or request.get("shipped_volume"), 0
+        )
+        freight_price = get_safe_float(
+            request.get("price") or request.get("freight_price"), 0
+        )
         status = request.get("status", "completed")
         completed_at = request.get(
             "completed_at", datetime.now().strftime("%d.%m.%Y %H:%M")
@@ -23135,7 +26199,7 @@ async def expeditor_delivery_history(message: types.Message, state: FSMContext):
             assigned_expeditor_id = get_assigned_expeditor_id(linked_request)
         if not same_id(assigned_expeditor_id, user_id):
             continue
-        if normalize_transition_status(deliv.get("status")) != "completed":
+        if get_effective_delivery_status(deliv, linked_request) != "completed":
             continue
         canonical_id = deliv.get("id", deliv_id)
         canonical_key = str(canonical_id)
@@ -23182,16 +26246,25 @@ async def logist_view_expeditor_card(callback: types.CallbackQuery, state: FSMCo
         return
 
     try:
-        expeditor_id = int(callback.data.split(":")[1])
+        expeditor_id_raw = callback.data.split(":", 1)[1]
+        expeditor_id = (
+            int(expeditor_id_raw)
+            if str(expeditor_id_raw).isdigit()
+            else str(expeditor_id_raw).strip()
+        )
     except (IndexError, ValueError):
         await callback.answer("❌ Ошибка", show_alert=True)
         return
 
-    if expeditor_id not in expeditor_cards:
+    card = (
+        expeditor_cards.get(expeditor_id) or expeditor_cards.get(str(expeditor_id))
+        if isinstance(expeditor_cards, dict)
+        else None
+    )
+    if not isinstance(card, dict):
         await callback.answer("❌ Карточка не найдена", show_alert=True)
         return
 
-    card = expeditor_cards[expeditor_id]
     expeditor = get_user_by_id(expeditor_id) or {}
 
     # Увеличиваем счётчик просмотров
@@ -23215,7 +26288,7 @@ async def logist_view_expeditor_card(callback: types.CallbackQuery, state: FSMCo
         f"Грузоподъёмность: {card.get('capacity', 0)} т\n\n"
         f"<b>📍 Регионы работы:</b>\n{regions_text}\n\n"
         "<b>💰 Тарифы:</b>\n"
-        f"Цена за км: {card.get('price_per_km', 0):.2f} ₽/км\n\n"
+        f"Цена за км: {get_safe_float(card.get('price_per_km'), 0):.2f} ₽/км\n\n"
         f"<b>📝 Описание:</b>\n{card.get('description', 'Не указано')}\n\n"
         "<b>👤 Контакты экспедитора:</b>\n"
         f"Имя: {card.get('user_name', expeditor.get('full_name', 'N/A'))}\n"
@@ -23232,7 +26305,7 @@ async def logist_view_expeditor_card(callback: types.CallbackQuery, state: FSMCo
     # ✅ ПРОВЕРЯЕМ VALID ID И ДОБАВЛЯЕМ КНОПКУ БЕЗОПАСНО
     try:
         # Проверяем что ID валидный
-        if expeditor_id > 0 and get_user_by_id(expeditor_id):
+        if get_user_by_id(expeditor_id):
             username = expeditor.get("username")
 
             if username:
@@ -23286,7 +26359,12 @@ async def send_message_to_expeditor(callback: types.CallbackQuery):
         return
 
     try:
-        expeditor_id = int(callback.data.split(":")[1])
+        expeditor_id_raw = callback.data.split(":", 1)[1]
+        expeditor_id = (
+            int(expeditor_id_raw)
+            if str(expeditor_id_raw).isdigit()
+            else str(expeditor_id_raw).strip()
+        )
     except (ValueError, IndexError):
         await callback.answer("❌ Ошибка данных", show_alert=True)
         return
@@ -23388,7 +26466,22 @@ async def view_shipping_requests_callback(callback: CallbackQuery):
         req
         for req in shipping_requests.values()
         if same_id(req.get("pull_id"), pull_id)
-        and normalize_transition_status(req.get("status")) not in {"completed", "cancelled", "rejected"}
+        and get_effective_request_status(
+            req.get("id", req.get("request_id", pull_id)),
+            "exporter",
+            req,
+            request_owner_id=(
+                req.get("exporter_id")
+                or req.get("customer_id")
+                or req.get("created_by")
+            ),
+            request_exporter_id=(
+                req.get("exporter_id")
+                or req.get("customer_id")
+                or req.get("created_by")
+            ),
+        )
+        not in {"completed", "cancelled", "rejected"}
     ]
 
     if not relevant_requests:
@@ -23409,7 +26502,7 @@ async def view_shipping_requests_callback(callback: CallbackQuery):
             continue
         route_from = req.get("route_from") or req.get("from_city") or "—"
         route_to = req.get("route_to") or req.get("to_city") or "—"
-        volume = req.get("volume", 0) or 0
+        volume = get_safe_float(req.get("volume"), 0)
         status = get_offer_status_display(req.get("status", "active"))
         button_text = f"📦 #{request_id} | {volume:.0f}т | {route_from}→{route_to} | {status}"
         keyboard.add(
@@ -23470,15 +26563,27 @@ async def select_logist_for_pull(callback: CallbackQuery):
         return
     user_id = callback.from_user.id
     user_role = (get_user_by_id(user_id) or {}).get("role")
-    if not (user_role == "admin" or same_id(request.get("exporter_id"), user_id)):
+    request_owner_id = (
+        request.get("exporter_id")
+        or request.get("customer_id")
+        or request.get("created_by")
+    )
+    if not (user_role == "admin" or same_id(request_owner_id, user_id)):
         await callback.answer("❌ Нет доступа", show_alert=True)
         return
-    if not is_request_open_for_offers(request.get("status")):
+    request_status = get_effective_request_status(
+        request_id,
+        "exporter",
+        request,
+        request_owner_id=request_owner_id,
+        request_exporter_id=request_owner_id,
+    )
+    if not is_request_open_for_offers(request_status):
         await callback.answer(
             "❌ Заявка уже не в статусе выбора логиста", show_alert=True
         )
         return
-    if normalize_transition_status(request.get("status")) in {
+    if request_status in {
         "completed",
         "cancelled",
         "rejected",
@@ -23503,72 +26608,105 @@ async def select_logist_for_pull(callback: CallbackQuery):
         await callback.answer("❌ Профиль логиста не найден", show_alert=True)
         return
 
-    # Обновляем статус заявки
+    now_sql = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    request_exporter_id = (
+        request.get("exporter_id")
+        or request.get("customer_id")
+        or request.get("created_by")
+    )
+    matching_deliveries = [
+        (deliv_key, d)
+        for deliv_key, d in deliveries.items()
+        if isinstance(d, dict)
+        and same_id(d.get("request_id"), request_id)
+        and (
+            not request_exporter_id
+            or (
+                d.get("exporter_id") or d.get("customer_id") or d.get("created_by")
+            )
+            in {None, ""}
+            or same_id(
+                d.get("exporter_id") or d.get("customer_id") or d.get("created_by"),
+                request_exporter_id,
+            )
+        )
+        and str(d.get("source") or "").strip().lower() in {"", "exporter"}
+    ]
+    if any(
+        get_effective_delivery_status(d, request if isinstance(request, dict) else None)
+        in {"completed", "cancelled"}
+        for _, d in matching_deliveries
+    ):
+        await callback.answer(
+            "❌ По заявке уже есть закрытая доставка", show_alert=True
+        )
+        return
+    if any(
+        get_effective_delivery_status(d, request if isinstance(request, dict) else None)
+        in {"in_progress", "expeditor_selected"}
+        for _, d in matching_deliveries
+    ):
+        await callback.answer(
+            "❌ По заявке уже есть доставка в работе", show_alert=True
+        )
+        return
+
+    # Обновляем статус заявки только после проверки целостности доставок.
     request["status"] = "assigned"
     request["selected_by"] = user_id
-    request["selected_at"] = datetime.now().strftime(
-        "%d.%m.%Y %H:%M"
-    )
-    request["assigned_at"] = datetime.now().strftime(
-        "%Y-%m-%d %H:%M:%S"
-    )
+    request["selected_at"] = datetime.now().strftime("%d.%m.%Y %H:%M")
+    request["assigned_at"] = now_sql
     request["logist_id"] = logist_id
     request["assigned_logist_id"] = logist_id
 
     # Создаём доставку, если ещё не создана (или переиспользуем по request_id)
-    request_exporter_id = request.get("exporter_id")
-    existing_delivery = next(
-        (
-            d
-            for d in deliveries.values()
-            if same_id(d.get("request_id"), request_id)
-            and same_id(d.get("exporter_id"), request_exporter_id)
-            and str(d.get("source") or "").strip().lower() in {"", "exporter"}
-        ),
-        None,
-    )
-    if existing_delivery:
-        if normalize_transition_status(existing_delivery.get("status")) in {
-            "completed",
-            "cancelled",
-        }:
-            await callback.answer(
-                "❌ По заявке уже есть закрытая доставка", show_alert=True
+    active_matching_deliveries = [
+        (deliv_key, d)
+        for deliv_key, d in matching_deliveries
+        if get_effective_delivery_status(d, request if isinstance(request, dict) else None)
+        not in {"completed", "cancelled"}
+    ]
+    if active_matching_deliveries:
+        for existing_delivery_key, existing_delivery in active_matching_deliveries:
+            if existing_delivery.get("id") is None:
+                existing_delivery["id"] = (
+                    int(existing_delivery_key)
+                    if str(existing_delivery_key).isdigit()
+                    else existing_delivery_key
+                )
+            existing_delivery["exporter_id"] = request_exporter_id
+            existing_delivery["logist_id"] = logist_id
+            existing_delivery["pull_id"] = request.get("pull_id")
+            existing_delivery["route_from"] = (
+                request.get("route_from") or request.get("from") or request.get("from_city")
             )
-            return
-        existing_delivery["exporter_id"] = request.get("exporter_id")
-        existing_delivery["logist_id"] = logist_id
-        existing_delivery["pull_id"] = request.get("pull_id")
-        existing_delivery["route_from"] = (
-            request.get("route_from") or request.get("from") or request.get("from_city")
-        )
-        existing_delivery["route_to"] = (
-            request.get("route_to") or request.get("to") or request.get("to_city")
-        )
-        existing_delivery["volume"] = request.get("volume", 0)
-        existing_delivery["price"] = request.get("price", 0)
-        existing_delivery["vehicle_type"] = request.get("vehicle_type")
-        existing_delivery["delivery_date"] = request.get("desired_date") or request.get("delivery_date")
-        existing_delivery["status"] = "pending"
-        existing_delivery["source"] = "exporter"
-        existing_delivery["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            existing_delivery["route_to"] = (
+                request.get("route_to") or request.get("to") or request.get("to_city")
+            )
+            existing_delivery["volume"] = request.get("volume", 0)
+            existing_delivery["price"] = get_safe_float(request.get("price"), 0)
+            existing_delivery["vehicle_type"] = request.get("vehicle_type")
+            existing_delivery["delivery_date"] = request.get("desired_date") or request.get("delivery_date")
+            existing_delivery["status"] = "pending"
+            existing_delivery["source"] = "exporter"
+            existing_delivery["updated_at"] = now_sql
     else:
         delivery_id = next_numeric_id(deliveries)
         deliveries[delivery_id] = {
             "id": delivery_id,
             "request_id": request_id,
-            "exporter_id": request.get("exporter_id"),
+            "exporter_id": request_exporter_id,
             "logist_id": logist_id,
             "pull_id": request.get("pull_id"),
             "route_from": request.get("route_from") or request.get("from") or request.get("from_city"),
             "route_to": request.get("route_to") or request.get("to") or request.get("to_city"),
             "volume": request.get("volume", 0),
-            "price": request.get("price", 0),
+            "price": get_safe_float(request.get("price"), 0),
             "vehicle_type": request.get("vehicle_type"),
             "delivery_date": request.get("desired_date") or request.get("delivery_date"),
             "status": "pending",
             "source": "exporter",
-            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "created_at": now_sql,
         }
 
     # Если есть офферы логистов по этой заявке — синхронизируем статусы
@@ -23577,7 +26715,10 @@ async def select_logist_for_pull(callback: CallbackQuery):
             continue
         if not logistic_offer_matches_request(offer, request_id, "exporter"):
             continue
-        if normalize_transition_status(offer.get("status") or "pending") not in {"pending", "active"}:
+        if (
+            normalize_transition_status(offer.get("status") or "pending")
+            not in OPEN_LOGISTIC_OFFER_STATUSES
+        ):
             continue
         if same_id(get_offer_logist_id(offer), logist_id):
             offer["status"] = "accepted"
@@ -23586,6 +26727,7 @@ async def select_logist_for_pull(callback: CallbackQuery):
         else:
             offer["status"] = "rejected"
             offer["rejected_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    request["offers_count"] = count_open_logistic_offers_for_request(request_id, "exporter")
 
     save_shipping_requests()
     save_logistic_offers()
@@ -23641,13 +26783,21 @@ def edit_pull_fields_keyboard():
 async def send_daily_stats():
     """Ежедневная отправка статистики админу"""
     try:
-        total_users = len(users)
+        unique_users = {}
+        for user_id_data, user_data in users.items():
+            if not isinstance(user_data, dict):
+                continue
+            canonical_user_id = user_data.get("id", user_id_data)
+            canonical_key = str(canonical_user_id)
+            if canonical_key in unique_users:
+                continue
+            unique_users[canonical_key] = user_data
+
+        total_users = len(unique_users)
         role_stats = defaultdict(int)
 
-        # ✅ ПРАВИЛЬНО: итерируемся по user_data
-        for user in users.values():
-            if not isinstance(user, dict):
-                continue
+        # ✅ ПРАВИЛЬНО: итерируемся по уникальным user_data
+        for user in unique_users.values():
             role = user.get("role", "unknown")
             role_stats[role] += 1
 
@@ -23807,7 +26957,7 @@ async def logistic_volume(message: types.Message, state: FSMContext):
 async def logistic_desired_price(message: types.Message, state: FSMContext):
     """Обработка ожидаемой цены за тонну"""
     try:
-        desired_price = float(message.text.replace(",", ".").replace(" ", ""))
+        desired_price = parse_price(message.text)
         if desired_price <= 0:
             raise ValueError
 
@@ -23831,7 +26981,7 @@ async def logistic_desired_price(message: types.Message, state: FSMContext):
 async def logistic_price(message: types.Message, state: FSMContext):
     """Обработка тарифа логиста"""
     try:
-        price = float(message.text.replace(",", ".").replace(" ", ""))
+        price = parse_price(message.text)
         if price <= 0:
             raise ValueError
 
@@ -23993,7 +27143,19 @@ async def show_logistic_requests_list(callback: types.CallbackQuery, state: FSMC
     for req_id, req in shipping_requests.items():
         if not isinstance(req, dict):
             continue
-        if not is_request_open_for_offers(req.get("status")):
+        request_owner_id = (
+            req.get("exporter_id")
+            or req.get("customer_id")
+            or req.get("created_by")
+        )
+        request_status = get_effective_request_status(
+            req.get("id", req_id),
+            "exporter",
+            req,
+            request_owner_id=request_owner_id,
+            request_exporter_id=request_owner_id,
+        )
+        if not is_request_open_for_offers(request_status):
             continue
         if get_assigned_logist_id(req):
             continue
@@ -24009,7 +27171,14 @@ async def show_logistic_requests_list(callback: types.CallbackQuery, state: FSMC
     for req_id, req in farmer_shipping_requests.items():
         if not isinstance(req, dict):
             continue
-        if not is_request_open_for_offers(req.get("status")):
+        request_owner_id = req.get("farmer_id") or req.get("user_id")
+        request_status = get_effective_request_status(
+            req.get("id", req_id),
+            "farmer",
+            req,
+            request_owner_id=request_owner_id,
+        )
+        if not is_request_open_for_offers(request_status):
             continue
         canonical_id = req.get("id", req_id)
         canonical_key = str(canonical_id)
@@ -24021,7 +27190,14 @@ async def show_logistic_requests_list(callback: types.CallbackQuery, state: FSMC
     for req_id, req in farmer_logistics_requests.items():
         if not isinstance(req, dict):
             continue
-        if not is_request_open_for_offers(req.get("status")):
+        request_owner_id = req.get("farmer_id") or req.get("user_id")
+        request_status = get_effective_request_status(
+            req.get("id", req_id),
+            "farmer",
+            req,
+            request_owner_id=request_owner_id,
+        )
+        if not is_request_open_for_offers(request_status):
             continue
         canonical_id = req.get("id", req_id)
         canonical_key = str(canonical_id)
@@ -24035,7 +27211,19 @@ async def show_logistic_requests_list(callback: types.CallbackQuery, state: FSMC
     for req_id, req in logistics_requests.items():
         if not isinstance(req, dict):
             continue
-        if not is_request_open_for_offers(req.get("status")):
+        request_owner_id = (
+            req.get("customer_id")
+            or req.get("created_by")
+            or req.get("exporter_id")
+        )
+        request_status = get_effective_request_status(
+            req.get("id", req_id),
+            "logistics",
+            req,
+            request_owner_id=request_owner_id,
+            request_exporter_id=req.get("exporter_id"),
+        )
+        if not is_request_open_for_offers(request_status):
             continue
         if get_assigned_logist_id(req):
             continue
@@ -24210,15 +27398,33 @@ async def make_offer_start(callback: types.CallbackQuery, state: FSMContext):
         or request.get("created_by")
         or request.get("exporter_id")
         or request.get("farmer_id")
-        or request.get("logist_id")
+        or request.get("user_id")
     )
+    if not request_owner_id:
+        legacy_logist_owner_id = request.get("logist_id")
+        has_assigned_logist_id = bool(
+            request.get("assigned_logist_id") or request.get("selected_logistic")
+        )
+        if legacy_logist_owner_id and not has_assigned_logist_id:
+            request_owner_id = legacy_logist_owner_id
     if same_id(request_owner_id, user_id):
         await callback.answer(
             "❌ Нельзя откликнуться на собственную заявку", show_alert=True
         )
         return
 
-    if not is_request_open_for_offers(request.get("status")):
+    effective_status = get_effective_request_status(
+        req_id,
+        source,
+        request,
+        request_owner_id=request_owner_id,
+        request_exporter_id=(
+            request.get("exporter_id")
+            or request.get("customer_id")
+            or request.get("created_by")
+        ),
+    )
+    if not is_request_open_for_offers(effective_status):
         await callback.answer("❌ Заявка уже не принимает отклики", show_alert=True)
         return
     if get_assigned_logist_id(request):
@@ -24265,11 +27471,12 @@ async def make_offer_start(callback: types.CallbackQuery, state: FSMContext):
     route_from = request.get("route_from") or request.get("from_city") or "—"
     route_to = request.get("route_to") or request.get("to_city") or "—"
 
+    req_volume = get_safe_float(request.get("volume"), 0)
     text = f"""✅ <b>СОЗДАНИЕ ПРЕДЛОЖЕНИЯ</b>
 
 📦 Заявка #{req_id}
 🌾 Культура: {pull_info.get('culture', request.get('culture', 'Не указана'))}
-📊 Объём: {request.get('volume', 0):.1f} т
+📊 Объём: {req_volume:.1f} т
 📍 Маршрут: {route_from} → {route_to}
 💰 Ожидаемая цена: <code>{expected_price}</code> ₽/т
 
@@ -24366,10 +27573,7 @@ async def offer_vehicle_selected(callback: types.CallbackQuery, state: FSMContex
 async def offer_price_entered(message: types.Message, state: FSMContext):
     """Ввод цены"""
     try:
-        price_str = (
-            message.text.strip().replace(" ", "").replace(",", "").replace("₽", "")
-        )
-        price = float(price_str)
+        price = parse_price(message.text)
 
         if price <= 0:
             await message.answer(
@@ -24544,11 +27748,13 @@ async def show_offer_confirmation(
     )
     route_to = request.get("route_to") or request.get("to_city") or request.get("to") or "—"
 
+    req_volume = get_safe_float(request.get("volume"), 0)
+    price_value = get_safe_float(price, 0)
     text = f"""📋 <b>ПОДТВЕРЖДЕНИЕ ПРЕДЛОЖЕНИЯ</b>
 
 📦 <b>ЗАЯВКА #{request_id}</b>
 🌾 Культура: {culture}
-📦 Объём: {request.get('volume', 0):.1f} т
+📦 Объём: {req_volume:.1f} т
 📍 Маршрут: {route_from} → {route_to}"""
 
     if pull_info.get("port"):
@@ -24561,7 +27767,7 @@ async def show_offer_confirmation(
 <b>ВАШЕ ПРЕДЛОЖЕНИЕ:</b>
 
 🚛 Транспорт: <b>{transport}</b>
-💰 Стоимость: <b>{price:,.0f} ₽</b>
+💰 Стоимость: <b>{price_value:,.0f} ₽</b>
 📅 Дата доставки: <b>{delivery_date}</b>"""
 
     if additional_info:
@@ -24608,9 +27814,15 @@ async def offer_confirmed(callback: types.CallbackQuery, state: FSMContext):
         delivery_date = data.get("delivery_date")
         additional_info = data.get("additional_info", "")
 
-        if not all([request_id, vehicle_type, price, delivery_date]):
+        if request_id is None or not vehicle_type or not delivery_date:
             await callback.answer(
                 "❌ Ошибка: отсутствуют обязательные данные", show_alert=True
+            )
+            return
+        price_value = get_safe_float(price, 0)
+        if price_value <= 0:
+            await callback.answer(
+                "❌ Укажите корректную стоимость больше 0", show_alert=True
             )
             return
 
@@ -24629,7 +27841,25 @@ async def offer_confirmed(callback: types.CallbackQuery, state: FSMContext):
             await callback.answer("❌ Заявка больше не доступна", show_alert=True)
             await state.finish()
             return
-        if not is_request_open_for_offers(request.get("status")):
+        request_owner_id = (
+            request.get("customer_id")
+            or request.get("created_by")
+            or request.get("exporter_id")
+            or request.get("farmer_id")
+            or request.get("user_id")
+        )
+        request_status = get_effective_request_status(
+            request_id,
+            source,
+            request,
+            request_owner_id=request_owner_id,
+            request_exporter_id=(
+                request.get("exporter_id")
+                or request.get("customer_id")
+                or request.get("created_by")
+            ),
+        )
+        if not is_request_open_for_offers(request_status):
             await callback.answer("❌ Заявка уже не принимает отклики", show_alert=True)
             await state.finish()
             return
@@ -24687,7 +27917,7 @@ async def offer_confirmed(callback: types.CallbackQuery, state: FSMContext):
             "request_id": request_id,
             "logist_id": user_id,
             "vehicle_type": vehicle_type,
-            "price": price,
+            "price": price_value,
             "delivery_date": delivery_date,
             "additional_info": additional_info,
             "status": "pending",
@@ -24708,18 +27938,41 @@ async def offer_confirmed(callback: types.CallbackQuery, state: FSMContext):
                 request.get("customer_id")
                 or request.get("created_by")
                 or request.get("exporter_id")
-                or request.get("logist_id")
             )
+            if not receiver_id:
+                legacy_logist_owner_id = request.get("logist_id")
+                has_assigned_logist_id = bool(
+                    request.get("assigned_logist_id") or request.get("selected_logistic")
+                )
+                if legacy_logist_owner_id and not has_assigned_logist_id:
+                    receiver_id = legacy_logist_owner_id
             receiver_role_label = "заказчику"
         else:
-            receiver_id = request.get("farmer_id")
+            receiver_id = request.get("farmer_id") or request.get("user_id")
             receiver_role_label = "фермеру"
 
         if request:
             request["offers_count"] = count_logistic_offers_for_request(
                 request_id, source
             )
-            if is_request_open_for_offers(request.get("status")):
+            request_status = get_effective_request_status(
+                request_id,
+                source,
+                request,
+                request_owner_id=(
+                    request.get("customer_id")
+                    or request.get("created_by")
+                    or request.get("exporter_id")
+                    or request.get("farmer_id")
+                    or request.get("user_id")
+                ),
+                request_exporter_id=(
+                    request.get("exporter_id")
+                    or request.get("customer_id")
+                    or request.get("created_by")
+                ),
+            )
+            if is_request_open_for_offers(request_status):
                 request["status"] = "has_offers"
 
             if source == "exporter":
@@ -24740,7 +27993,7 @@ async def offer_confirmed(callback: types.CallbackQuery, state: FSMContext):
 
 📦 Заявка #{request_id}
 🚛 Транспорт: <b>{transport}</b>
-💰 Стоимость: <b>{price:,.0f} ₽</b>
+	💰 Стоимость: <b>{price_value:,.0f} ₽</b>
 📅 Дата: <b>{delivery_date}</b>
 
 
@@ -24764,7 +28017,7 @@ async def offer_confirmed(callback: types.CallbackQuery, state: FSMContext):
 📦 <b>Заявка #{request_id}</b>
 👤 От: <b>{logist_name}</b>
 🚛 Транспорт: <b>{transport}</b>
-💰 Стоимость: <b>{price:,.0f} ₽</b>
+	💰 Стоимость: <b>{price_value:,.0f} ₽</b>
 📅 Дата доставки: <b>{delivery_date}</b>"""
 
                 if additional_info:
@@ -24875,12 +28128,12 @@ async def logistic_my_offers_text_button(message: types.Message, state: FSMConte
             status = normalize_transition_status(offer.get("status", "pending"))
             if status in {"active", "new", "open"}:
                 status = "pending"
-            elif status in {"assigned", "in_progress", "completed", "accepted"}:
+            elif status in {"assigned", "accepted"}:
                 status = "accepted"
+            elif status in {"filled", "sold", "closed", "delivered"}:
+                status = "completed"
             elif status in {"cancelled", "canceled"}:
                 status = "cancelled"
-            elif status in {"filled", "sold", "closed", "delivered"}:
-                status = "rejected"
             logger.info(f"[{user_id}] 📌 Предложение #{offer_id}: статус = '{status}'")
             if status not in by_status:
                 by_status[status] = []
@@ -24893,7 +28146,9 @@ async def logistic_my_offers_text_button(message: types.Message, state: FSMConte
 
         text = f"📋 <b>МОИ ПРЕДЛОЖЕНИЯ</b> ({len(my_offers)} шт)\n\n"
         text += f"🕐 Ожидают: {len(by_status.get('pending', []))}\n"
-        text += f"✅ Приняты: {len(by_status.get('accepted', []))}\n"
+        text += f"✅ Выбраны: {len(by_status.get('accepted', []))}\n"
+        text += f"🚚 В работе: {len(by_status.get('in_progress', []))}\n"
+        text += f"🏁 Завершены: {len(by_status.get('completed', []))}\n"
         text += f"❌ Отклонены: {len(by_status.get('rejected', []))}\n"
         text += f"⛔ Отменены: {len(by_status.get('cancelled', []))}\n\n"
 
@@ -24904,13 +28159,15 @@ async def logistic_my_offers_text_button(message: types.Message, state: FSMConte
         for status_key, emoji in [
             ("pending", "🕐"),
             ("accepted", "✅"),
+            ("in_progress", "🚚"),
+            ("completed", "🏁"),
             ("rejected", "❌"),
             ("cancelled", "⛔"),
         ]:
             for offer_id, offer in by_status.get(status_key, [])[:5]:
                 if button_count >= 10:
                     break
-                price = offer.get("price", 0)
+                price = get_safe_float(offer.get("price"), 0)
                 button_text = f"{emoji} #{offer_id} | {price:,.0f}₽".replace(",", " ")
                 keyboard.add(
                     InlineKeyboardButton(
@@ -24975,12 +28232,12 @@ async def show_my_offers(callback: types.CallbackQuery, state: FSMContext):
             status = normalize_transition_status(offer.get("status", "pending"))
             if status in {"active", "new", "open"}:
                 status = "pending"
-            elif status in {"assigned", "in_progress", "completed", "accepted"}:
+            elif status in {"assigned", "accepted"}:
                 status = "accepted"
+            elif status in {"filled", "sold", "closed", "delivered"}:
+                status = "completed"
             elif status in {"cancelled", "canceled"}:
                 status = "cancelled"
-            elif status in {"filled", "sold", "closed", "delivered"}:
-                status = "rejected"
             logger.info(f"[{user_id}] 📌 Предложение #{offer_id}: статус = '{status}'")
             if status not in by_status:
                 by_status[status] = []
@@ -24992,7 +28249,9 @@ async def show_my_offers(callback: types.CallbackQuery, state: FSMContext):
 
         text = f"📋 <b>МОИ ПРЕДЛОЖЕНИЯ</b> ({len(my_offers)} шт)\n\n"
         text += f"🕐 Ожидают: {len(by_status.get('pending', []))}\n"
-        text += f"✅ Приняты: {len(by_status.get('accepted', []))}\n"
+        text += f"✅ Выбраны: {len(by_status.get('accepted', []))}\n"
+        text += f"🚚 В работе: {len(by_status.get('in_progress', []))}\n"
+        text += f"🏁 Завершены: {len(by_status.get('completed', []))}\n"
         text += f"❌ Отклонены: {len(by_status.get('rejected', []))}\n"
         text += f"⛔ Отменены: {len(by_status.get('cancelled', []))}\n\n"
 
@@ -25003,13 +28262,15 @@ async def show_my_offers(callback: types.CallbackQuery, state: FSMContext):
         for status_key, emoji in [
             ("pending", "🕐"),
             ("accepted", "✅"),
+            ("in_progress", "🚚"),
+            ("completed", "🏁"),
             ("rejected", "❌"),
             ("cancelled", "⛔"),
         ]:
             for offer_id, offer in by_status.get(status_key, [])[:5]:
                 if button_count >= 10:
                     break
-                price = offer.get("price", 0)
+                price = get_safe_float(offer.get("price"), 0)
                 button_text = f"{emoji} #{offer_id} | {price:,.0f}₽"
                 keyboard.add(
                     InlineKeyboardButton(
@@ -25123,8 +28384,15 @@ async def view_my_offer_details(callback: types.CallbackQuery, state: FSMContext
             or request.get("created_by")
             or request.get("exporter_id")
             or request.get("farmer_id")
-            or request.get("logist_id")
+            or request.get("user_id")
         )
+        if not customer_id:
+            legacy_logist_owner_id = request.get("logist_id")
+            has_assigned_logist_id = bool(
+                request.get("assigned_logist_id") or request.get("selected_logistic")
+            )
+            if legacy_logist_owner_id and not has_assigned_logist_id:
+                customer_id = legacy_logist_owner_id
         customer = get_user_by_id(customer_id) or {}
         customer_company = (
             customer.get("company_name")
@@ -25137,7 +28405,7 @@ async def view_my_offer_details(callback: types.CallbackQuery, state: FSMContext
         _, request = find_farmer_request_by_id(request_id)
         request = request or {}
         pull_info = {}  # для фермера культура хранится в самой заявке
-        customer_id = request.get("farmer_id")
+        customer_id = request.get("farmer_id") or request.get("user_id")
         customer = get_user_by_id(customer_id) or {}
         customer_company = (
             customer.get("company_name")
@@ -25157,11 +28425,13 @@ async def view_my_offer_details(callback: types.CallbackQuery, state: FSMContext
     }
 
     culture = pull_info.get("culture", request.get("culture", "Не указана"))
+    request_volume = get_safe_float(request.get("volume"), 0)
+    offer_price = get_safe_float(offer.get("price"), 0)
 
     text = f"📋 <b>МОЁ ПРЕДЛОЖЕНИЕ #{offer_id}</b>\n\n"
     text += f"📦 <b>ЗАЯВКА #{request_id}</b>\n"
     text += f"🌾 Культура: {culture}\n"
-    text += f"📦 Объём: {request.get('volume', 0):.1f} т\n"
+    text += f"📦 Объём: {request_volume:.1f} т\n"
     offer_route_from = (
         request.get("route_from") or request.get("from_city") or request.get("from") or "—"
     )
@@ -25174,7 +28444,7 @@ async def view_my_offer_details(callback: types.CallbackQuery, state: FSMContext
     text += "<b>ВАШЕ ПРЕДЛОЖЕНИЕ:</b>\n\n"
     transport = vehicles_display.get(offer.get("vehicle_type"), "Не указан")
     text += f"🚛 Транспорт: <b>{transport}</b>\n"
-    text += f"💰 Стоимость: <b>{offer.get('price', 0):,.0f} ₽</b>\n"
+    text += f"💰 Стоимость: <b>{offer_price:,.0f} ₽</b>\n"
     text += f"📅 Дата доставки: <b>{offer.get('delivery_date', 'Не указана')}</b>\n"
     if offer.get("additional_info"):
         text += f"\nℹ️ Дополнительно:\n{offer.get('additional_info')}\n"
@@ -25191,6 +28461,13 @@ async def view_my_offer_details(callback: types.CallbackQuery, state: FSMContext
     if status == "accepted":
         text += "\n✅ <b>Ваше предложение принято!</b>\n"
         text += "<i>Ожидайте дальнейших инструкций от заказчика</i>"
+    elif status == "in_progress":
+        text += "\n🚚 <b>Предложение в работе</b>\n"
+        text += "<i>По заявке уже идёт активная перевозка</i>"
+    elif status in {"completed", "filled", "sold", "closed", "delivered"}:
+        text += "\n🏁 <b>Предложение завершено</b>\n"
+        if offer.get("completed_at"):
+            text += f"<i>Завершено: {offer.get('completed_at')}</i>"
     elif status == "rejected":
         text += "\n❌ <b>Предложение отклонено</b>\n"
         if offer.get("rejection_reason"):
@@ -25201,10 +28478,10 @@ async def view_my_offer_details(callback: types.CallbackQuery, state: FSMContext
             text += f"\n<i>Отменено: {offer.get('cancelled_at')}</i>"
 
     keyboard = InlineKeyboardMarkup(row_width=2)
-    if status in {"pending", "active"}:
+    if status in OPEN_LOGISTIC_OFFER_STATUSES:
         keyboard.add(
             InlineKeyboardButton(
-                "✏️ Редактировать цену", callback_data=f"edit_price_{offer_id}"
+                "✏️ Редактировать", callback_data=f"edit_offer_{offer_id}"
             ),
             InlineKeyboardButton(
                 "❌ Отменить", callback_data=f"cancel_my_offer_{offer_id}"
@@ -25241,7 +28518,7 @@ async def cancel_my_offer_confirm(callback: types.CallbackQuery, state: FSMConte
         await callback.answer("❌ Это не ваше предложение", show_alert=True)
         return
 
-    if normalize_transition_status(offer.get("status")) not in {"pending", "active"}:
+    if normalize_transition_status(offer.get("status")) not in OPEN_LOGISTIC_OFFER_STATUSES:
         await callback.answer(
             "❌ Можно отменить только ожидающие предложения", show_alert=True
         )
@@ -25254,11 +28531,12 @@ async def cancel_my_offer_confirm(callback: types.CallbackQuery, state: FSMConte
     }
 
     transport = vehicles_display.get(offer.get("vehicle_type"), "Неизвестный")
+    offer_price = get_safe_float(offer.get("price"), 0)
 
     text = f"❓ <b>ОТМЕНА ПРЕДЛОЖЕНИЯ #{offer_id}</b>\n\n"
     text += "Вы уверены, что хотите отменить это предложение?\n\n"
     text += f"🚛 Транспорт: {transport}\n"
-    text += f"💰 Стоимость: {offer.get('price', 0):,.0f} ₽\n\n"
+    text += f"💰 Стоимость: {offer_price:,.0f} ₽\n\n"
     text += "<i>Это действие нельзя будет отменить</i>"
 
     keyboard = InlineKeyboardMarkup(row_width=2)
@@ -25289,7 +28567,11 @@ async def cancel_my_offer_confirmed(callback: types.CallbackQuery, state: FSMCon
     await confirm_cancel_offer(callback)
 
 
-@dp.callback_query_handler(lambda c: c.data.startswith("edit_offer_"), state="*")
+@dp.callback_query_handler(
+    lambda c: c.data.startswith("edit_offer_")
+    and not c.data.startswith("edit_offer_field:"),
+    state="*",
+)
 async def edit_offer_start(callback: types.CallbackQuery, state: FSMContext):
     """Начало редактирования предложения"""
     await state.finish()
@@ -25311,23 +28593,35 @@ async def edit_offer_start(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer("❌ Это не ваше предложение", show_alert=True)
         return
 
-    if normalize_transition_status(offer.get("status")) not in {"pending", "active"}:
+    if normalize_transition_status(offer.get("status")) not in OPEN_LOGISTIC_OFFER_STATUSES:
         await callback.answer(
             "❌ Можно редактировать только ожидающие предложения", show_alert=True
         )
         return
 
     text = f"✏️ <b>РЕДАКТИРОВАНИЕ ПРЕДЛОЖЕНИЯ #{offer_id}</b>\n\n"
+    offer_price = get_safe_float(offer.get("price"), 0)
     text += "Текущие данные:\n\n"
     text += f"🚛 Транспорт: {offer.get('vehicle_type')}\n"
-    text += f"💰 Стоимость: {offer.get('price', 0):,.0f} ₽\n"
+    text += f"💰 Стоимость: {offer_price:,.0f} ₽\n"
     text += f"📅 Дата: {offer.get('delivery_date')}\n\n"
-    text += "Сейчас доступно изменение только цены."
+    text += "Выберите поле для редактирования."
 
     keyboard = InlineKeyboardMarkup(row_width=1)
     keyboard.add(
         InlineKeyboardButton(
-            "💰 Изменить цену", callback_data=f"edit_price_{offer_id}"
+            "💰 Изменить цену", callback_data=f"edit_offer_field:price:{offer_id}"
+        ),
+    )
+    keyboard.add(
+        InlineKeyboardButton(
+            "📅 Изменить дату", callback_data=f"edit_offer_field:delivery_date:{offer_id}"
+        ),
+    )
+    keyboard.add(
+        InlineKeyboardButton(
+            "📝 Изменить комментарий",
+            callback_data=f"edit_offer_field:additional_info:{offer_id}",
         ),
     )
     keyboard.add(
@@ -25349,7 +28643,7 @@ class EditOfferStatesGroup(StatesGroup):
 
 @dp.callback_query_handler(lambda c: c.data.startswith("edit_price_"), state="*")
 async def edit_offer_price(callback: types.CallbackQuery, state: FSMContext):
-    """Редактирование цены"""
+    """Legacy-совместимость: редактирование цены через новый роут."""
     await state.finish()
 
     try:
@@ -25369,23 +28663,77 @@ async def edit_offer_price(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer("❌ Это не ваше предложение", show_alert=True)
         return
 
-    if normalize_transition_status(offer.get("status")) not in {"pending", "active"}:
+    if normalize_transition_status(offer.get("status")) not in OPEN_LOGISTIC_OFFER_STATUSES:
         await callback.answer(
             "❌ Нельзя редактировать обработанные предложения", show_alert=True
         )
         return
 
-    await state.update_data(offer_id=offer_id, field="price")
+    callback.data = f"edit_offer_field:price:{offer_id}"
+    await edit_offer_field(callback, state)
 
-    text = "💰 <b>ИЗМЕНЕНИЕ ЦЕНЫ</b>\n\n"
-    text += f"Заявка #{offer.get('request_id')}\n\n"
-    text += f"Текущая цена: <b>{offer.get('price', 0):,.0f} ₽</b>\n\n"
-    text += "Введите новую цену в рублях:"
+
+@dp.callback_query_handler(lambda c: c.data.startswith("edit_offer_field:"), state="*")
+async def edit_offer_field(callback: types.CallbackQuery, state: FSMContext):
+    """Начало редактирования поля предложения."""
+    await state.finish()
+
+    try:
+        _, field, offer_ref = callback.data.split(":", 2)
+        offer_id = int(offer_ref) if str(offer_ref).isdigit() else offer_ref
+    except (IndexError, ValueError):
+        await callback.answer("❌ Ошибка", show_alert=True)
+        return
+
+    if field not in {"price", "delivery_date", "additional_info"}:
+        await callback.answer("❌ Неподдерживаемое поле", show_alert=True)
+        return
+
+    resolved_offer_id, offer = find_logistic_offer_by_id(offer_id)
+    if not offer:
+        await callback.answer("❌ Предложение не найдено", show_alert=True)
+        return
+    offer_id = resolved_offer_id
+
+    if not same_id(get_offer_logist_id(offer), callback.from_user.id):
+        await callback.answer("❌ Это не ваше предложение", show_alert=True)
+        return
+
+    if normalize_transition_status(offer.get("status")) not in OPEN_LOGISTIC_OFFER_STATUSES:
+        await callback.answer(
+            "❌ Нельзя редактировать обработанные предложения", show_alert=True
+        )
+        return
+
+    await state.update_data(offer_id=offer_id, field=field)
 
     keyboard = InlineKeyboardMarkup()
     keyboard.add(
         InlineKeyboardButton("❌ Отмена", callback_data=f"view_my_offer_{offer_id}")
     )
+
+    if field == "price":
+        current_price = get_safe_float(offer.get("price"), 0)
+        text = (
+            "💰 <b>ИЗМЕНЕНИЕ ЦЕНЫ</b>\n\n"
+            f"Заявка #{offer.get('request_id')}\n\n"
+            f"Текущая цена: <b>{current_price:,.0f} ₽</b>\n\n"
+            "Введите новую цену в рублях:"
+        )
+    elif field == "delivery_date":
+        text = (
+            "📅 <b>ИЗМЕНЕНИЕ ДАТЫ ДОСТАВКИ</b>\n\n"
+            f"Текущая дата: <b>{offer.get('delivery_date', 'Не указана')}</b>\n\n"
+            "Введите новую дату в формате ДД.ММ.ГГГГ:"
+        )
+    else:
+        current_info = html.escape(str(offer.get("additional_info") or "—"))
+        text = (
+            "📝 <b>ИЗМЕНЕНИЕ КОММЕНТАРИЯ</b>\n\n"
+            f"Текущий комментарий:\n{current_info}\n\n"
+            "Введите новый комментарий (до 500 символов).\n"
+            "Чтобы очистить комментарий, отправьте '-'."
+        )
 
     await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
     await EditOfferStatesGroup.value.set()
@@ -25394,7 +28742,7 @@ async def edit_offer_price(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.message_handler(state=EditOfferStatesGroup.value)
 async def edit_offer_value_entered(message: types.Message, state: FSMContext):
-    """Сохранение изменённого значения (пока только цена)"""
+    """Сохранение изменённого значения предложения."""
     data = await state.get_data()
     offer_id = data.get("offer_id")
     field = data.get("field")
@@ -25409,17 +28757,22 @@ async def edit_offer_value_entered(message: types.Message, state: FSMContext):
         await message.answer("❌ Это не ваше предложение")
         await state.finish()
         return
-    if normalize_transition_status(offer.get("status")) not in {"pending", "active"}:
+    if normalize_transition_status(offer.get("status")) not in OPEN_LOGISTIC_OFFER_STATUSES:
         await message.answer("❌ Можно редактировать только ожидающие предложения")
         await state.finish()
         return
 
-    # Валидация и сохранение
+    if field not in {"price", "delivery_date", "additional_info"}:
+        await message.answer("❌ Неподдерживаемое поле редактирования")
+        await state.finish()
+        return
+
+    updated_field = ""
+    customer_change_line = ""
+
     if field == "price":
         try:
-            new_price = float(
-                message.text.strip().replace(" ", "").replace(",", "").replace("₽", "")
-            )
+            new_price = parse_price(message.text.strip().replace("₽", ""))
             if new_price <= 0 or new_price > 10_000_000:
                 await message.answer(
                     "❌ Неправильная цена! Диапазон: 1 - 10 млн ₽\n\nПопробуйте ещё раз:"
@@ -25427,101 +28780,139 @@ async def edit_offer_value_entered(message: types.Message, state: FSMContext):
                 return
 
             old_price = offer.get("price")
+            old_price_safe = get_safe_float(old_price, 0)
             offer["price"] = new_price
-            offer["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
             text = (
                 "✅ <b>ЦЕНА ИЗМЕНЕНА!</b>\n\n"
-                f"Было: {old_price:,.0f} ₽\n"
+                f"Было: {old_price_safe:,.0f} ₽\n"
                 f"Стало: <b>{new_price:,.0f} ₽</b>\n\n"
                 "Заказчик получит уведомление об изменении"
             )
-
-            # Определяем, кто заказчик (экспортёр или фермер)
-            request_id = offer.get("request_id")
-            source = str(offer.get("source", "exporter")).strip().lower()
-            if source == "logistic":
-                source = "logistics"
-            if source not in {"exporter", "farmer", "logistics"}:
-                source_candidates = set()
-                request_key = request_id if isinstance(request_id, str) else str(request_id)
-                if request_id in shipping_requests or request_key in shipping_requests:
-                    source_candidates.add("exporter")
-                if request_id in logistics_requests or request_key in logistics_requests:
-                    source_candidates.add("logistics")
-                if (
-                    request_id in farmer_shipping_requests
-                    or request_key in farmer_shipping_requests
-                    or request_id in farmer_logistics_requests
-                    or request_key in farmer_logistics_requests
-                ):
-                    source_candidates.add("farmer")
-                if len(source_candidates) == 1:
-                    source = next(iter(source_candidates))
-                else:
-                    inferred_source = infer_logistic_offer_source(request_id)
-                    if (
-                        inferred_source in {"exporter", "farmer", "logistics"}
-                        and (
-                            not source_candidates
-                            or inferred_source in source_candidates
-                        )
-                    ):
-                        source = inferred_source
-                    else:
-                        await message.answer(
-                            "❌ Не удалось определить тип заявки для предложения"
-                        )
-                        await state.finish()
-                        return
-
-            if source == "exporter":
-                _, request = find_shipping_request_by_id(request_id)
-                request = request or {}
-                customer_id = request.get("exporter_id")
-            elif source == "logistics":
-                request = logistics_requests.get(request_id) or logistics_requests.get(
-                    str(request_id)
-                )
-                request = request if isinstance(request, dict) else {}
-                customer_id = (
-                    request.get("customer_id")
-                    or request.get("created_by")
-                    or request.get("exporter_id")
-                    or request.get("farmer_id")
-                    or request.get("logist_id")
-                )
-            else:
-                _, request = find_farmer_request_by_id(request_id)
-                request = request or {}
-                customer_id = request.get("farmer_id")
-
-            logist_name = (get_user_by_id(message.from_user.id) or {}).get(
-                "company_name", "Логист"
-            )
-
-            if customer_id:
-                try:
-                    await bot.send_message(
-                        customer_id,
-                        f"🔔 <b>Предложение #{offer_id} изменено</b>\n\n"
-                        f"📦 Заявка #{request_id}\n"
-                        f"👤 Логист: {logist_name}\n"
-                        f"💰 Новая цена: <b>{new_price:,.0f} ₽</b>",
-                        parse_mode="HTML",
-                    )
-                except Exception as e:
-                    logging.error(f"Ошибка уведомления: {e}")
-
+            updated_field = "price"
+            customer_change_line = f"💰 Новая цена: <b>{new_price:,.0f} ₽</b>"
         except ValueError:
             await message.answer(
                 "❌ Неправильный формат! Введите число (без символов)\n\nПопробуйте ещё раз:"
             )
             return
+    elif field == "delivery_date":
+        new_date = (message.text or "").strip()
+        if not validate_date(new_date):
+            await message.answer(
+                "❌ Неверный формат даты. Используйте ДД.ММ.ГГГГ (например: 15.12.2026)"
+            )
+            return
+        old_date = offer.get("delivery_date", "Не указана")
+        offer["delivery_date"] = new_date
+        text = (
+            "✅ <b>ДАТА ДОСТАВКИ ОБНОВЛЕНА!</b>\n\n"
+            f"Было: {old_date}\n"
+            f"Стало: <b>{new_date}</b>\n\n"
+            "Заказчик получит уведомление об изменении"
+        )
+        updated_field = "delivery_date"
+        customer_change_line = f"📅 Новая дата доставки: <b>{new_date}</b>"
     else:
-        await message.answer("❌ Редактирование этого поля пока недоступно")
-        await state.finish()
-        return
+        new_info = (message.text or "").strip()
+        if new_info in {"-", "—", "нет", "Нет", "NONE", "none", "clear"}:
+            new_info = ""
+        if len(new_info) > 500:
+            await message.answer("❌ Комментарий слишком длинный. Максимум 500 символов.")
+            return
+        old_info = (offer.get("additional_info") or "").strip() or "—"
+        offer["additional_info"] = new_info
+        old_info_label = html.escape(old_info)
+        new_info_label = html.escape(new_info) if new_info else "—"
+        text = (
+            "✅ <b>КОММЕНТАРИЙ ОБНОВЛЁН!</b>\n\n"
+            f"Было: {old_info_label}\n"
+            f"Стало: <b>{new_info_label}</b>\n\n"
+            "Заказчик получит уведомление об изменении"
+        )
+        updated_field = "additional_info"
+        customer_change_line = (
+            "📝 Комментарий обновлён"
+            if new_info
+            else "📝 Комментарий очищен"
+        )
+
+    offer["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    save_logistic_offers()
+
+    # Определяем, кто заказчик (экспортёр/фермер/логистика) и отправляем уведомление.
+    request_id = offer.get("request_id")
+    source = str(offer.get("source", "exporter")).strip().lower()
+    if source == "logistic":
+        source = "logistics"
+    if source not in {"exporter", "farmer", "logistics"}:
+        source_candidates = set()
+        request_key = request_id if isinstance(request_id, str) else str(request_id)
+        if request_id in shipping_requests or request_key in shipping_requests:
+            source_candidates.add("exporter")
+        if request_id in logistics_requests or request_key in logistics_requests:
+            source_candidates.add("logistics")
+        if (
+            request_id in farmer_shipping_requests
+            or request_key in farmer_shipping_requests
+            or request_id in farmer_logistics_requests
+            or request_key in farmer_logistics_requests
+        ):
+            source_candidates.add("farmer")
+        if len(source_candidates) == 1:
+            source = next(iter(source_candidates))
+        else:
+            inferred_source = infer_logistic_offer_source(request_id)
+            if inferred_source in {"exporter", "farmer", "logistics"} and (
+                not source_candidates or inferred_source in source_candidates
+            ):
+                source = inferred_source
+            else:
+                source = "exporter"
+
+    if source == "exporter":
+        _, request = find_shipping_request_by_id(request_id)
+        request = request or {}
+        customer_id = request.get("exporter_id")
+    elif source == "logistics":
+        request = logistics_requests.get(request_id) or logistics_requests.get(str(request_id))
+        request = request if isinstance(request, dict) else {}
+        customer_id = (
+            request.get("customer_id")
+            or request.get("created_by")
+            or request.get("exporter_id")
+            or request.get("farmer_id")
+            or request.get("user_id")
+        )
+        if not customer_id:
+            legacy_logist_owner_id = request.get("logist_id")
+            has_assigned_logist_id = bool(
+                request.get("assigned_logist_id") or request.get("selected_logistic")
+            )
+            if legacy_logist_owner_id and not has_assigned_logist_id:
+                customer_id = legacy_logist_owner_id
+    else:
+        _, request = find_farmer_request_by_id(request_id)
+        request = request or {}
+        customer_id = request.get("farmer_id") or request.get("user_id")
+
+    logist_name = (
+        (get_user_by_id(message.from_user.id) or {}).get("company_name")
+        or (get_user_by_id(message.from_user.id) or {}).get("name")
+        or "Логист"
+    )
+
+    if customer_id:
+        try:
+            await bot.send_message(
+                customer_id,
+                f"🔔 <b>Предложение #{offer_id} обновлено</b>\n\n"
+                f"📦 Заявка #{request_id}\n"
+                f"👤 Логист: {logist_name}\n"
+                f"{customer_change_line}",
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            logging.error(f"Ошибка уведомления: {e}")
 
     keyboard = InlineKeyboardMarkup()
     keyboard.add(
@@ -25535,7 +28926,7 @@ async def edit_offer_value_entered(message: types.Message, state: FSMContext):
     await state.finish()
 
     logging.info(
-        f"✏️ Логист {message.from_user.id} изменил цену предложения #{offer_id}"
+        f"✏️ Логист {message.from_user.id} изменил поле {updated_field} предложения #{offer_id}"
     )
 
 
@@ -25570,7 +28961,7 @@ async def notify_logistic_offer_accepted(offer_id: int, exporter_id: int):
         text += f"📦 Заявка #{request_id}\n"
         text += f"👤 Заказчик: {exporter_company}\n\n"
         text += f"🚛 Транспорт: {offer.get('vehicle_type')}\n"
-        text += f"💰 Стоимость: {offer.get('price', 0):,.0f} ₽\n"
+        text += f"💰 Стоимость: {get_safe_float(offer.get('price'), 0):,.0f} ₽\n"
         text += f"📅 Дата доставки: {offer.get('delivery_date')}\n\n"
         text += "━━━━━━━━━━━━━━━━━━━━\n\n"
         text += "✅ <b>Следующие шаги:</b>\n"
@@ -25688,17 +29079,19 @@ async def notify_logistic_new_request(request_id: int):
             return
 
         text = "🔔 <b>НОВАЯ ЗАЯВКА НА ДОСТАВКУ!</b>\n\n"
+        request_volume = get_safe_float(request.get("volume"), 0)
+        budget = get_safe_float(request.get("budget"), 0)
         text += f"📦 Заявка #{request_id}\n"
         text += f"🌾 Культура: {pull_info.get('culture', 'Не указана')}\n"
-        text += f"📦 Объём: {request.get('volume', 0):.1f} т\n"
+        text += f"📦 Объём: {request_volume:.1f} т\n"
         text += f"📍 Маршрут: {request.get('route_from', '')} → {request.get('route_to', '')}\n"
 
         preferred_date = request.get("loading_date") or request.get("desired_date")
         if preferred_date:
             text += f"📅 Желаемая дата: {preferred_date}\n"
 
-        if request.get("budget"):
-            text += f"💰 Бюджет: {request.get('budget'):,.0f} ₽\n"
+        if budget > 0:
+            text += f"💰 Бюджет: {budget:,.0f} ₽\n"
 
         text += "\n<i>Торопитесь! Конкуренты уже смотрят эту заявку</i>"
 
@@ -25789,7 +29182,7 @@ async def notify_logistic_delivery_completed(delivery_id: int):
         offer_id = delivery.get("offer_id")
         _, offer = find_logistic_offer_by_id(offer_id)
         offer = offer or {}
-        price = offer.get("price", 0)
+        price = get_safe_float(offer.get("price"), 0)
 
         text = "✅ <b>ДОСТАВКА ЗАВЕРШЕНА!</b>\n\n"
         text += f"📦 Доставка #{delivery_id}\n"
@@ -25841,7 +29234,7 @@ async def notify_logistic_request_cancelled(request_id: int, reason: str = None)
                 str(offer.get("rejection_reason") or "").strip().lower()
                 == "заявка отменена заказчиком"
             )
-            if offer_status in {"pending", "active"} or was_cancelled_by_request:
+            if offer_status in OPEN_LOGISTIC_OFFER_STATUSES or was_cancelled_by_request:
                 logist_id = get_offer_logist_id(offer)
                 if logist_id:
                     related_logist_ids.add(logist_id)
@@ -25892,6 +29285,12 @@ async def show_my_deliveries(callback: types.CallbackQuery, state: FSMContext):
 
     user_id = callback.from_user.id
     user_role = (get_user_by_id(user_id) or {}).get("role")
+
+    # Для экспедитора у нас отдельный детальный поток списка доставок.
+    if is_expeditor_role(user_role):
+        await back_to_exp_deliveries_alias(callback, state)
+        return
+
     if not (is_logistic_role(user_role) or user_role == "admin"):
         await callback.answer("❌ Раздел доступен только логистам", show_alert=True)
         return
@@ -25934,7 +29333,7 @@ async def show_my_deliveries(callback: types.CallbackQuery, state: FSMContext):
     by_status = {"pending": [], "in_progress": [], "completed": [], "cancelled": []}
 
     for deliv_id, deliv in my_deliveries:
-        status = normalize_transition_status(deliv.get("status", "pending"))
+        status = get_effective_delivery_status(deliv)
         if status in {"new", "assigned", "expeditor_selected", "accepted", "open"}:
             status = "pending"
         if status not in by_status:
@@ -26046,10 +29445,36 @@ async def show_logistic_statistics(callback: types.CallbackQuery, state: FSMCont
 
     total_offers = len(my_offers)
     accepted_offers = len(
-        [o for o in my_offers if normalize_transition_status(o.get("status")) == "accepted"]
+        [
+            o
+            for o in my_offers
+            if normalize_transition_status(o.get("status")) in {"accepted", "assigned"}
+        ]
+    )
+    in_progress_offers = len(
+        [
+            o
+            for o in my_offers
+            if normalize_transition_status(o.get("status")) == "in_progress"
+        ]
+    )
+    completed_offers = len(
+        [
+            o
+            for o in my_offers
+            if normalize_transition_status(o.get("status"))
+            in {"completed", "filled", "sold", "closed", "delivered"}
+        ]
     )
     rejected_offers = len(
         [o for o in my_offers if normalize_transition_status(o.get("status")) == "rejected"]
+    )
+    cancelled_offers = len(
+        [
+            o
+            for o in my_offers
+            if normalize_transition_status(o.get("status")) in {"cancelled", "canceled"}
+        ]
     )
     pending_offers = len(
         [
@@ -26061,13 +29486,13 @@ async def show_logistic_statistics(callback: types.CallbackQuery, state: FSMCont
     )
 
     completed_deliveries = len(
-        [d for d in my_deliveries if normalize_transition_status(d.get("status")) == "completed"]
+        [d for d in my_deliveries if get_effective_delivery_status(d) == "completed"]
     )
     active_deliveries = len(
         [
             d
             for d in my_deliveries
-            if normalize_transition_status(d.get("status"))
+            if get_effective_delivery_status(d)
             in {"pending", "in_progress", "expeditor_selected", "assigned", "new", "open"}
         ]
     )
@@ -26075,11 +29500,11 @@ async def show_logistic_statistics(callback: types.CallbackQuery, state: FSMCont
     # Подсчитываем общий заработок
     total_earnings = 0
     for d in my_deliveries:
-        if normalize_transition_status(d.get("status")) != "completed":
+        if get_effective_delivery_status(d) != "completed":
             continue
         offer_ref = d.get("offer_id") or d.get("logistic_offer_id")
         _, delivery_offer = find_logistic_offer_by_id(offer_ref)
-        total_earnings += (delivery_offer or {}).get("price", 0)
+        total_earnings += get_safe_float((delivery_offer or {}).get("price"), 0)
 
     # Конверсия
     conversion = (accepted_offers / total_offers * 100) if total_offers > 0 else 0
@@ -26093,8 +29518,11 @@ async def show_logistic_statistics(callback: types.CallbackQuery, state: FSMCont
 
     text += "<b>ПРЕДЛОЖЕНИЯ:</b>\n"
     text += f"📋 Всего отправлено: <b>{total_offers}</b>\n"
-    text += f"✅ Принято: <b>{accepted_offers}</b>\n"
+    text += f"✅ Выбрано: <b>{accepted_offers}</b>\n"
+    text += f"🚚 В работе: <b>{in_progress_offers}</b>\n"
+    text += f"🏁 Завершено: <b>{completed_offers}</b>\n"
     text += f"❌ Отклонено: <b>{rejected_offers}</b>\n"
+    text += f"⛔ Отменено: <b>{cancelled_offers}</b>\n"
     text += f"🕐 Ожидают ответа: <b>{pending_offers}</b>\n"
     text += f"📈 Конверсия: <b>{conversion:.1f}%</b>\n\n"
 
@@ -26199,7 +29627,7 @@ async def shipping_route_to(message: types.Message, state: FSMContext):
         await state.finish()
         return
 
-    available_volume = pull.get("current_volume", 0) or 0
+    available_volume = get_safe_float(pull.get("current_volume"), 0)
 
     await message.answer(
         f"📍 Маршрут: <b>{data['route_from']}</b> → <b>{route_to}</b>\n\n"
@@ -26235,7 +29663,7 @@ async def shipping_volume(message: types.Message, state: FSMContext):
             await state.finish()
             return
 
-        available_volume = pull.get("current_volume", 0) or 0
+        available_volume = get_safe_float(pull.get("current_volume"), 0)
         if available_volume <= 0:
             await message.answer(
                 "❌ В пуле нет доступного объёма для перевозки"
@@ -26296,7 +29724,7 @@ async def shipping_price_rub(message: types.Message, state: FSMContext):
     price_text = message.text.strip()
 
     try:
-        price_rub = float(price_text)
+        price_rub = parse_price(price_text)
         if price_rub <= 0:
             await message.answer("❌ Цена должна быть больше нуля!")
             return
@@ -26385,9 +29813,9 @@ async def shipping_final_confirmation(message: types.Message, state: FSMContext)
     # Нормализуем данные из state
     route_from = data.get("route_from", "")
     route_to = data.get("route_to", "")
-    volume = float(data.get("volume", 0) or 0)
+    volume = get_safe_float(data.get("volume"), 0)
     culture = data.get("culture", "")
-    price_rub = int(data.get("price_rub", 0) or 0)
+    price_rub = int(get_safe_float(data.get("price_rub"), 0))
     desired_date = data.get("desired_date", "Не указана")
 
     # Тип транспорта можем взять из пула, если он там есть
@@ -26395,7 +29823,7 @@ async def shipping_final_confirmation(message: types.Message, state: FSMContext)
         pull.get("transport_type") or pull.get("vehicle_type") or "Не указан"
     )
 
-    available_volume = pull.get("current_volume", 0) or 0
+    available_volume = get_safe_float(pull.get("current_volume"), 0)
     if volume <= 0 or volume > available_volume:
         await message.answer(
             "❌ Некорректный объём заявки. "
@@ -26407,9 +29835,29 @@ async def shipping_final_confirmation(message: types.Message, state: FSMContext)
     has_open_request_for_pull = any(
         isinstance(req, dict)
         and same_id(req.get("pull_id"), pull_id)
-        and same_id(req.get("exporter_id"), exporter_id)
+        and same_id(
+            req.get("exporter_id")
+            or req.get("customer_id")
+            or req.get("created_by"),
+            exporter_id,
+        )
         and str(req.get("source") or "").strip().lower() in {"", "exporter"}
-        and normalize_transition_status(req.get("status")) not in {"completed", "cancelled", "rejected"}
+        and get_effective_request_status(
+            req.get("id", req.get("request_id", pull_id)),
+            "exporter",
+            req,
+            request_owner_id=(
+                req.get("exporter_id")
+                or req.get("customer_id")
+                or req.get("created_by")
+            ),
+            request_exporter_id=(
+                req.get("exporter_id")
+                or req.get("customer_id")
+                or req.get("created_by")
+            ),
+        )
+        not in {"completed", "cancelled", "rejected"}
         for req in shipping_requests.values()
     )
     if has_open_request_for_pull:
@@ -26496,7 +29944,7 @@ async def attach_contractors_to_pull(pull_id):
     _, pull = find_pull_by_id(pull_id)
     if not pull:
         return
-    exporter_id = pull.get("exporter_id")
+    exporter_id = pull.get("exporter_id") or pull.get("creator_id")
     pull_port = pull.get("port", "")
     pull_region = pull.get("region", "")
 
@@ -26505,7 +29953,19 @@ async def attach_contractors_to_pull(pull_id):
     for req_id, request in shipping_requests.items():
         if not isinstance(request, dict):
             continue
-        if not is_request_open_for_offers(request.get("status")):
+        request_owner_id = (
+            request.get("exporter_id")
+            or request.get("customer_id")
+            or request.get("created_by")
+        )
+        request_status = get_effective_request_status(
+            request.get("id", req_id),
+            "exporter",
+            request,
+            request_owner_id=request_owner_id,
+            request_exporter_id=request_owner_id,
+        )
+        if not is_request_open_for_offers(request_status):
             continue
 
         # Проверяем совпадение по региону/порту
@@ -26529,7 +29989,7 @@ async def attach_contractors_to_pull(pull_id):
                             f"{request.get('from') or request.get('route_from') or request.get('from_city', '—')} "
                             f"→ {request.get('to') or request.get('route_to') or request.get('to_city', '—')}"
                         ),
-                        "price": request.get("price")
+                        "price": get_safe_float(request.get("price"), 0)
                         or request.get("price_rub")
                         or request.get("budget")
                         or 0,
@@ -26543,7 +30003,7 @@ async def attach_contractors_to_pull(pull_id):
     for offer_id, offer in expeditor_offers.items():
         if not isinstance(offer, dict):
             continue
-        if normalize_transition_status(offer.get("status")) != "active":
+        if normalize_transition_status(offer.get("status")) not in OPEN_EXPEDITOR_OFFER_STATUSES:
             continue
 
         # Проверяем совпадение по порту
@@ -26558,7 +30018,7 @@ async def attach_contractors_to_pull(pull_id):
                         "expeditor_name": (get_user_by_id(expeditor_id) or {}).get("name", "Экспедитор"),
                         "phone": (get_user_by_id(expeditor_id) or {}).get("phone", "Не указан"),
                         "service": offer.get("service_type", "Не указана"),
-                        "price": offer.get("price", 0),
+                        "price": get_safe_float(offer.get("price"), 0),
                         "terms": offer.get("terms", "Не указаны"),
                         "ports": offer.get("ports", "Не указаны"),
                     }
@@ -26611,8 +30071,8 @@ async def attach_contractors_to_pull(pull_id):
     if pull_id in pullparticipants:
         participants = pullparticipants[pull_id]
         for participant in participants:
-            farmer_id = participant.get("farmer_id")
-            if farmer_id and farmer_id in users:
+            farmer_id = participant.get("farmer_id") or participant.get("user_id")
+            if farmer_id and get_user_by_id(farmer_id):
                 try:
                     # Формируем сообщение для фермера
                     farmer_text = f"🎉 <b>Пулл #{pull_id} собран!</b>\n\n"
@@ -26722,7 +30182,10 @@ async def on_startup(dp):
     logging.info("=" * 70)
 
     logging.info(f"📊 Тип данных pulls: {type(pulls)}")
-    logging.info(f"📊 Количество пулов: {len(pulls)}")
+    actual_pulls_count = (
+        len(pulls.get("pulls", pulls)) if isinstance(pulls, dict) else len(pulls)
+    )
+    logging.info(f"📊 Количество пулов: {actual_pulls_count}")
 
     if isinstance(pulls, dict):
         logging.info(f"📊 Ключи пулов: {list(pulls.keys())}")
@@ -26868,17 +30331,20 @@ async def show_available_batches_exporter(message: types.Message, state: FSMCont
     for i, item in enumerate(available[:10], 1):
         batch = item["batch"]
         farmer_name = item["farmer_name"]
+        batch_id_value = batch.get("id")
+        if batch_id_value is None:
+            continue
 
-        text += f"{i}. <b>{batch['culture']}</b> - {batch['volume']} т\n"
+        text += f"{i}. <b>{batch.get('culture', '?')}</b> - {batch.get('volume', 0)} т\n"
         text += (
-            f"   💰 {batch['price']:,.0f} ₽/т | 📍 {batch.get('region', 'Не указан')}\n"
+            f"   💰 {get_safe_float(batch.get('price'), 0):,.0f} ₽/т | 📍 {batch.get('region', 'Не указан')}\n"
         )
         text += f"   👤 {farmer_name}\n\n"
 
         keyboard.add(
             InlineKeyboardButton(
-                f"🌾 {batch['culture']} - {batch['volume']} т",
-                callback_data=f"view_batch:{batch['id']}",
+                f"🌾 {batch.get('culture', '?')} - {batch.get('volume', 0)} т",
+                callback_data=f"view_batch:{batch_id_value}",
             )
         )
 
@@ -26997,25 +30463,42 @@ async def view_delivery_details(callback: types.CallbackQuery, state: FSMContext
     request = request if isinstance(request, dict) else {}
 
     exporter_owner_id = request.get("exporter_id")
+    request_owner_id = (
+        request.get("exporter_id")
+        or request.get("customer_id")
+        or request.get("created_by")
+    )
     logistics_owner_id = (
         request.get("customer_id")
         or request.get("created_by")
-        or request.get("logist_id")
         or exporter_owner_id
     )
+    if not logistics_owner_id:
+        legacy_logist_owner_id = request.get("logist_id")
+        has_assigned_logist_id = bool(
+            request.get("assigned_logist_id") or request.get("selected_logistic")
+        )
+        if legacy_logist_owner_id and not has_assigned_logist_id:
+            logistics_owner_id = legacy_logist_owner_id
+    delivery_owner_id = (
+        delivery.get("exporter_id")
+        or delivery.get("customer_id")
+        or delivery.get("created_by")
+    )
     exporter_access = (
-        same_id(delivery.get("exporter_id"), user_id)
+        same_id(delivery_owner_id, user_id)
         or (
             delivery_source == "exporter"
-            and same_id(exporter_owner_id, user_id)
+            and same_id(request_owner_id, user_id)
         )
         or (
             delivery_source == "logistics"
             and same_id(logistics_owner_id, user_id)
         )
     )
-    farmer_access = same_id(delivery.get("farmer_id"), user_id) or (
-        delivery_source == "farmer" and same_id(request.get("farmer_id"), user_id)
+    farmer_access = same_id(delivery.get("farmer_id") or delivery.get("user_id"), user_id) or (
+        delivery_source == "farmer"
+        and same_id(request.get("farmer_id") or request.get("user_id"), user_id)
     )
     logistic_access = (
         same_id(get_assigned_logist_id(delivery), user_id)
@@ -27047,16 +30530,18 @@ async def view_delivery_details(callback: types.CallbackQuery, state: FSMContext
     logist_id = get_assigned_logist_id(delivery) or get_assigned_logist_id(request)
     logist = get_user_by_id(logist_id) or {}
 
-    status = normalize_transition_status(delivery.get("status", "pending"))
+    status = get_effective_delivery_status(delivery, request)
     status_text = {
         "pending": "🕐 Ожидает начала",
+        "assigned": "🕐 Назначена",
+        "expeditor_selected": "🚛 Экспедитор выбран",
         "in_progress": "🚚 В пути",
         "completed": "✅ Завершена",
         "cancelled": "🚫 Отменена",
     }.get(status, status)
 
     culture = pull.get("culture") or request.get("culture", "Не указана")
-    volume = delivery.get("volume", request.get("volume", 0))
+    volume = get_safe_float(delivery.get("volume", request.get("volume", 0)), 0)
     route_from = (
         delivery.get("route_from")
         or request.get("route_from")
@@ -27071,7 +30556,7 @@ async def view_delivery_details(callback: types.CallbackQuery, state: FSMContext
         or request.get("to")
         or "Не указано"
     )
-    price = delivery.get("price", 0)
+    price = get_safe_float(delivery.get("price"), 0)
     vehicle_type = delivery.get("vehicle_type", "Не указан")
     delivery_date = delivery.get("delivery_date", "Не указана")
 
@@ -27120,7 +30605,7 @@ async def view_delivery_details(callback: types.CallbackQuery, state: FSMContext
         )
         status_ref = f"delivery_{delivery_id}"
         if not has_expeditor:
-            if status in {"pending", "assigned", "new", "open", ""}:
+            if status in {"pending", "assigned", "new", "open", "", "accepted"}:
                 keyboard.add(
                     InlineKeyboardButton(
                         "🚚 Начать доставку",
@@ -27296,20 +30781,11 @@ async def complete_delivery(callback: types.CallbackQuery):
     ):
         await callback.answer("❌ Нет доступа к этой доставке", show_alert=True)
         return
-    if normalize_transition_status(offer.get("status")) == "completed":
+    offer_status_norm = normalize_transition_status(offer.get("status"))
+    if offer_status_norm == "completed":
         await callback.answer("ℹ️ Доставка уже завершена", show_alert=True)
         return
-    allowed_to_complete = {
-        "accepted",
-        "assigned",
-        "in_progress",
-        "active",
-        "open",
-        "selected",
-        "reserved",
-        "expeditor_selected",
-    }
-    if normalize_transition_status(offer.get("status")) not in allowed_to_complete:
+    if offer_status_norm in {"cancelled", "rejected"}:
         await callback.answer(
             "❌ Нельзя завершить доставку в текущем статусе", show_alert=True
         )
@@ -27363,19 +30839,46 @@ async def complete_delivery(callback: types.CallbackQuery):
         await callback.answer("❌ Предложение не относится к выбранной заявке", show_alert=True)
         return
     if offer_source == "farmer":
-        request_owner_id = request.get("farmer_id")
+        request_owner_id = request.get("farmer_id") or request.get("user_id")
     elif offer_source == "logistics":
         request_owner_id = (
             request.get("customer_id")
             or request.get("created_by")
             or request.get("exporter_id")
-            or request.get("logist_id")
         )
+        if not request_owner_id:
+            legacy_logist_owner_id = request.get("logist_id")
+            has_assigned_logist_id = bool(
+                request.get("assigned_logist_id") or request.get("selected_logistic")
+            )
+            if legacy_logist_owner_id and not has_assigned_logist_id:
+                request_owner_id = legacy_logist_owner_id
     else:
-        request_owner_id = request.get("exporter_id")
-    if normalize_transition_status(request.get("status")) == "cancelled":
+        request_owner_id = (
+            request.get("exporter_id")
+            or request.get("customer_id")
+            or request.get("created_by")
+        )
+    request_status = get_effective_request_status(
+        request_id,
+        offer_source,
+        request,
+        request_owner_id=request_owner_id if offer_source != "exporter" else None,
+        request_exporter_id=request_owner_id if offer_source == "exporter" else None,
+    )
+    if request_status == "cancelled":
         await callback.answer(
             "❌ Нельзя завершить доставку по отменённой заявке", show_alert=True
+        )
+        return
+    if request_status == "completed":
+        await callback.answer(
+            "ℹ️ Связанная заявка уже завершена", show_alert=True
+        )
+        return
+    if request_status != "in_progress":
+        await callback.answer(
+            "❌ Завершение доступно только для заявки в работе", show_alert=True
         )
         return
     if get_assigned_expeditor_id(request):
@@ -27400,22 +30903,21 @@ async def complete_delivery(callback: types.CallbackQuery):
         if not logistic_offer_matches_request(other_offer, request_id, offer_source):
             continue
         other_status = normalize_transition_status(other_offer.get("status"))
-        if other_status not in {"pending", "active"}:
+        if other_status not in MUTABLE_LOGISTIC_OFFER_STATUSES:
             continue
         other_offer["status"] = "rejected"
         other_offer["rejected_at"] = now_sql
         other_offer["rejection_reason"] = "Заявка завершена исполнителем"
 
     save_logistic_offers()
-    if normalize_transition_status(request.get("status")) != "cancelled":
-        request["status"] = "completed"
-        request["completed_at"] = now_sql
-        if offer_source == "farmer":
-            save_farmers_logistics()
-        elif offer_source == "logistics":
-            save_logistics_requests_to_pickle()
-        else:
-            save_shipping_requests()
+    request["status"] = "completed"
+    request["completed_at"] = now_sql
+    if offer_source == "farmer":
+        save_farmers_logistics()
+    elif offer_source == "logistics":
+        save_logistics_requests_to_pickle()
+    else:
+        save_shipping_requests()
 
     for delivery in deliveries.values():
         if not isinstance(delivery, dict):
@@ -27461,19 +30963,37 @@ async def complete_delivery(callback: types.CallbackQuery):
                     delivery.get("customer_id")
                     or delivery.get("created_by")
                     or delivery.get("exporter_id")
-                    or delivery.get("logist_id")
                 )
+                if not delivery_owner_id:
+                    legacy_logist_owner_id = delivery.get("logist_id")
+                    has_assigned_logist_id = bool(
+                        delivery.get("assigned_logist_id")
+                        or delivery.get("selected_logistic")
+                    )
+                    if legacy_logist_owner_id and not has_assigned_logist_id:
+                        delivery_owner_id = legacy_logist_owner_id
             else:
                 delivery_owner_id = delivery.get("exporter_id")
-            if not same_id(delivery_owner_id, request_owner_id):
+            if delivery_owner_id not in {None, ""} and not same_id(
+                delivery_owner_id, request_owner_id
+            ):
                 continue
-        if offer_source == "farmer" and request_owner_id and not same_id(
-            delivery.get("farmer_id"), request_owner_id
+        if (
+            offer_source == "farmer"
+            and request_owner_id
+            and (delivery.get("farmer_id") or delivery.get("user_id")) not in {None, ""}
+            and not same_id(
+                delivery.get("farmer_id") or delivery.get("user_id"),
+                request_owner_id,
+            )
         ):
             continue
         if delivery.get("expeditor_id"):
             continue
-        if normalize_transition_status(delivery.get("status")) == "cancelled":
+        if get_effective_delivery_status(delivery) in {
+            "completed",
+            "cancelled",
+        }:
             continue
         delivery["status"] = "completed"
         delivery["completed_at"] = now_sql
@@ -27521,20 +31041,42 @@ async def complete_delivery(callback: types.CallbackQuery):
                     deal.get("customer_id")
                     or deal.get("created_by")
                     or deal.get("exporter_id")
-                    or deal.get("logist_id")
                 )
+                if not deal_owner_id:
+                    legacy_logist_owner_id = deal.get("logist_id")
+                    has_assigned_logist_id = bool(
+                        deal.get("assigned_logist_id") or deal.get("selected_logistic")
+                    )
+                    if legacy_logist_owner_id and not has_assigned_logist_id:
+                        deal_owner_id = legacy_logist_owner_id
             else:
                 deal_owner_id = deal.get("exporter_id")
-            if not same_id(deal_owner_id, request_owner_id):
+            if deal_owner_id not in {None, ""} and not same_id(
+                deal_owner_id, request_owner_id
+            ):
                 continue
-        if offer_source == "farmer" and request_owner_id and not same_id(
-            deal.get("farmer_id"), request_owner_id
+        if (
+            offer_source == "farmer"
+            and request_owner_id
+            and (
+                (deal.get("farmer_ids") or [])
+                or (deal.get("farmer_id") not in {None, ""})
+            )
+            and not any(
+                same_id(fid, request_owner_id)
+                for fid in [
+                    *(deal.get("farmer_ids") or []),
+                    *(
+                        []
+                        if deal.get("farmer_id") in {None, ""}
+                        else [deal.get("farmer_id")]
+                    ),
+                ]
+            )
         ):
             continue
-        if normalize_transition_status(deal.get("status")) in {
-            "completed",
-            "cancelled",
-        }:
+        deal_effective_status = get_effective_deal_status(deal)
+        if deal_effective_status in {"completed", "cancelled"}:
             continue
         deal["status"] = "completed"
         deal["completed_at"] = now_sql
@@ -27564,7 +31106,7 @@ async def complete_delivery(callback: types.CallbackQuery):
         f"✅ <b>Доставка #{offer_id} завершена!</b>\n\n"
         "Спасибо за работу! \n"
         "Доставка отмечена как выполненная.\n\n"
-        f"💰 Заработано: {offer.get('price', 0):,} ₽"
+        f"💰 Заработано: {get_safe_float(offer.get('price'), 0):,.0f} ₽"
     )
 
     keyboard = InlineKeyboardMarkup(row_width=1)
@@ -27580,6 +31122,12 @@ async def complete_delivery(callback: types.CallbackQuery):
 )
 async def back_to_deliveries_handler(callback: types.CallbackQuery, state: FSMContext):
     """Вернуться к списку доставок"""
+    await state.finish()
+    user_id = callback.from_user.id
+    role = (get_user_by_id(user_id) or {}).get("role")
+    if is_expeditor_role(role):
+        await back_to_exp_deliveries_alias(callback, state)
+        return
     await show_my_deliveries(callback, state)
 
 
@@ -27750,12 +31298,12 @@ async def view_batch_details_direct(
     ]
 
     text = f"""
-📦 <b>Партия #{batch['id']}</b>
+📦 <b>Партия #{batch.get('id', batch_id)}</b>
 
-🌾 Культура: {batch['culture']}
+🌾 Культура: {batch.get('culture', '?')}
 📍 Регион: {batch.get('region', 'Не указан')}
-📦 Объём: {batch['volume']} т
-💰 Цена: {batch['price']:,.0f} ₽/т
+📦 Объём: {batch.get('volume', 0)} т
+💰 Цена: {get_safe_float(batch.get('price'), 0):,.0f} ₽/т
 💧 Влажность: {batch.get('humidity', 'Не указано')}%
 🌾 Сорность: {batch.get('impurity', 'Не указано')}%
 ⭐ Класс: {batch.get('quality_class', 'Не указано')}
@@ -27918,8 +31466,8 @@ async def filter_batches(callback: types.CallbackQuery, state: FSMContext):
         # Добавляем кнопки партий
         for batch in filtered_batches:
             culture = batch.get("culture", "?")
-            volume = batch.get("volume", 0)
-            price = batch.get("price", 0)
+            volume = get_safe_float(batch.get("volume"), 0)
+            price = get_safe_float(batch.get("price"), 0)
             batch_id = batch.get("id", "unknown")
             button_text = (
                 f"{title.split()[0]} {culture} - {volume} т ({price:,.0f} ₽/т)"
@@ -27991,9 +31539,21 @@ async def back_to_requests(callback: types.CallbackQuery, state: FSMContext):
     for req_id, req in shipping_requests.items():
         if not isinstance(req, dict):
             continue
-        status = req.get("status")
+        request_owner_id = (
+            req.get("exporter_id")
+            or req.get("customer_id")
+            or req.get("created_by")
+        )
+        status = get_effective_request_status(
+            req.get("id", req_id),
+            "exporter",
+            req,
+            request_owner_id=request_owner_id,
+            request_exporter_id=request_owner_id,
+        )
+        assigned_logist = get_assigned_logist_id(req)
         logging.info(f"   - ID {req_id}: status='{status}'")
-        if is_request_open_for_offers(status):
+        if is_request_open_for_offers(status) and not assigned_logist:
             canonical_id = req.get("id", req_id)
             canonical_key = str(canonical_id)
             if canonical_key in seen_exporter_request_ids:
@@ -28016,9 +31576,16 @@ async def back_to_requests(callback: types.CallbackQuery, state: FSMContext):
     for req_id, req in farmer_shipping_requests.items():
         if not isinstance(req, dict):
             continue
-        status = req.get("status")
+        request_owner_id = req.get("farmer_id") or req.get("user_id")
+        status = get_effective_request_status(
+            req.get("id", req_id),
+            "farmer",
+            req,
+            request_owner_id=request_owner_id,
+        )
+        assigned_logist = get_assigned_logist_id(req)
         logging.info(f"   - farmer_shipping ID {req_id}: status='{status}'")
-        if is_request_open_for_offers(status):
+        if is_request_open_for_offers(status) and not assigned_logist:
             canonical_id = req.get("id", req_id)
             canonical_key = str(canonical_id)
             if canonical_key in seen_farmer_request_ids:
@@ -28037,9 +31604,16 @@ async def back_to_requests(callback: types.CallbackQuery, state: FSMContext):
     for req_id, req in farmer_logistics_requests.items():
         if not isinstance(req, dict):
             continue
-        status = req.get("status")
+        request_owner_id = req.get("farmer_id") or req.get("user_id")
+        status = get_effective_request_status(
+            req.get("id", req_id),
+            "farmer",
+            req,
+            request_owner_id=request_owner_id,
+        )
+        assigned_logist = get_assigned_logist_id(req)
         logging.info(f"   - ID {req_id}: status='{status}'")
-        if is_request_open_for_offers(status):
+        if is_request_open_for_offers(status) and not assigned_logist:
             canonical_id = req.get("id", req_id)
             canonical_key = str(canonical_id)
             if canonical_key in seen_farmer_request_ids:
@@ -28061,9 +31635,21 @@ async def back_to_requests(callback: types.CallbackQuery, state: FSMContext):
     for req_id, req in logistics_requests.items():
         if not isinstance(req, dict):
             continue
-        status = req.get("status")
+        request_owner_id = (
+            req.get("customer_id")
+            or req.get("created_by")
+            or req.get("exporter_id")
+        )
+        status = get_effective_request_status(
+            req.get("id", req_id),
+            "logistics",
+            req,
+            request_owner_id=request_owner_id,
+            request_exporter_id=req.get("exporter_id"),
+        )
+        assigned_logist = get_assigned_logist_id(req)
         logging.info(f"   - ID {req_id}: status='{status}'")
-        if is_request_open_for_offers(status):
+        if is_request_open_for_offers(status) and not assigned_logist:
             canonical_id = req.get("id", req_id)
             canonical_key = str(canonical_id)
             if canonical_key in seen_logistics_request_ids:
@@ -28191,8 +31777,10 @@ async def contact_farmer_handler(callback: types.CallbackQuery, state: FSMContex
     """Контакт с фермером"""
     try:
         parts = callback.data.split("_")
-        farmer_id = int(parts[2])
-        batch_id = int(parts[3])
+        farmer_id_raw = parts[2]
+        batch_id_raw = parts[3]
+        farmer_id = int(farmer_id_raw) if str(farmer_id_raw).isdigit() else farmer_id_raw
+        batch_id = int(batch_id_raw) if str(batch_id_raw).isdigit() else batch_id_raw
     except (IndexError, ValueError):
         await callback.answer("❌ Ошибка обработки данных", show_alert=True)
         return
@@ -28310,20 +31898,49 @@ async def callback_search_by_region(callback_query: types.CallbackQuery):
 @dp.callback_query_handler(
     lambda c: c.data in ["search_by_price", "search_by_volume"], state="*"
 )
-async def callback_search_by_unavailable(callback_query: types.CallbackQuery):
-    """Временный маршрут для неактивных фильтров поиска."""
-    keyboard = InlineKeyboardMarkup(row_width=2)
-    keyboard.add(
-        InlineKeyboardButton("🌾 По культуре", callback_data="search_by_culture"),
-        InlineKeyboardButton("📍 По региону", callback_data="search_by_region"),
-    )
-    keyboard.add(InlineKeyboardButton("🔙 Назад", callback_data="back_to_menu"))
+async def callback_search_by_unavailable(
+    callback_query: types.CallbackQuery, state: FSMContext
+):
+    """Запуск поиска партий по цене или объёму из быстрого меню."""
+    await state.finish()
 
-    await callback_query.message.edit_text(
-        "ℹ️ Фильтры по цене и объёму пока недоступны.\n\n"
-        "Используйте поиск по культуре или региону.",
-        reply_markup=keyboard,
-    )
+    if callback_query.data == "search_by_price":
+        await state.update_data(search_type="price")
+        try:
+            await callback_query.message.edit_text(
+                "💰 <b>Поиск по цене</b>\n\n"
+                "Введите минимальную цену (₽/тонна):",
+                parse_mode="HTML",
+            )
+        except MessageNotModified:
+            pass
+        except Exception as e:
+            logging.error(f"Ошибка edit_text: {e}")
+            await callback_query.message.answer(
+                "💰 <b>Поиск по цене</b>\n\n"
+                "Введите минимальную цену (₽/тонна):",
+                parse_mode="HTML",
+            )
+        await SearchBatchesStatesGroup.enter_min_price.set()
+    else:
+        await state.update_data(search_type="volume")
+        try:
+            await callback_query.message.edit_text(
+                "📦 <b>Поиск по объёму</b>\n\n"
+                "Введите минимальный объём (в тоннах):",
+                parse_mode="HTML",
+            )
+        except MessageNotModified:
+            pass
+        except Exception as e:
+            logging.error(f"Ошибка edit_text: {e}")
+            await callback_query.message.answer(
+                "📦 <b>Поиск по объёму</b>\n\n"
+                "Введите минимальный объём (в тоннах):",
+                parse_mode="HTML",
+            )
+        await SearchBatchesStatesGroup.enter_min_volume.set()
+
     await callback_query.answer()
 
 
@@ -28336,8 +31953,8 @@ async def publish_pull_to_channel(pull_data):
         message_text = f"""🌐 <b>НОВЫЙ ПУЛЛ</b>
 
 🌾 Культура: {pull_data.get('culture', 'Не указано')}
-📦 Объем: {pull_data.get('target_volume', 0):,.0f} тонн
-💰 Цена: {pull_data.get('price', 0):,.0f} ₽/т
+📦 Объем: {get_safe_float(pull_data.get('target_volume'), 0):,.0f} тонн
+💰 Цена: {get_safe_float(pull_data.get('price'), 0):,.0f} ₽/т
 🚢 Порт: {pull_data.get('port', 'Не указано')}
 
 📊 Требования к качеству:
@@ -28363,8 +31980,8 @@ async def publish_batch_to_channel(batch_data, farmer_name):
 
 👤 Фермер: {farmer_name}
 🌾 Культура: {batch_data.get('culture', 'Не указано')}
-📦 Объем: {batch_data.get('volume', 0):,.0f} тонн
-💰 Цена: {batch_data.get('price', 0):,.0f} ₽/т
+📦 Объем: {get_safe_float(batch_data.get('volume'), 0):,.0f} тонн
+💰 Цена: {get_safe_float(batch_data.get('price'), 0):,.0f} ₽/т
 📍 Регион: {batch_data.get('region', 'Не указано')}
 
 📊 Качество:
@@ -28385,19 +32002,27 @@ async def publish_batch_to_channel(batch_data, farmer_name):
 async def generate_weekly_report():
     """Генерация еженедельного отчета"""
     try:
-        farmers_count = len([u for u in users.values() if u.get("role") == "farmer"])
+        unique_users = {}
+        for user_id_data, user_data in users.items():
+            if not isinstance(user_data, dict):
+                continue
+            canonical_user_id = user_data.get("id", user_id_data)
+            canonical_key = str(canonical_user_id)
+            if canonical_key in unique_users:
+                continue
+            unique_users[canonical_key] = user_data
+
+        farmers_count = len(
+            [u for u in unique_users.values() if u.get("role") == "farmer"]
+        )
         exporters_count = len(
-            [u for u in users.values() if u.get("role") == "exporter"]
+            [u for u in unique_users.values() if u.get("role") == "exporter"]
         )
         logistics_count = len(
-            [u for u in users.values() if is_logistic_role(u.get("role"))]
+            [u for u in unique_users.values() if is_logistic_role(u.get("role"))]
         )
         expeditors_count = len(
-            [
-                u
-                for u in users.values()
-                if is_expeditor_role(u.get("role"))
-            ]
+            [u for u in unique_users.values() if is_expeditor_role(u.get("role"))]
         )
 
         total_batches = sum(1 for _ in iter_all_batches())
@@ -28424,7 +32049,7 @@ async def generate_weekly_report():
 • Экспортеры: {exporters_count}
 • Логисты: {logistics_count}
 • Экспедиторы: {expeditors_count}
-• <b>Всего: {len(users)}</b>
+• <b>Всего: {len(unique_users)}</b>
 
 📦 <b>ПАРТИИ:</b>
 • Всего партий: {total_batches}
@@ -28565,7 +32190,7 @@ async def process_batch_selection_for_pull(
                 "farmer_id": batch.get("farmer_id"),
                 "culture": batch.get("culture"),
                 "volume": batch.get("volume"),
-                "price": batch.get("price"),
+                "price": get_safe_float(batch.get("price"), 0),
                 "moisture": batch.get("moisture", batch.get("humidity", 0)),
                 "impurity": batch.get("impurity", batch.get("impurities", 0)),
                 "quality_class": batch.get("quality_class", ""),
@@ -28573,8 +32198,8 @@ async def process_batch_selection_for_pull(
             }
         )
         pull["batch_ids"].append(batch_id_int)
-        current_volume = pull.get("current_volume", 0)
-        pull["current_volume"] = current_volume + batch.get("volume", 0)
+        current_volume = get_safe_float(pull.get("current_volume"), 0)
+        pull["current_volume"] = current_volume + get_safe_float(batch.get("volume"), 0)
 
         save_pulls_to_pickle()
 
@@ -28603,13 +32228,12 @@ async def safe_notify_exporter(pull, batch):
             logging.debug("Пулл не указан")
             return
 
-        exporter_id = pull.get("exporter_id")
+        exporter_id = pull.get("exporter_id") or pull.get("creator_id")
         if not exporter_id:
-            logging.debug("У пулла нет exporter_id")
+            logging.debug("У пулла нет exporter_id/creator_id")
             return
 
-        users_data = users if isinstance(users, dict) else {}
-        if exporter_id not in users_data:
+        if not get_user_by_id(exporter_id):
             logging.debug(f"Экспортёр {exporter_id} не найден")
             return
 
@@ -28672,7 +32296,7 @@ async def show_my_pulls_farmer(message: types.Message, state: FSMContext):
             continue
 
         for participant in participants:
-            if not same_id(participant.get("farmer_id"), user_id):
+            if not same_id(participant.get("farmer_id") or participant.get("user_id"), user_id):
                 continue
             batch_id = participant.get("batch_id")
             batch = next((b for b in user_batches if same_id(b.get("id"), batch_id)), {})
@@ -28740,8 +32364,8 @@ async def debug_account(message: types.Message):
     info.append(f"User ID: `{user_id}`\n")
 
     # Проверяем users
-    if user_id in users:
-        user_data = get_user_by_id(user_id) or {}
+    user_data = get_user_by_id(user_id) or {}
+    if user_data:
         info.append("✅ Найден в памяти (users)")
         info.append(f"   Роль: {user_data.get('role', 'не указана')}")
         info.append(f"   Телефон: {user_data.get('phone', 'не указан')}")
@@ -28750,14 +32374,24 @@ async def debug_account(message: types.Message):
         info.append("❌ Не найден в памяти (users)\n")
 
     # Проверяем batches
-    if user_id in batches:
-        batch_count = len(batches[user_id])
+    batch_count = 0
+    for key in [user_id, str(user_id)]:
+        user_batches = batches.get(key, [])
+        if isinstance(user_batches, list):
+            batch_count += len(user_batches)
+    if batch_count:
         info.append(f"📦 Партий фермера: {batch_count}\n")
 
     # Проверяем пулы экспортёра
     all_pulls = pulls.get("pulls", {}) if isinstance(pulls, dict) else {}
     exporter_pulls_count = sum(
-        1 for p in all_pulls.values() if isinstance(p, dict) and same_id(p.get("exporter_id"), user_id)
+        1
+        for p in all_pulls.values()
+        if isinstance(p, dict)
+        and (
+            same_id(p.get("exporter_id"), user_id)
+            or same_id(p.get("creator_id"), user_id)
+        )
     )
     if exporter_pulls_count:
         info.append(f"🎯 Пуллов экспортёра: {exporter_pulls_count}\n")
@@ -28861,7 +32495,11 @@ async def create_logistics_request_start(message: types.Message, state: FSMConte
         all_user_pulls = [
             p
             for p in true_pulls.values()
-            if isinstance(p, dict) and same_id(p.get("exporter_id"), user_id)
+            if isinstance(p, dict)
+            and (
+                same_id(p.get("exporter_id"), user_id)
+                or same_id(p.get("creator_id"), user_id)
+            )
         ]
 
         if all_user_pulls:
@@ -28869,8 +32507,8 @@ async def create_logistics_request_start(message: types.Message, state: FSMConte
                 pull_id = pull.get("id")
                 culture = pull.get("culture", "Неизвестно")
                 status = pull.get("status", "active")
-                current = pull.get("current_volume", 0)
-                target = pull.get("target_volume", 0)
+                current = get_safe_float(pull.get("current_volume"), 0)
+                target = get_safe_float(pull.get("target_volume"), 0)
                 percent = (current / target * 100) if target > 0 else 0
 
                 status_emoji = "🔓" if is_pull_open_status(status) else "🔒"
@@ -28891,7 +32529,7 @@ async def create_logistics_request_start(message: types.Message, state: FSMConte
 
     for pull_id, pull in list(exporter_pulls.items())[:10]:
         culture = pull.get("culture", "Неизвестно")
-        current_vol = pull.get("current_volume", 0) or 0
+        current_vol = get_safe_float(pull.get("current_volume"), 0)
 
         btn_text = f"📦 Пул #{pull_id}: {culture} ({current_vol:.0f}т)"
         keyboard.add(
@@ -28935,8 +32573,8 @@ async def select_pull_for_logistics(callback: types.CallbackQuery, state: FSMCon
         return
 
     pull_status = normalize_transition_status(pull.get("status", "active"))
-    current_volume = pull.get("current_volume", 0) or 0
-    target_volume = pull.get("target_volume", 0) or 0
+    current_volume = get_safe_float(pull.get("current_volume"), 0)
+    target_volume = get_safe_float(pull.get("target_volume"), 0)
     is_closed = pull_status == "closed"
     is_full = target_volume > 0 and current_volume >= target_volume
     if not (is_closed or is_full):
@@ -28949,14 +32587,14 @@ async def select_pull_for_logistics(callback: types.CallbackQuery, state: FSMCon
     await state.update_data(
         pull_id=pull_id,
         culture=pull.get("culture", "Культура"),
-        volume=pull.get("current_volume", 0),
+        volume=current_volume,
         port=pull.get("port", ""),
     )
 
     await callback.message.edit_text(
         "🚚 <b>Заявка на логистику</b>\n\n"
         "<b>Шаг 1 из 4</b>\n\n"
-        f"Пул: #{pull_id} • {pull.get('culture', 'Культура')} • {pull.get('current_volume', 0):.0f} т\n"
+        f"Пул: #{pull_id} • {pull.get('culture', 'Культура')} • {current_volume:.0f} т\n"
         f"Порт: {pull.get('port', '')}\n\n"
         "Откуда (регион/город погрузки):",
         parse_mode="HTML",
@@ -29020,7 +32658,7 @@ async def logistics_request_date(message: types.Message, state: FSMContext):
 async def logistics_request_desired_price(message: types.Message, state: FSMContext):
     """Ожидаемая цена доставки"""
     try:
-        desired_price = float(message.text.replace(",", ".").replace(" ", ""))
+        desired_price = parse_price(message.text)
 
         if desired_price <= 0:
             raise ValueError("Цена должна быть больше 0")
@@ -29073,8 +32711,8 @@ async def logistics_request_finish(message: types.Message, state: FSMContext):
         await state.finish()
         return
     pull_status = normalize_transition_status(pull.get("status", "active"))
-    current_volume = pull.get("current_volume", 0) or 0
-    target_volume = pull.get("target_volume", 0) or 0
+    current_volume = get_safe_float(pull.get("current_volume"), 0)
+    target_volume = get_safe_float(pull.get("target_volume"), 0)
     is_closed = pull_status == "closed"
     is_full = target_volume > 0 and current_volume >= target_volume
     if not (is_closed or is_full):
@@ -29087,8 +32725,41 @@ async def logistics_request_finish(message: types.Message, state: FSMContext):
     has_open_logistics_request = any(
         isinstance(req, dict)
         and same_id(req.get("pull_id"), pull_id)
-        and same_id(req.get("exporter_id"), pull_owner_id)
-        and normalize_transition_status(req.get("status")) not in {"completed", "cancelled", "rejected"}
+        and (
+            not pull_owner_id
+            or (
+                req.get("exporter_id")
+                or req.get("customer_id")
+                or req.get("created_by")
+            )
+            in {None, ""}
+            or same_id(
+                req.get("exporter_id")
+                or req.get("customer_id")
+                or req.get("created_by"),
+                pull_owner_id,
+            )
+        )
+        and get_effective_request_status(
+            req.get("id", req.get("request_id", pull_id)),
+            "logistics",
+            req,
+            request_owner_id=(
+                req.get("customer_id")
+                or req.get("created_by")
+                or req.get("exporter_id")
+                or (
+                    req.get("logist_id")
+                    if not (
+                        req.get("assigned_logist_id")
+                        or req.get("selected_logistic")
+                    )
+                    else None
+                )
+            ),
+            request_exporter_id=req.get("exporter_id"),
+        )
+        not in {"completed", "cancelled", "rejected"}
         for req in logistics_requests.values()
     )
     if has_open_logistics_request:
@@ -29136,10 +32807,10 @@ async def logistics_request_finish(message: types.Message, state: FSMContext):
         f"✅ <b>Заявка на логистику #{logistics_request_counter} создана!</b>\n\n"
         f"📦 Пул: #{pull_id}\n"
         f"🌾 Культура: {data['culture']}\n"
-        f"📦 Объем: {data['volume']:.0f} т\n"
+        f"📦 Объем: {get_safe_float(data.get('volume'), 0):.0f} т\n"
         f"📍 Маршрут: {data['route_from']} → {request['route_to']}\n"
         f"📅 Дата: {data['loading_date']}\n"
-        f"💰 Ожидаемая цена: <code>{data.get('desired_price', 0):,.0f}</code> ₽/т\n"
+        f"💰 Ожидаемая цена: <code>{get_safe_float(data.get('desired_price'), 0):,.0f}</code> ₽/т\n"
     )
 
     if notes:
@@ -29197,8 +32868,15 @@ async def view_logistics_request_details(
         or req.get("created_by")
         or req.get("exporter_id")
         or req.get("farmer_id")
-        or req.get("logist_id")
+        or req.get("user_id")
     )
+    if not owner_id:
+        legacy_logist_owner_id = req.get("logist_id")
+        has_assigned_logist_id = bool(
+            req.get("assigned_logist_id") or req.get("selected_logistic")
+        )
+        if legacy_logist_owner_id and not has_assigned_logist_id:
+            owner_id = legacy_logist_owner_id
 
     if not (
         user_role == "admin"
@@ -29209,8 +32887,15 @@ async def view_logistics_request_details(
         await callback.answer("❌ Нет доступа к заявке", show_alert=True)
         return
 
+    req_status_norm = get_effective_request_status(
+        req_id,
+        "logistics",
+        req,
+        request_owner_id=owner_id,
+        request_exporter_id=req.get("exporter_id"),
+    )
+
     if is_logistic_role(user_role):
-        req_status_norm = normalize_transition_status(req.get("status"))
         assigned_logist_id = get_assigned_logist_id(req)
         if (
             req_status_norm in {"assigned", "in_progress", "completed", "expeditor_selected"}
@@ -29220,7 +32905,6 @@ async def view_logistics_request_details(
             await callback.answer("❌ Нет доступа к этой перевозке", show_alert=True)
             return
     if is_expeditor_role(user_role):
-        req_status_norm = normalize_transition_status(req.get("status"))
         assigned_expeditor_id = get_assigned_expeditor_id(req)
         if not has_assigned_logist(req) and not same_id(assigned_expeditor_id, user_id):
             await callback.answer(
@@ -29257,12 +32941,14 @@ async def view_logistics_request_details(
     )
 
     # ✅ ПОЛНАЯ ИНФОРМАЦИЯ О ЗАЯВКЕ
+    req_volume = get_safe_float(req.get("volume"), 0)
+    req_status_label = get_status_name(req_status_norm)
     msg = f"""
 📋 <b>ЗАЯВКА #{req_id}</b>
 
 <b>🌾 Информация о грузе:</b>
 Культура: {req.get('culture', 'Не указана')}
-Объем: {req.get('volume', 0):.0f} т
+Объем: {req_volume:.0f} т
 
 <b>📍 Маршрут доставки:</b>
 От: {req.get('route_from', 'Не указано')}
@@ -29274,7 +32960,7 @@ async def view_logistics_request_details(
 
 <b>💼 Статистика:</b>
 Откликов получено: {count_logistic_offers_for_request(req_id, 'logistics')}
-Статус: {req.get('status', 'active')}
+Статус: {req_status_label}
 """
 
     if req.get("notes"):
@@ -29285,9 +32971,16 @@ async def view_logistics_request_details(
         req.get("customer_id")
         or req.get("created_by")
         or req.get("farmer_id")
+        or req.get("user_id")
         or req.get("exporter_id")
-        or req.get("logist_id")
     )
+    if not customer_id:
+        legacy_logist_owner_id = req.get("logist_id")
+        has_assigned_logist_id = bool(
+            req.get("assigned_logist_id") or req.get("selected_logistic")
+        )
+        if legacy_logist_owner_id and not has_assigned_logist_id:
+            customer_id = legacy_logist_owner_id
     customer = (get_user_by_id(customer_id) or {}) if customer_id else {}
     if customer:
         msg += f"""
@@ -29317,14 +33010,14 @@ Email: <code>{req.get('exporter_email', 'Не указан')}</code>
     pending_offers = [
         (offer_id, offer)
         for offer_id, offer in offers_for_request
-        if normalize_transition_status(offer.get("status")) in {"pending", "active"}
+        if normalize_transition_status(offer.get("status")) in OPEN_LOGISTIC_OFFER_STATUSES
     ]
 
     # Кнопка отклика (единый поток: make_offer -> logistic_offers)
     if (
         is_logistic_role(user_role)
         and not already_offered
-        and is_request_open_for_offers(req.get("status"))
+        and is_request_open_for_offers(req_status_norm)
         and not same_id(owner_id, user_id)
     ):
         keyboard.add(
@@ -29346,7 +33039,7 @@ Email: <code>{req.get('exporter_email', 'Не указан')}</code>
             f"Ожидают решения: {len(pending_offers)}"
         )
         for offer_id, offer in pending_offers[:5]:
-            price = offer.get("price", 0)
+            price = get_safe_float(offer.get("price"), 0)
             vehicle = offer.get("vehicle_type", "—")
             keyboard.add(
                 InlineKeyboardButton(
@@ -29355,11 +33048,19 @@ Email: <code>{req.get('exporter_email', 'Не указан')}</code>
                 )
             )
 
+    delivery_guard_state = get_request_delivery_guard_state(
+        req_id,
+        "logistics",
+        request_owner_id=owner_id,
+        request_exporter_id=req.get("exporter_id"),
+    )
+
     if (
         is_expeditor_role(user_role)
-        and is_request_open_for_expeditor(req.get("status"))
+        and is_request_open_for_expeditor(req_status_norm)
         and not has_assigned_expeditor(req)
         and has_assigned_logist(req)
+        and delivery_guard_state is None
     ):
         keyboard.add(
             InlineKeyboardButton(
@@ -29386,13 +33087,20 @@ Email: <code>{req.get('exporter_email', 'Не указан')}</code>
         expeditor_offers_count = count_open_expeditor_request_offers_for_request(
             req_id, "logistics"
         )
-        keyboard.add(
-            InlineKeyboardButton(
-                f"📄 Отклики экспедиторов ({expeditor_offers_count})",
-                callback_data=f"view_expeditor_offers_for_request:logistics:{req_id}",
-            )
+        has_expeditor_offer_history = any(
+            iter_request_related_expeditor_offers(req_id, "logistics")
         )
-        req_status_norm = normalize_transition_status(req.get("status"))
+        if (
+            has_assigned_logist(req)
+            or has_assigned_expeditor(req)
+            or has_expeditor_offer_history
+        ):
+            keyboard.add(
+                InlineKeyboardButton(
+                    f"📄 Отклики экспедиторов ({expeditor_offers_count})",
+                    callback_data=f"view_expeditor_offers_for_request:logistics:{req_id}",
+                )
+            )
         if req_status_norm in {
             "pending",
             "active",
@@ -29409,7 +33117,13 @@ Email: <code>{req.get('exporter_email', 'Не указан')}</code>
                     callback_data=f"cancel_logistics_request:{req_id}",
                 )
             )
-        if req_status_norm in {"assigned", "in_progress", "completed", "expeditor_selected"}:
+        if req_status_norm in {
+            "assigned",
+            "in_progress",
+            "completed",
+            "expeditor_selected",
+            "cancelled",
+        }:
             linked_delivery = None
             for d in deliveries.values():
                 if not isinstance(d, dict):
@@ -29450,8 +33164,14 @@ Email: <code>{req.get('exporter_email', 'Не указан')}</code>
                     d.get("customer_id")
                     or d.get("created_by")
                     or d.get("exporter_id")
-                    or d.get("logist_id")
                 )
+                if not delivery_owner_id:
+                    legacy_logist_owner_id = d.get("logist_id")
+                    has_assigned_logist_id = bool(
+                        d.get("assigned_logist_id") or d.get("selected_logistic")
+                    )
+                    if legacy_logist_owner_id and not has_assigned_logist_id:
+                        delivery_owner_id = legacy_logist_owner_id
                 if owner_id is not None and not same_id(delivery_owner_id, owner_id):
                     continue
                 linked_delivery = d
@@ -29539,7 +33259,25 @@ async def respond_to_logistics_request(
         await callback.answer("❌ Заявка не найдена", show_alert=True)
         return
     req_id = req.get("id", req_id)
-    if not is_request_open_for_offers(req.get("status")):
+    request_owner_id = (
+        req.get("customer_id")
+        or req.get("created_by")
+        or req.get("exporter_id")
+        or req.get("farmer_id")
+        or req.get("user_id")
+    )
+    effective_status = get_effective_request_status(
+        req_id,
+        source,
+        req,
+        request_owner_id=request_owner_id,
+        request_exporter_id=(
+            req.get("exporter_id")
+            or req.get("customer_id")
+            or req.get("created_by")
+        ),
+    )
+    if not is_request_open_for_offers(effective_status):
         await callback.answer("❌ Заявка уже не принимает отклики", show_alert=True)
         return
     if get_assigned_logist_id(req):
@@ -29555,7 +33293,7 @@ async def respond_to_logistics_request(
 async def logistics_offer_price(message: types.Message, state: FSMContext):
     """Цена за перевозку"""
     try:
-        price = float(message.text.strip().replace(",", ".").replace(" ", ""))
+        price = parse_price(message.text)
         if price <= 0:
             raise ValueError
 
@@ -29647,7 +33385,26 @@ async def logistics_offer_finish(message: types.Message, state: FSMContext):
         await message.answer("❌ Заявка не найдена. Попробуйте ещё раз.")
         await state.finish()
         return
-    if not is_request_open_for_offers(req.get("status")):
+    request_owner_id = (
+        req.get("customer_id")
+        or req.get("created_by")
+        or req.get("exporter_id")
+    )
+    if not request_owner_id:
+        legacy_logist_owner_id = req.get("logist_id")
+        has_assigned_logist_id = bool(
+            req.get("assigned_logist_id") or req.get("selected_logistic")
+        )
+        if legacy_logist_owner_id and not has_assigned_logist_id:
+            request_owner_id = legacy_logist_owner_id
+    request_status = get_effective_request_status(
+        req_id,
+        "logistics",
+        req,
+        request_owner_id=request_owner_id,
+        request_exporter_id=req.get("exporter_id"),
+    )
+    if not is_request_open_for_offers(request_status):
         await message.answer("❌ Заявка уже не принимает отклики.")
         await state.finish()
         return
@@ -29695,7 +33452,7 @@ async def logistics_offer_finish(message: types.Message, state: FSMContext):
 
     # Обновляем счётчик откликов в заявке
     req["offers_count"] = count_logistic_offers_for_request(req_id, "logistics")
-    if is_request_open_for_offers(req.get("status")):
+    if is_request_open_for_offers(request_status):
         req["status"] = "has_offers"
 
     save_logistics_requests_to_pickle()
@@ -29704,15 +33461,17 @@ async def logistics_offer_finish(message: types.Message, state: FSMContext):
     await state.finish()
 
     # РАСЧЁТ ИТОГОВОЙ СУММЫ
-    total_price = data["price"] * req["volume"]
+    req_volume = get_safe_float(req.get("volume"), 0)
+    offer_price = get_safe_float(data.get("price"), 0)
+    total_price = offer_price * req_volume
 
     # ИТОГОВОЕ СООБЩЕНИЕ ЛОГИСТУ
     summary = (
         "✅ <b>Отклик отправлен!</b>\n\n"
         f"📋 Заявка: #{req_id}\n"
-        f"🌾 {req['culture']} • {req['volume']:.0f} т\n"
-        f"📍 {req['route_from']} → {req['route_to']}\n\n"
-        f"💰 <b>Ваша цена:</b> <code>{data['price']:,.0f}</code> ₽/т\n"
+        f"🌾 {req.get('culture', '—')} • {req_volume:.0f} т\n"
+        f"📍 {req.get('route_from', '—')} → {req.get('route_to', '—')}\n\n"
+        f"💰 <b>Ваша цена:</b> <code>{offer_price:,.0f}</code> ₽/т\n"
         f"💵 <b>Общая сумма:</b> <code>{total_price:,.0f}</code> ₽\n"
         f"🚛 <b>Транспорт:</b> {data['vehicle_type']}\n"
         f"⏱ <b>Срок:</b> {data['delivery_days']} дн.\n\n"
@@ -29757,10 +33516,10 @@ async def notify_logistics_about_new_request(request: dict):
         or "Не указана"
     )
     culture = request.get("culture", "—")
-    volume = request.get("volume", 0) or 0
+    volume = get_safe_float(request.get("volume"), 0)
     route_from = request.get("route_from", "—")
     route_to = request.get("route_to", "—")
-    desired_price = request.get("desired_price", 0) or 0
+    desired_price = get_safe_float(request.get("desired_price"), 0)
 
     msg = (
         f"✅ <b>Заявка на логистику #{request.get('id','-')}</b>\n\n"
@@ -29797,14 +33556,14 @@ async def notify_exporter_about_offer(request: dict, offer: dict):
     req_id = request.get("id", "-")
     pull_id = request.get("pull_id", "-")
     culture = request.get("culture", "—")
-    volume = request.get("volume", 0) or 0
+    volume = get_safe_float(request.get("volume"), 0)
     route_from = request.get("route_from", "—")
     route_to = request.get("route_to", "—")
     desired_date = request.get("loading_date") or request.get("desired_date") or "Не указана"
-    desired_price = request.get("desired_price", 0) or 0
+    desired_price = get_safe_float(request.get("desired_price"), 0)
 
     # Параметры предложения логиста
-    price = offer.get("price", 0) or 0
+    price = get_safe_float(offer.get("price"), 0)
     total_price = price * volume
     vehicle_type = offer.get("vehicle_type", "-")
     delivery_days = offer.get("delivery_days") or offer.get("delivery_date") or "-"
@@ -29945,7 +33704,7 @@ async def show_my_card_menu(message: types.Message, state: FSMContext):
                 f"🚛 <b>Тип транспорта:</b> {card.get('vehicle_type', 'Не указан')}\n"
                 f"📦 <b>Грузоподъёмность:</b> {card.get('capacity', 'Не указана')} т\n"
                 f"📍 <b>Регионы работы:</b> {card.get('regions', 'Не указаны')}\n"
-                f"💰 <b>Цена за км:</b> {card.get('price_per_km', 0):.2f} ₽/км\n"
+                f"💰 <b>Цена за км:</b> {get_safe_float(card.get('price_per_km'), 0):.2f} ₽/км\n"
                 f"📝 <b>Описание:</b> {card.get('description', 'Не указано')}\n\n"
                 f"📅 Создана: {card.get('created_at', 'Не указано')}\n"
                 f"👁 Просмотров: {card.get('views', 0)}\n"
@@ -30065,7 +33824,9 @@ async def process_logistic_routes(message: types.Message, state: FSMContext):
 async def process_price_per_km(message: types.Message, state: FSMContext):
     """Шаг 2 — цена за км."""
     try:
-        price = float(message.text.replace(",", "."))
+        price = parse_price(message.text)
+        if price <= 0:
+            raise ValueError
         await state.update_data(price_per_km=price)
         await message.answer(
             "💰 Шаг 3/7\n\nУкажите среднюю цену за тонну (руб.):", parse_mode="HTML"
@@ -30079,7 +33840,9 @@ async def process_price_per_km(message: types.Message, state: FSMContext):
 async def process_price_per_ton(message: types.Message, state: FSMContext):
     """Шаг 3 — цена за тонну."""
     try:
-        price = float(message.text.replace(",", "."))
+        price = parse_price(message.text)
+        if price <= 0:
+            raise ValueError
         await state.update_data(price_per_ton=price)
         await message.answer(
             "📦 Шаг 4/7\n\nУкажите минимальный объём перевозки (тонн):",
@@ -30095,6 +33858,8 @@ async def process_min_volume(message: types.Message, state: FSMContext):
     """Шаг 4 — минимальный объем."""
     try:
         volume = float(message.text.replace(",", "."))
+        if volume <= 0:
+            raise ValueError
         await state.update_data(min_volume=volume)
         await message.answer(
             "🚛 Шаг 5/7\n\nУкажите тип транспорта (например: Фура 20т):",
@@ -30485,8 +34250,16 @@ async def select_logistic_handler(callback: types.CallbackQuery):
     """
     try:
         parts = callback.data.split("_")
-        logistic_id = int(parts[2])
-        deal_id = int(parts[3])
+        logistic_id_raw = parts[2]
+        deal_id_raw = parts[3]
+        logistic_id = (
+            int(logistic_id_raw)
+            if str(logistic_id_raw).isdigit()
+            else str(logistic_id_raw).strip()
+        )
+        deal_id = (
+            int(deal_id_raw) if str(deal_id_raw).isdigit() else str(deal_id_raw).strip()
+        )
 
         resolved_deal_id, deal = find_deal_by_id(deal_id)
         if not deal:
@@ -30495,24 +34268,43 @@ async def select_logistic_handler(callback: types.CallbackQuery):
         deal_id = resolved_deal_id
         user_id = callback.from_user.id
         user_role = (get_user_by_id(user_id) or {}).get("role")
-        if not (user_role == "admin" or same_id(deal.get("exporter_id"), user_id)):
+        pull_id = deal.get("pull_id")
+        all_pulls = pulls.get("pulls", {}) if isinstance(pulls, dict) else {}
+        pull = all_pulls.get(pull_id) or all_pulls.get(str(pull_id), {})
+        deal_exporter_id = (
+            deal.get("exporter_id") or pull.get("exporter_id") or pull.get("creator_id")
+        )
+        if not (user_role == "admin" or same_id(deal_exporter_id, user_id)):
             await callback.answer("❌ Нет доступа", show_alert=True)
             return
-        deal_status = normalize_transition_status(deal.get("status"))
+        deal_status = get_effective_deal_status(deal)
         if deal_status in {"completed", "cancelled", "canceled"}:
             await callback.answer("❌ Сделка уже закрыта", show_alert=True)
+            return
+        if deal_status in {"in_progress", "expeditor_selected"}:
+            await callback.answer(
+                "❌ Сделка уже на этапе исполнения, логиста менять нельзя",
+                show_alert=True,
+            )
             return
         if not is_logistic_role((get_user_by_id(logistic_id) or {}).get("role")):
             await callback.answer("❌ Пользователь не является логистом", show_alert=True)
             return
-        if deal.get("logistic_id"):
+        if get_assigned_logist_id(deal):
             await callback.answer("❌ По сделке уже выбран логист", show_alert=True)
+            return
+        if get_assigned_expeditor_id(deal):
+            await callback.answer(
+                "❌ По сделке уже выбран экспедитор, логиста менять нельзя",
+                show_alert=True,
+            )
             return
 
         deal["logistic_id"] = logistic_id
         deal["logistic_selected_at"] = datetime.now().strftime(
             "%Y-%m-%d %H:%M:%S"
         )
+        deal["status"] = "assigned"
         save_deals_to_pickle()
 
         # --- карточка для экспортёра ---
@@ -30548,7 +34340,11 @@ async def select_logistic_handler(callback: types.CallbackQuery):
         all_pulls = pulls.get("pulls", {}) if isinstance(pulls, dict) else {}
         pull = all_pulls.get(pull_id) or all_pulls.get(str(pull_id), {})
 
-        exporter_id = deal.get("exporter_id") or pull.get("exporter_id")
+        exporter_id = (
+            deal_exporter_id
+            or pull.get("exporter_id")
+            or pull.get("creator_id")
+        )
         exporter = (get_user_by_id(exporter_id) or {}) if exporter_id else {}
         exporter_name = exporter.get("name", "Не указано")
         exporter_phone = exporter.get("phone", "Не указан")
@@ -30597,8 +34393,16 @@ async def select_expeditor_handler(callback: types.CallbackQuery):
     """
     try:
         parts = callback.data.split("_")
-        expeditor_id = int(parts[2])
-        deal_id = int(parts[3])
+        expeditor_id_raw = parts[2]
+        deal_id_raw = parts[3]
+        expeditor_id = (
+            int(expeditor_id_raw)
+            if str(expeditor_id_raw).isdigit()
+            else str(expeditor_id_raw).strip()
+        )
+        deal_id = (
+            int(deal_id_raw) if str(deal_id_raw).isdigit() else str(deal_id_raw).strip()
+        )
 
         resolved_deal_id, deal = find_deal_by_id(deal_id)
         if not deal:
@@ -30607,19 +34411,36 @@ async def select_expeditor_handler(callback: types.CallbackQuery):
         deal_id = resolved_deal_id
         user_id = callback.from_user.id
         user_role = (get_user_by_id(user_id) or {}).get("role")
-        if not (user_role == "admin" or same_id(deal.get("exporter_id"), user_id)):
+        pull_id = deal.get("pull_id")
+        all_pulls = pulls.get("pulls", {}) if isinstance(pulls, dict) else {}
+        pull = all_pulls.get(pull_id) or all_pulls.get(str(pull_id), {})
+        deal_exporter_id = (
+            deal.get("exporter_id") or pull.get("exporter_id") or pull.get("creator_id")
+        )
+        if not (user_role == "admin" or same_id(deal_exporter_id, user_id)):
             await callback.answer("❌ Нет доступа", show_alert=True)
             return
-        deal_status = normalize_transition_status(deal.get("status"))
+        deal_status = get_effective_deal_status(deal)
         if deal_status in {"completed", "cancelled", "canceled"}:
             await callback.answer("❌ Сделка уже закрыта", show_alert=True)
+            return
+        if deal_status == "in_progress":
+            await callback.answer(
+                "❌ Сделка уже в работе, экспедитора менять нельзя",
+                show_alert=True,
+            )
+            return
+        if not get_assigned_logist_id(deal):
+            await callback.answer(
+                "❌ Сначала по сделке нужно выбрать логиста", show_alert=True
+            )
             return
         if not is_expeditor_role((get_user_by_id(expeditor_id) or {}).get("role")):
             await callback.answer(
                 "❌ Пользователь не является экспедитором", show_alert=True
             )
             return
-        if deal.get("expeditor_id"):
+        if get_assigned_expeditor_id(deal):
             await callback.answer("❌ По сделке уже выбран экспедитор", show_alert=True)
             return
 
@@ -30627,6 +34448,7 @@ async def select_expeditor_handler(callback: types.CallbackQuery):
         deal["expeditor_selected_at"] = datetime.now().strftime(
             "%Y-%m-%d %H:%M:%S"
         )
+        deal["status"] = "expeditor_selected"
         save_deals_to_pickle()
 
         # --- карточка для экспортёра ---
@@ -30659,7 +34481,11 @@ async def select_expeditor_handler(callback: types.CallbackQuery):
         all_pulls = pulls.get("pulls", {}) if isinstance(pulls, dict) else {}
         pull = all_pulls.get(pull_id) or all_pulls.get(str(pull_id), {})
 
-        exporter_id = deal.get("exporter_id") or pull.get("exporter_id")
+        exporter_id = (
+            deal_exporter_id
+            or pull.get("exporter_id")
+            or pull.get("creator_id")
+        )
         exporter = (get_user_by_id(exporter_id) or {}) if exporter_id else {}
         exporter_name = exporter.get("name", "Не указано")
         exporter_phone = exporter.get("phone", "Не указан")
@@ -30864,10 +34690,20 @@ async def broadcast_confirm_handler(callback: types.CallbackQuery, state: FSMCon
     sent = 0
     failed = 0
 
-    for user_id in users.keys():
+    unique_user_ids = set()
+    for user_key, user_data in users.items():
+        if not isinstance(user_data, dict):
+            continue
+        canonical_user_id = user_data.get("id", user_key)
+        unique_user_ids.add(str(canonical_user_id))
+
+    for user_id in unique_user_ids:
         try:
+            target_user_id = int(user_id) if user_id.isdigit() else user_id
             await bot.send_message(
-                user_id, f"📢 <b>Рассылка:</b>\n\n{message_text}", parse_mode="HTML"
+                target_user_id,
+                f"📢 <b>Рассылка:</b>\n\n{message_text}",
+                parse_mode="HTML",
             )
             sent += 1
         except Exception as e:
@@ -30969,10 +34805,10 @@ async def legacy_offer_delete_handler(callback: types.CallbackQuery):
         await callback.answer("❌ Предложение не найдено", show_alert=True)
         return
 
-    if normalize_transition_status(offer.get("status")) not in {"pending", "active"}:
-        await callback.answer(
-            "❌ Можно отменить только предложения в ожидании ответа",
-            show_alert=True,
+        if normalize_transition_status(offer.get("status")) not in OPEN_LOGISTIC_OFFER_STATUSES:
+            await callback.answer(
+                "❌ Можно отменить только предложения в ожидании ответа",
+                show_alert=True,
         )
         return
 
@@ -31056,7 +34892,7 @@ async def legacy_view_delivery_handler(callback: types.CallbackQuery, state: FSM
         else:
             _, request_obj = find_farmer_request_by_id(request_id)
             request_obj = request_obj if isinstance(request_obj, dict) else {}
-            request_owner_id = request_obj.get("farmer_id")
+            request_owner_id = request_obj.get("farmer_id") or request_obj.get("user_id")
 
     delivery_id = None
     for deliv_id, delivery in deliveries.items():
@@ -31089,14 +34925,28 @@ async def legacy_view_delivery_handler(callback: types.CallbackQuery, state: FSM
                             delivery.get("customer_id")
                             or delivery.get("created_by")
                             or delivery.get("exporter_id")
-                            or delivery.get("logist_id")
                         )
+                        if not delivery_owner_id:
+                            legacy_logist_owner_id = delivery.get("logist_id")
+                            has_assigned_logist_id = bool(
+                                delivery.get("assigned_logist_id")
+                                or delivery.get("selected_logistic")
+                            )
+                            if legacy_logist_owner_id and not has_assigned_logist_id:
+                                delivery_owner_id = legacy_logist_owner_id
                     else:
                         delivery_owner_id = delivery.get("exporter_id")
-                    if not same_id(delivery_owner_id, request_owner_id):
+                    if delivery_owner_id not in {None, ""} and not same_id(
+                        delivery_owner_id, request_owner_id
+                    ):
                         continue
-                if offer_source == "farmer" and not same_id(
-                    delivery.get("farmer_id"), request_owner_id
+                if (
+                    offer_source == "farmer"
+                    and (delivery.get("farmer_id") or delivery.get("user_id")) not in {None, ""}
+                    and not same_id(
+                        delivery.get("farmer_id") or delivery.get("user_id"),
+                        request_owner_id,
+                    )
                 ):
                     continue
             delivery_id = deliv_id
@@ -31147,7 +34997,7 @@ async def cancel_offer_handler(callback: types.CallbackQuery):
         return
 
     # Проверяем что предложение ещё в статусе pending
-    if normalize_transition_status(offer.get("status")) not in {"pending", "active"}:
+    if normalize_transition_status(offer.get("status")) not in OPEN_LOGISTIC_OFFER_STATUSES:
         await callback.answer(
             "❌ Можно отменить только предложения в ожидании ответа", show_alert=True
         )
@@ -31199,7 +35049,7 @@ async def confirm_cancel_offer(callback: types.CallbackQuery):
     ):
         await callback.answer("❌ Нет доступа к предложению", show_alert=True)
         return
-    if normalize_transition_status(offer.get("status")) not in {"pending", "active"}:
+    if normalize_transition_status(offer.get("status")) not in OPEN_LOGISTIC_OFFER_STATUSES:
         await callback.answer(
             "❌ Можно отменить только предложение в ожидании", show_alert=True
         )
@@ -31242,7 +35092,7 @@ async def confirm_cancel_offer(callback: types.CallbackQuery):
     if offer_source == "farmer":
         _, request = find_farmer_request_by_id(request_id)
         request = request or {}
-        customer_id = request.get("farmer_id")
+        customer_id = request.get("farmer_id") or request.get("user_id")
     elif offer_source == "logistics":
         request = logistics_requests.get(request_id) or logistics_requests.get(str(request_id))
         request = request if isinstance(request, dict) else {}
@@ -31250,8 +35100,14 @@ async def confirm_cancel_offer(callback: types.CallbackQuery):
             request.get("customer_id")
             or request.get("created_by")
             or request.get("exporter_id")
-            or request.get("logist_id")
         )
+        if not customer_id:
+            legacy_logist_owner_id = request.get("logist_id")
+            has_assigned_logist_id = bool(
+                request.get("assigned_logist_id") or request.get("selected_logistic")
+            )
+            if legacy_logist_owner_id and not has_assigned_logist_id:
+                customer_id = legacy_logist_owner_id
     else:
         _, request = find_shipping_request_by_id(request_id)
         request = request or {}
@@ -31265,17 +35121,34 @@ async def confirm_cancel_offer(callback: types.CallbackQuery):
         request_state_updated = refresh_exporter_request_offer_state(request_id)
     elif offer_source == "farmer":
         request["offers_count"] = count_logistic_offers_for_request(request_id, "farmer")
-        if is_request_open_for_offers(request.get("status")):
+        request_status = get_effective_request_status(
+            request_id,
+            "farmer",
+            request,
+            request_owner_id=request.get("farmer_id") or request.get("user_id"),
+        )
+        if is_request_open_for_offers(request_status):
             request["status"] = "has_offers" if request["offers_count"] > 0 else "active"
         request_state_updated = True
     elif offer_source == "logistics":
         request["offers_count"] = count_logistic_offers_for_request(request_id, "logistics")
-        if is_request_open_for_offers(request.get("status")):
+        request_status = get_effective_request_status(
+            request_id,
+            "logistics",
+            request,
+            request_owner_id=(
+                request.get("customer_id")
+                or request.get("created_by")
+                or request.get("exporter_id")
+            ),
+            request_exporter_id=request.get("exporter_id"),
+        )
+        if is_request_open_for_offers(request_status):
             request["status"] = "has_offers" if request["offers_count"] > 0 else "active"
         request_state_updated = True
 
     # Получаем данные для уведомления
-    price = offer.get("price", 0)
+    price = get_safe_float(offer.get("price"), 0)
     vehicle_type = offer.get("vehicle_type", "Не указан")
     delivery_date = offer.get("delivery_date", "Не указана")
 
@@ -31289,7 +35162,7 @@ async def confirm_cancel_offer(callback: types.CallbackQuery):
 📋 Предложение: #{offer_id}
 📦 Заявка: #{request_id}
 🚛 Транспорт: {vehicle_type}
-💰 Цена: {price:,} ₽
+💰 Цена: {price:,.0f} ₽
 📅 Дата доставки: {delivery_date}
 
 Вы можете рассмотреть другие предложения от других логистов.""",
@@ -31342,191 +35215,8 @@ async def confirm_cancel_offer(callback: types.CallbackQuery):
 @dp.callback_query_handler(lambda c: c.data == "back_to_offers_list", state="*")
 async def back_to_offers_list(callback: types.CallbackQuery, state: FSMContext):
     """Вернуться к списку предложений логиста"""
-    await state.finish()
-
-    user_id = callback.from_user.id
-
-    # Проверяем доступ
-    if not is_logistic_role((get_user_by_id(user_id) or {}).get("role")):
-        await callback.answer("❌ Доступ запрещен", show_alert=True)
-        return
-
-    try:
-        # Получаем все предложения логиста
-        my_offers = {
-            oid: o
-            for oid, o in logistic_offers.items()
-            if same_id((o.get("logist_id") or o.get("logistic_id")), user_id)
-        }
-
-        # Если предложений нет
-        if not my_offers:
-            keyboard = InlineKeyboardMarkup()
-            keyboard.add(
-                InlineKeyboardButton(
-                    "🚚 К активным заявкам", callback_data="logistic_requests_list"
-                )
-            )
-
-            await callback.message.edit_text(
-                "💼 <b>Мои предложения</b>\n\n"
-                "У вас пока нет предложений.\n"
-                "Откликайтесь на заявки в разделе «🚚 Активные заявки»!",
-                reply_markup=keyboard,
-                parse_mode="HTML",
-            )
-            await callback.answer()
-            return
-
-        # Подсчёт по статусам
-        pending = sum(
-            1
-            for o in my_offers.values()
-            if normalize_transition_status(o.get("status")) == "pending"
-        )
-        accepted = sum(
-            1
-            for o in my_offers.values()
-            if normalize_transition_status(o.get("status")) == "accepted"
-        )
-        rejected = sum(
-            1
-            for o in my_offers.values()
-            if normalize_transition_status(o.get("status")) == "rejected"
-        )
-        in_progress = sum(
-            1
-            for o in my_offers.values()
-            if normalize_transition_status(o.get("status")) == "in_progress"
-        )
-        completed = sum(
-            1
-            for o in my_offers.values()
-            if normalize_transition_status(o.get("status")) == "completed"
-        )
-        cancelled = sum(
-            1
-            for o in my_offers.values()
-            if normalize_transition_status(o.get("status")) == "cancelled"
-        )
-
-        text = (
-            "💼 <b>Мои предложения</b>\n\n"
-            f"📊 <b>Всего:</b> {len(my_offers)}\n"
-            f"⏳ Ожидают ответа: {pending}\n"
-            f"✅ Приняты: {accepted}\n"
-            f"🚚 В работе: {in_progress}\n"
-            f"✔️ Завершены: {completed}\n"
-            f"❌ Отклонены: {rejected}\n"
-            f"🚫 Отменены: {cancelled}\n\n"
-            "<b>Последние предложения:</b>\n\n"
-        )
-
-        keyboard = InlineKeyboardMarkup(row_width=1)
-
-        # Сортируем предложения (активные первыми)
-        sorted_offers = sorted(
-            my_offers.items(),
-            key=lambda x: {
-                "pending": 0,
-                "accepted": 1,
-                "in_progress": 2,
-                "completed": 3,
-                "rejected": 4,
-                "cancelled": 5,
-            }.get(
-                (
-                    "pending"
-                    if normalize_transition_status(x[1].get("status")) == "active"
-                    else normalize_transition_status(x[1].get("status"))
-                ),
-                6,
-            ),
-        )
-
-        # Показываем первые 10 предложений
-        for idx, (offer_id, offer) in enumerate(sorted_offers[:10], 1):
-            req_id = offer.get("request_id")
-            status = normalize_transition_status(offer.get("status", "pending"))
-            if status == "active":
-                status = "pending"
-            price = offer.get("price", 0)
-            # Эмодзи статуса
-            status_emoji = {
-                "pending": "⏳",
-                "accepted": "✅",
-                "in_progress": "🚚",
-                "completed": "✔️",
-                "rejected": "❌",
-                "cancelled": "🚫",
-            }.get(status, "❓")
-
-            # Получаем культуру из заявки
-            source = str(offer.get("source", "exporter")).strip().lower()
-            if source == "logistic":
-                source = "logistics"
-            if source not in {"exporter", "farmer", "logistics"}:
-                source_candidates = set()
-                request_key = req_id if isinstance(req_id, str) else str(req_id)
-                if req_id in shipping_requests or request_key in shipping_requests:
-                    source_candidates.add("exporter")
-                if req_id in logistics_requests or request_key in logistics_requests:
-                    source_candidates.add("logistics")
-                if (
-                    req_id in farmer_shipping_requests
-                    or request_key in farmer_shipping_requests
-                    or req_id in farmer_logistics_requests
-                    or request_key in farmer_logistics_requests
-                ):
-                    source_candidates.add("farmer")
-                if len(source_candidates) == 1:
-                    source = next(iter(source_candidates))
-                else:
-                    inferred_source = infer_logistic_offer_source(req_id)
-                    if (
-                        inferred_source in {"exporter", "farmer", "logistics"}
-                        and (not source_candidates or inferred_source in source_candidates)
-                    ):
-                        source = inferred_source
-                    else:
-                        source = None
-            if source == "farmer":
-                _, request = find_farmer_request_by_id(req_id)
-                request = request or {}
-                culture = request.get("culture", "Н/Д")
-            elif source == "logistics":
-                request = logistics_requests.get(req_id) or logistics_requests.get(str(req_id))
-                request = request if isinstance(request, dict) else {}
-                culture = request.get("culture", "Н/Д")
-            else:
-                _, request = find_shipping_request_by_id(req_id)
-                request = request or {}
-                culture = request.get("culture", "Н/Д")
-
-            text += f"{idx}. {status_emoji} <b>Предложение #{offer_id}</b>\n"
-            text += f"   📋 Заявка #{req_id} | {culture}\n"
-            text += f"   💰 {price:,} ₽\n\n"
-
-            # Добавляем кнопку
-            keyboard.add(
-                InlineKeyboardButton(
-                    f"{status_emoji} Предложение #{offer_id}",
-                    callback_data=f"view_my_offer_{offer_id}",
-                )
-            )
-
-        # Если предложений больше чем показываем
-        if len(my_offers) > 10:
-            text += f"<i>...и ещё {len(my_offers) - 10} предложений</i>\n"
-
-        # Редактируем сообщение
-        await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
-
-        await callback.answer()
-
-    except Exception as e:
-        logging.error(f"Ошибка в back_to_offers_list: {e}", exc_info=True)
-        await callback.answer(f"❌ Ошибка: {str(e)}", show_alert=True)
+    callback.data = "my_offers"
+    await show_my_offers(callback, state)
 
 
 # ============================================================================
@@ -31995,8 +35685,7 @@ async def save_edit_price(message: types.Message, state: FSMContext):
         return
 
     try:
-        price_text = price_text.replace(",", ".").replace(" ", "").strip()
-        price = float(price_text)
+        price = parse_price(price_text)
 
         if price < 0.01:
             await message.answer(
@@ -32371,7 +36060,9 @@ async def set_service_type(callback: types.CallbackQuery, state: FSMContext):
     """Установить тип услуги"""
     user_id = callback.from_user.id
     user_role = (get_user_by_id(user_id) or {}).get("role")
-    if not is_expeditor_role(user_role):
+    state_data = await state.get_data()
+    is_edit_mode = state_data.get("editing_expeditor_offer_id") is not None
+    if not (is_expeditor_role(user_role) or (user_role == "admin" and is_edit_mode)):
         await state.finish()
         await callback.answer("❌ Доступно только экспедиторам", show_alert=True)
         return
@@ -32407,7 +36098,9 @@ async def set_service_type(callback: types.CallbackQuery, state: FSMContext):
 async def set_expeditor_ports(message: types.Message, state: FSMContext):
     """Установить порты обслуживания"""
     user_role = (get_user_by_id(message.from_user.id) or {}).get("role")
-    if not is_expeditor_role(user_role):
+    state_data = await state.get_data()
+    is_edit_mode = state_data.get("editing_expeditor_offer_id") is not None
+    if not (is_expeditor_role(user_role) or (user_role == "admin" and is_edit_mode)):
         await state.finish()
         await message.answer("❌ Доступно только экспедиторам.")
         return
@@ -32430,13 +36123,15 @@ async def set_expeditor_ports(message: types.Message, state: FSMContext):
 async def set_expeditor_price(message: types.Message, state: FSMContext):
     """Установить цену услуги"""
     user_role = (get_user_by_id(message.from_user.id) or {}).get("role")
-    if not is_expeditor_role(user_role):
+    state_data = await state.get_data()
+    is_edit_mode = state_data.get("editing_expeditor_offer_id") is not None
+    if not (is_expeditor_role(user_role) or (user_role == "admin" and is_edit_mode)):
         await state.finish()
         await message.answer("❌ Доступно только экспедиторам.")
         return
 
     try:
-        price = float(message.text.replace(",", ".").replace(" ", ""))
+        price = parse_price(message.text)
         if price <= 0:
             raise ValueError
     except ValueError:
@@ -32457,7 +36152,10 @@ async def set_expeditor_price(message: types.Message, state: FSMContext):
 async def set_expeditor_terms(message: types.Message, state: FSMContext):
     """Установить условия"""
     user_role = (get_user_by_id(message.from_user.id) or {}).get("role")
-    if not is_expeditor_role(user_role):
+    state_data = await state.get_data()
+    editing_offer_id = state_data.get("editing_expeditor_offer_id")
+    is_edit_mode = editing_offer_id is not None
+    if not (is_expeditor_role(user_role) or (user_role == "admin" and is_edit_mode)):
         await state.finish()
         await message.answer("❌ Доступно только экспедиторам.")
         return
@@ -32472,17 +36170,34 @@ async def set_expeditor_terms(message: types.Message, state: FSMContext):
     await ExpeditorOfferStates.confirm.set()
 
     data = await state.get_data()
-    text = "<b>✅ Подтверждение предложения:</b>\n\n"
+    text = (
+        "<b>✅ Подтверждение изменений:</b>\n\n"
+        if is_edit_mode
+        else "<b>✅ Подтверждение предложения:</b>\n\n"
+    )
     text += f"📋 {data['service_type']}\n"
     text += f"🏢 {data['ports']}\n"
     text += f"💰 {data['price']:,.0f} ₽\n"
     text += f"📝 {data['terms']}\n\nВсё верно?"
 
     keyboard = InlineKeyboardMarkup(row_width=2)
-    keyboard.add(
-        InlineKeyboardButton("✅ Подтвердить", callback_data="confirm_expeditor_offer"),
-        InlineKeyboardButton("❌ Отменить", callback_data="cancel"),
-    )
+    if is_edit_mode:
+        keyboard.add(
+            InlineKeyboardButton(
+                "✅ Подтвердить", callback_data="confirm_expeditor_offer"
+            ),
+            InlineKeyboardButton(
+                "❌ Отменить",
+                callback_data=f"view_expeditor_offer_{editing_offer_id}",
+            ),
+        )
+    else:
+        keyboard.add(
+            InlineKeyboardButton(
+                "✅ Подтвердить", callback_data="confirm_expeditor_offer"
+            ),
+            InlineKeyboardButton("❌ Отменить", callback_data="cancel"),
+        )
     await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
 
 
@@ -32494,7 +36209,9 @@ async def confirm_expeditor_offer(callback: types.CallbackQuery, state: FSMConte
     data = await state.get_data()
     user_id = callback.from_user.id
     user_role = (get_user_by_id(user_id) or {}).get("role")
-    if not is_expeditor_role(user_role):
+    editing_offer_id = data.get("editing_expeditor_offer_id")
+    is_edit_mode = editing_offer_id is not None
+    if not (is_expeditor_role(user_role) or (user_role == "admin" and is_edit_mode)):
         await callback.answer("❌ Доступно только экспедиторам", show_alert=True)
         await state.finish()
         return
@@ -32509,7 +36226,6 @@ async def confirm_expeditor_offer(callback: types.CallbackQuery, state: FSMConte
         await callback.answer()
         return
 
-    offer_id = next_numeric_id(expeditor_offers)
     try:
         normalized_price = float(data["price"])
     except (TypeError, ValueError):
@@ -32521,28 +36237,86 @@ async def confirm_expeditor_offer(callback: types.CallbackQuery, state: FSMConte
         await callback.answer()
         return
 
-    offer = {
-        "id": offer_id,
-        "expeditor_id": user_id,
-        "service_type": data["service_type"],
-        "ports": data["ports"],
-        "price": normalized_price,
-        "terms": data["terms"],
-        "status": "active",
-        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    }
+    if is_edit_mode:
+        resolved_offer_id, offer = find_expeditor_offer_by_id(editing_offer_id)
+        if not offer:
+            await state.finish()
+            await callback.message.edit_text(
+                "❌ Предложение для редактирования не найдено.\n"
+                "Откройте список предложений и попробуйте снова."
+            )
+            await callback.answer()
+            return
 
-    expeditor_offers[offer_id] = offer
-    save_expeditor_offers()
+        offer_id = resolved_offer_id
+        is_admin = user_role == "admin"
+        if not (is_admin or same_id(offer.get("expeditor_id"), user_id)):
+            await state.finish()
+            await callback.answer("❌ Нет доступа к редактированию", show_alert=True)
+            return
 
-    await callback.message.edit_text(
-        f"<b>✅ Предложение создано!</b>\n\nПредложение #{offer_id}\n"
-        f"📋 {data['service_type']}\n"
-        f"🏢 {data['ports']}\n"
-        f"💰 {normalized_price:,.0f} ₽\n\n"
-        "Ваше предложение будет отображаться экспортёрам.",
-        parse_mode="HTML",
-    )
+        if normalize_transition_status(offer.get("status")) not in OPEN_EXPEDITOR_OFFER_STATUSES:
+            await state.finish()
+            await callback.answer(
+                "❌ Можно редактировать только активные предложения",
+                show_alert=True,
+            )
+            return
+
+        offer["service_type"] = data["service_type"]
+        offer["ports"] = data["ports"]
+        offer["price"] = normalized_price
+        offer["terms"] = data["terms"]
+        offer["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        save_expeditor_offers()
+
+        keyboard = InlineKeyboardMarkup()
+        keyboard.add(
+            InlineKeyboardButton(
+                "👁 Открыть предложение",
+                callback_data=f"view_expeditor_offer_{offer_id}",
+            )
+        )
+        keyboard.add(
+            InlineKeyboardButton(
+                "💼 Мои предложения", callback_data="expeditor_my_offers"
+            )
+        )
+
+        await callback.message.edit_text(
+            f"<b>✅ Предложение #{offer_id} обновлено!</b>\n\n"
+            f"📋 {data['service_type']}\n"
+            f"🏢 {data['ports']}\n"
+            f"💰 {normalized_price:,.0f} ₽\n"
+            f"📝 {data['terms']}\n\n"
+            "Обновлённые условия уже отображаются в системе.",
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+    else:
+        offer_id = next_numeric_id(expeditor_offers)
+        offer = {
+            "id": offer_id,
+            "expeditor_id": user_id,
+            "service_type": data["service_type"],
+            "ports": data["ports"],
+            "price": normalized_price,
+            "terms": data["terms"],
+            "status": "active",
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+        expeditor_offers[offer_id] = offer
+        save_expeditor_offers()
+
+        await callback.message.edit_text(
+            f"<b>✅ Предложение создано!</b>\n\nПредложение #{offer_id}\n"
+            f"📋 {data['service_type']}\n"
+            f"🏢 {data['ports']}\n"
+            f"💰 {normalized_price:,.0f} ₽\n\n"
+            "Ваше предложение будет отображаться экспортёрам.",
+            parse_mode="HTML",
+        )
     await state.finish()
     await callback.answer()
 
@@ -32558,11 +36332,7 @@ async def expeditor_my_offers_handler(message: types.Message, state: FSMContext)
     await state.finish()
     user_id = message.from_user.id
 
-    my_offers = {
-        oid: o
-        for oid, o in expeditor_offers.items()
-        if same_id(o.get("expeditor_id"), user_id)
-    }
+    my_offers = list(iter_expeditor_self_offers(user_id))
 
     if not my_offers:
         await message.answer(
@@ -32571,17 +36341,32 @@ async def expeditor_my_offers_handler(message: types.Message, state: FSMContext)
         )
         return
 
+    active_statuses = {"active", "open", "pending", "new"}
     active = sum(
-        1 for o in my_offers.values() if normalize_transition_status(o.get("status")) == "active"
+        1
+        for storage_name, _, offer in my_offers
+        if get_effective_expeditor_offer_status(storage_name, offer) in active_statuses
     )
     text = f"<b>💼 Мои предложения</b>\n\nВсего: <b>{len(my_offers)}</b>\nАктивных: <b>{active}</b>\n\n"
 
-    for idx, (offer_id, offer) in enumerate(list(my_offers.items())[:10], 1):
+    for idx, (storage_name, offer_id, offer) in enumerate(my_offers[:10], 1):
+        offer_price = get_safe_float(offer.get("price"), 0)
+        service_name = (
+            offer.get("service_type")
+            or offer.get("services")
+            or offer.get("services_text")
+            or "Услуга"
+        )
+        geo_value = offer.get("ports") or offer.get("regions") or "Не указано"
+        source_note = "Заявка" if storage_name == "request" else "Витрина"
         text += f"{idx}. <b>Предложение #{offer_id}</b>\n"
-        text += f"   📋 {offer.get('service_type', '')}\n"
-        text += f"   🏢 {offer.get('ports', '')}\n"
-        text += f"   💰 {offer.get('price', 0):,.0f} ₽\n"
-        text += f"   Статус: {offer.get('status', 'active')}\n\n"
+        text += f"   📋 {service_name}\n"
+        text += f"   🏢 {geo_value}\n"
+        text += f"   💰 {offer_price:,.0f} ₽\n"
+        text += f"   📡 {source_note}\n"
+        text += (
+            f"   Статус: {get_status_name(get_effective_expeditor_offer_status(storage_name, offer))}\n\n"
+        )
 
     if len(my_offers) > 10:
         text += f"\n...и ещё {len(my_offers) - 10}\n"
@@ -32630,7 +36415,12 @@ async def view_request_offers(callback: types.CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
 
     # Проверяем права доступа: только владелец заявки (экспортёр)
-    if not same_id(request.get("exporter_id"), user_id):
+    request_owner_id = (
+        request.get("exporter_id")
+        or request.get("customer_id")
+        or request.get("created_by")
+    )
+    if not same_id(request_owner_id, user_id):
         await callback.answer("❌ Это не ваша заявка", show_alert=True)
         return
 
@@ -32678,7 +36468,9 @@ async def view_request_offers(callback: types.CallbackQuery, state: FSMContext):
 
     # Сортируем по цене (низкие первые) в каждом статусе
     for status in by_status:
-        by_status[status].sort(key=lambda x: x[1].get("price", 999_999_999))
+        by_status[status].sort(
+            key=lambda x: get_safe_float(x[1].get("price"), 999_999_999)
+        )
 
     # Информация о заявке / пуле
     pull_id = request.get("pull_id")
@@ -32690,7 +36482,7 @@ async def view_request_offers(callback: types.CallbackQuery, state: FSMContext):
     text = (
         f"📦 <b>ПРЕДЛОЖЕНИЯ ПО ЗАЯВКЕ #{request_id}</b>\n\n"
         f"🌾 Культура: {pull_info.get('culture', request.get('culture', 'Не указана'))}\n"
-        f"📦 Объём: {request.get('volume', 0):.1f} т\n"
+        f"📦 Объём: {get_safe_float(request.get('volume'), 0):.1f} т\n"
         f"📍 Маршрут: {req_route_from} → {req_route_to}\n"
     )
 
@@ -32716,8 +36508,9 @@ async def view_request_offers(callback: types.CallbackQuery, state: FSMContext):
     # Лучшее ожидающее предложение
     if pending > 0:
         best_offer_id, best_offer = by_status["pending"][0]
+        best_offer_price = get_safe_float(best_offer.get("price"), 0)
         text += "💰 <b>ЛУЧШЕЕ ПРЕДЛОЖЕНИЕ:</b>\n"
-        text += f"💵 Цена: <b>{best_offer.get('price', 0):,.0f} ₽</b>\n"
+        text += f"💵 Цена: <b>{best_offer_price:,.0f} ₽</b>\n"
         text += f"🚛 Транспорт: {best_offer.get('vehicle_type', '—')}\n"
         text += f"📅 Дата: {best_offer.get('delivery_date', '—')}\n\n"
 
@@ -32739,7 +36532,7 @@ async def view_request_offers(callback: types.CallbackQuery, state: FSMContext):
             or f"Логист #{logist_id}"
         )
 
-        price = offer.get("price", 0)
+        price = get_safe_float(offer.get("price"), 0)
         vehicle = offer.get("vehicle_type", "Не указан")
 
         button_text = f"💰 {price:,.0f} ₽ | {vehicle[:15]} | {str(logist_name)[:20]}"
@@ -32841,18 +36634,33 @@ async def view_offer_details_for_exporter(
                 return
     if offer_source == "farmer":
         _, request = find_farmer_request_by_id(request_id)
-        request_owner_id = (request if isinstance(request, dict) else {}).get("farmer_id")
+        request_owner_id = (request if isinstance(request, dict) else {}).get(
+            "farmer_id"
+        ) or (request if isinstance(request, dict) else {}).get("user_id")
     elif offer_source == "logistics":
         request = logistics_requests.get(request_id) or logistics_requests.get(str(request_id))
+        request_obj = request if isinstance(request, dict) else {}
         request_owner_id = (
-            (request if isinstance(request, dict) else {}).get("customer_id")
-            or (request if isinstance(request, dict) else {}).get("created_by")
-            or (request if isinstance(request, dict) else {}).get("exporter_id")
-            or (request if isinstance(request, dict) else {}).get("logist_id")
+            request_obj.get("customer_id")
+            or request_obj.get("created_by")
+            or request_obj.get("exporter_id")
         )
+        if not request_owner_id:
+            legacy_logist_owner_id = request_obj.get("logist_id")
+            has_assigned_logist_id = bool(
+                request_obj.get("assigned_logist_id")
+                or request_obj.get("selected_logistic")
+            )
+            if legacy_logist_owner_id and not has_assigned_logist_id:
+                request_owner_id = legacy_logist_owner_id
     else:
         _, request = find_shipping_request_by_id(request_id)
-        request_owner_id = (request if isinstance(request, dict) else {}).get("exporter_id")
+        request_obj = request if isinstance(request, dict) else {}
+        request_owner_id = (
+            request_obj.get("exporter_id")
+            or request_obj.get("customer_id")
+            or request_obj.get("created_by")
+        )
     if not request:
         await callback.answer("❌ Заявка не найдена", show_alert=True)
         return
@@ -32882,18 +36690,19 @@ async def view_offer_details_for_exporter(
         and same_id((o.get("logist_id") or o.get("logistic_id")), logist_id)
     ]
     logist_deliveries = [
-        d for d in deliveries.values() if same_id(d.get("logist_id"), logist_id)
+        d for d in deliveries.values() if same_id(get_assigned_logist_id(d), logist_id)
     ]
     completed = len(
-        [d for d in logist_deliveries if normalize_transition_status(d.get("status")) == "completed"]
+        [d for d in logist_deliveries if get_effective_delivery_status(d) == "completed"]
     )
     total_offers = len(logist_offers)
 
     text = f"📋 <b>ДЕТАЛИ ПРЕДЛОЖЕНИЯ #{offer_id}</b>\n\n"
 
     # Информация о предложении
+    offer_price = get_safe_float(offer.get("price"), 0)
     text += "<b>💰 ПРЕДЛОЖЕНИЕ:</b>\n"
-    text += f"💵 Стоимость: <b>{offer.get('price', 0):,.0f} ₽</b>\n"
+    text += f"💵 Стоимость: <b>{offer_price:,.0f} ₽</b>\n"
     text += f"🚛 Транспорт: <b>{offer.get('vehicle_type', 'Не указан')}</b>\n"
     text += f"📅 Дата доставки: <b>{offer.get('delivery_date', 'Не указана')}</b>\n"
 
@@ -32918,10 +36727,12 @@ async def view_offer_details_for_exporter(
         # Средняя стоимость
         completed_deliveries = []
         for d in logist_deliveries:
-            if normalize_transition_status(d.get("status")) != "completed":
+            if get_effective_delivery_status(d) != "completed":
                 continue
             _, delivery_offer = find_logistic_offer_by_id(d.get("offer_id"))
-            completed_deliveries.append((delivery_offer or {}).get("price", 0))
+            completed_deliveries.append(
+                get_safe_float((delivery_offer or {}).get("price"), 0)
+            )
         if completed_deliveries:
             avg_price = sum(completed_deliveries) / len(completed_deliveries)
             text += f"💰 Средняя стоимость: <b>{avg_price:,.0f} ₽</b>\n"
@@ -32931,7 +36742,7 @@ async def view_offer_details_for_exporter(
     # Статус предложения
     status = normalize_transition_status(offer.get("status", "pending"))
 
-    if status in {"pending", "active"}:
+    if status in OPEN_LOGISTIC_OFFER_STATUSES:
         text += "⏳ <b>Ожидает вашего решения</b>"
     elif status == "accepted":
         text += "✅ <b>Предложение принято</b>"
@@ -32942,7 +36753,7 @@ async def view_offer_details_for_exporter(
 
     keyboard = InlineKeyboardMarkup(row_width=2)
 
-    if status in {"pending", "active"}:
+    if status in OPEN_LOGISTIC_OFFER_STATUSES:
         keyboard.add(
             InlineKeyboardButton(
                 "✅ Принять", callback_data=f"accept_offer_{offer_id}"
@@ -32995,7 +36806,12 @@ async def compare_offers(callback: types.CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
     user_role = (get_user_by_id(user_id) or {}).get("role")
 
-    if not (same_id(request.get("exporter_id"), user_id) or user_role == "admin"):
+    request_owner_id = (
+        request.get("exporter_id")
+        or request.get("customer_id")
+        or request.get("created_by")
+    )
+    if not (same_id(request_owner_id, user_id) or user_role == "admin"):
         await callback.answer("❌ Нет доступа", show_alert=True)
         return
 
@@ -33004,7 +36820,7 @@ async def compare_offers(callback: types.CallbackQuery, state: FSMContext):
         (offer_id, offer)
         for offer_id, offer in logistic_offers.items()
         if logistic_offer_matches_request(offer, request_id, "exporter")
-        and normalize_transition_status(offer.get("status")) in {"pending", "active"}
+        and normalize_transition_status(offer.get("status")) in OPEN_LOGISTIC_OFFER_STATUSES
     ]
 
     if len(offers) < 2:
@@ -33014,7 +36830,7 @@ async def compare_offers(callback: types.CallbackQuery, state: FSMContext):
         return
 
     # Сортируем по цене
-    offers.sort(key=lambda x: x[1].get("price", 999999))
+    offers.sort(key=lambda x: get_safe_float(x[1].get("price"), 999999))
 
     text = "⚖️ <b>СРАВНЕНИЕ ПРЕДЛОЖЕНИЙ</b>\n\n"
     text += f"📦 Заявка #{request_id}\n"
@@ -33030,7 +36846,7 @@ async def compare_offers(callback: types.CallbackQuery, state: FSMContext):
         medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉"
 
         text += f"{medal} <b>#{i} - {logist_name}</b>\n"
-        text += f"💰 Цена: <b>{offer.get('price', 0):,.0f} ₽</b>\n"
+        text += f"💰 Цена: <b>{get_safe_float(offer.get('price'), 0):,.0f} ₽</b>\n"
         text += f"🚛 Транспорт: {offer.get('vehicle_type')}\n"
         text += f"📅 Дата: {offer.get('delivery_date')}\n"
 
@@ -33038,8 +36854,8 @@ async def compare_offers(callback: types.CallbackQuery, state: FSMContext):
         logist_deliveries = [
             d
             for d in deliveries.values()
-            if same_id(d.get("logist_id"), logist_id)
-            and normalize_transition_status(d.get("status")) == "completed"
+            if same_id(get_assigned_logist_id(d), logist_id)
+            and get_effective_delivery_status(d) == "completed"
         ]
         completed = len(logist_deliveries)
 
@@ -33050,7 +36866,7 @@ async def compare_offers(callback: types.CallbackQuery, state: FSMContext):
         text += f"<i>... и ещё {len(offers) - 3} предложений</i>\n\n"
 
     # Анализ
-    prices = [o[1].get("price", 0) for o in offers]
+    prices = [get_safe_float(o[1].get("price"), 0) for o in offers]
     min_price = min(prices)
     max_price = max(prices)
     avg_price = sum(prices) / len(prices)
@@ -33073,7 +36889,7 @@ async def compare_offers(callback: types.CallbackQuery, state: FSMContext):
     # Кнопки для топ-3
     for i, (offer_id, offer) in enumerate(offers[:3], 1):
         medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉"
-        price = offer.get("price", 0)
+        price = get_safe_float(offer.get("price"), 0)
 
         keyboard.add(
             InlineKeyboardButton(
@@ -33168,18 +36984,32 @@ async def accept_offer_start(callback: types.CallbackQuery, state: FSMContext):
                 return
     if offer_source == "farmer":
         _, request = find_farmer_request_by_id(request_id)
-        request_owner_id = (request if isinstance(request, dict) else {}).get("farmer_id")
+        request_owner_id = (request if isinstance(request, dict) else {}).get(
+            "farmer_id"
+        ) or (request if isinstance(request, dict) else {}).get("user_id")
     elif offer_source == "logistics":
         request = logistics_requests.get(request_id) or logistics_requests.get(str(request_id))
+        request_obj = request if isinstance(request, dict) else {}
         request_owner_id = (
-            (request if isinstance(request, dict) else {}).get("customer_id")
-            or (request if isinstance(request, dict) else {}).get("created_by")
-            or (request if isinstance(request, dict) else {}).get("exporter_id")
-            or (request if isinstance(request, dict) else {}).get("logist_id")
+            request_obj.get("customer_id")
+            or request_obj.get("created_by")
+            or request_obj.get("exporter_id")
         )
+        if not request_owner_id:
+            legacy_logist_owner_id = request_obj.get("logist_id")
+            has_assigned_logist_id = bool(
+                request_obj.get("assigned_logist_id")
+                or request_obj.get("selected_logistic")
+            )
+            if legacy_logist_owner_id and not has_assigned_logist_id:
+                request_owner_id = legacy_logist_owner_id
     else:
         _, request = find_shipping_request_by_id(request_id)
-        request_owner_id = (request if isinstance(request, dict) else {}).get("exporter_id")
+        request_owner_id = (
+            (request if isinstance(request, dict) else {}).get("exporter_id")
+            or (request if isinstance(request, dict) else {}).get("customer_id")
+            or (request if isinstance(request, dict) else {}).get("created_by")
+        )
     if not request:
         await callback.answer("❌ Заявка не найдена", show_alert=True)
         return
@@ -33193,7 +37023,18 @@ async def accept_offer_start(callback: types.CallbackQuery, state: FSMContext):
     if not (user_role == "admin" or same_id(request_owner_id, user_id)):
         await callback.answer("❌ Нет доступа", show_alert=True)
         return
-    if not is_request_open_for_offers(request.get("status")):
+    request_status = get_effective_request_status(
+        request_id,
+        offer_source,
+        request,
+        request_owner_id=request_owner_id,
+        request_exporter_id=(
+            request.get("exporter_id")
+            or request.get("customer_id")
+            or request.get("created_by")
+        ),
+    )
+    if not is_request_open_for_offers(request_status):
         await callback.answer("❌ Заявка уже не принимает предложения", show_alert=True)
         return
     if get_assigned_logist_id(request):
@@ -33201,7 +37042,7 @@ async def accept_offer_start(callback: types.CallbackQuery, state: FSMContext):
         return
 
     offer_status = normalize_transition_status(offer.get("status") or "pending")
-    if offer_status not in {"pending", "active"}:
+    if offer_status not in OPEN_LOGISTIC_OFFER_STATUSES:
         await callback.answer("❌ Предложение уже обработано", show_alert=True)
         return
 
@@ -33231,7 +37072,7 @@ async def accept_offer_start(callback: types.CallbackQuery, state: FSMContext):
     text = f"✅ <b>ПРИНЯТИЕ ПРЕДЛОЖЕНИЯ #{offer_id}</b>\n\n"
     text += f"📦 <b>ЗАЯВКА #{request_id}</b>\n"
     text += f"🌾 Культура: {pull_info.get('culture', request.get('culture', 'Не указана'))}\n"
-    text += f"📦 Объём: {request.get('volume', 0):.1f} т\n"
+    text += f"📦 Объём: {get_safe_float(request.get('volume'), 0):.1f} т\n"
     route_from = request.get("route_from") or request.get("from") or request.get("from_city") or ""
     route_to = request.get("route_to") or request.get("to") or request.get("to_city") or ""
     text += f"📍 Маршрут: {route_from} → {route_to}\n\n"
@@ -33240,7 +37081,7 @@ async def accept_offer_start(callback: types.CallbackQuery, state: FSMContext):
 
     text += "<b>ПРЕДЛОЖЕНИЕ:</b>\n"
     text += f"🚚 Логист: <b>{logist_name}</b>\n"
-    text += f"💰 Стоимость: <b>{offer.get('price', 0):,.0f} ₽</b>\n"
+    text += f"💰 Стоимость: <b>{get_safe_float(offer.get('price'), 0):,.0f} ₽</b>\n"
     text += f"🚛 Транспорт: {offer.get('vehicle_type')}\n"
     text += f"📅 Дата доставки: {offer.get('delivery_date')}\n\n"
 
@@ -33320,18 +37161,32 @@ async def accept_offer_confirmed(callback: types.CallbackQuery, state: FSMContex
                 return
     if offer_source == "farmer":
         _, request = find_farmer_request_by_id(request_id)
-        request_owner_id = (request if isinstance(request, dict) else {}).get("farmer_id")
+        request_owner_id = (request if isinstance(request, dict) else {}).get(
+            "farmer_id"
+        ) or (request if isinstance(request, dict) else {}).get("user_id")
     elif offer_source == "logistics":
         request = logistics_requests.get(request_id) or logistics_requests.get(str(request_id))
+        request_obj = request if isinstance(request, dict) else {}
         request_owner_id = (
-            (request if isinstance(request, dict) else {}).get("customer_id")
-            or (request if isinstance(request, dict) else {}).get("created_by")
-            or (request if isinstance(request, dict) else {}).get("exporter_id")
-            or (request if isinstance(request, dict) else {}).get("logist_id")
+            request_obj.get("customer_id")
+            or request_obj.get("created_by")
+            or request_obj.get("exporter_id")
         )
+        if not request_owner_id:
+            legacy_logist_owner_id = request_obj.get("logist_id")
+            has_assigned_logist_id = bool(
+                request_obj.get("assigned_logist_id")
+                or request_obj.get("selected_logistic")
+            )
+            if legacy_logist_owner_id and not has_assigned_logist_id:
+                request_owner_id = legacy_logist_owner_id
     else:
         _, request = find_shipping_request_by_id(request_id)
-        request_owner_id = (request if isinstance(request, dict) else {}).get("exporter_id")
+        request_owner_id = (
+            (request if isinstance(request, dict) else {}).get("exporter_id")
+            or (request if isinstance(request, dict) else {}).get("customer_id")
+            or (request if isinstance(request, dict) else {}).get("created_by")
+        )
 
     if not request:
         await callback.answer("❌ Заявка не найдена", show_alert=True)
@@ -33346,7 +37201,18 @@ async def accept_offer_confirmed(callback: types.CallbackQuery, state: FSMContex
     if not (user_role == "admin" or same_id(request_owner_id, user_id)):
         await callback.answer("❌ Нет доступа", show_alert=True)
         return
-    if not is_request_open_for_offers(request.get("status")):
+    request_status = get_effective_request_status(
+        request_id,
+        offer_source,
+        request,
+        request_owner_id=request_owner_id,
+        request_exporter_id=(
+            request.get("exporter_id")
+            or request.get("customer_id")
+            or request.get("created_by")
+        ),
+    )
+    if not is_request_open_for_offers(request_status):
         await callback.answer("❌ Заявка уже не принимает предложения", show_alert=True)
         return
     if get_assigned_logist_id(request):
@@ -33355,7 +37221,7 @@ async def accept_offer_confirmed(callback: types.CallbackQuery, state: FSMContex
 
     # Защита от повторной обработки: оффер должен быть в открытом статусе
     offer_status = normalize_transition_status(offer.get("status") or "pending")
-    if offer_status not in {"pending", "active"}:
+    if offer_status not in OPEN_LOGISTIC_OFFER_STATUSES:
         await callback.answer("❌ Предложение уже обработано", show_alert=True)
         return
 
@@ -33371,97 +37237,146 @@ async def accept_offer_confirmed(callback: types.CallbackQuery, state: FSMContex
         )
         return
 
-    # Принимаем предложение
+    now_sql = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    selected_logist_id = get_offer_logist_id(offer)
+    if not selected_logist_id:
+        await callback.answer(
+            "❌ В предложении не указан логист, принятие невозможно",
+            show_alert=True,
+        )
+        return
+    matching_deliveries = [
+        (deliv_key, d)
+        for deliv_key, d in deliveries.items()
+        if isinstance(d, dict)
+        and same_id(d.get("request_id"), request_id)
+        and (
+            same_id(d.get("farmer_id") or d.get("user_id"), request_owner_id)
+            if offer_source == "farmer"
+            else (
+                same_id(d.get("customer_id"), request_owner_id)
+                or same_id(d.get("created_by"), request_owner_id)
+                or same_id(d.get("exporter_id"), request_owner_id)
+                or same_id(d.get("logist_id"), request_owner_id)
+            )
+            if offer_source == "logistics"
+            else (
+                not request_owner_id
+                or (
+                    d.get("exporter_id") or d.get("customer_id") or d.get("created_by")
+                )
+                in {None, ""}
+                or same_id(
+                    d.get("exporter_id") or d.get("customer_id") or d.get("created_by"),
+                    request_owner_id,
+                )
+            )
+        )
+        and (
+            str(d.get("source") or "").strip().lower() in {"", offer_source}
+            or (
+                offer_source == "logistics"
+                and str(d.get("source") or "").strip().lower() == "logistic"
+            )
+        )
+    ]
+    if any(
+        get_effective_delivery_status(d, request if isinstance(request, dict) else None)
+        in {"completed", "cancelled"}
+        for _, d in matching_deliveries
+    ):
+        await callback.answer(
+            "❌ По заявке уже есть закрытая доставка", show_alert=True
+        )
+        return
+    if any(
+        get_effective_delivery_status(d, request if isinstance(request, dict) else None)
+        in {"in_progress", "expeditor_selected"}
+        for _, d in matching_deliveries
+    ):
+        await callback.answer(
+            "❌ По заявке уже есть доставка в работе", show_alert=True
+        )
+        return
+
+    # Принимаем предложение только после проверки доставок.
     offer["status"] = "accepted"
-    offer["accepted_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    offer["accepted_at"] = now_sql
     offer["accepted_by"] = user_id
 
-    # Обновляем статус заявки
     request["status"] = "assigned"
-    request["selected_logistic"] = get_offer_logist_id(offer)
-    request["assigned_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    request["logist_id"] = get_offer_logist_id(offer)
-    request["assigned_logist_id"] = get_offer_logist_id(offer)
+    request["selected_logistic"] = selected_logist_id
+    request["assigned_at"] = now_sql
+    if offer_source == "logistics" and request_owner_id:
+        request.setdefault("customer_id", request_owner_id)
+        request.setdefault("created_by", request_owner_id)
+    request["logist_id"] = selected_logist_id
+    request["assigned_logist_id"] = selected_logist_id
 
-    # Создаём доставку (или обновляем существующую по request_id)
-    existing_delivery = next(
-        (
-            d
-            for d in deliveries.values()
-            if same_id(d.get("request_id"), request_id)
-            and (
-                same_id(d.get("farmer_id"), request_owner_id)
-                if offer_source == "farmer"
-                else (
-                    same_id(d.get("customer_id"), request_owner_id)
-                    or same_id(d.get("created_by"), request_owner_id)
-                    or same_id(d.get("exporter_id"), request_owner_id)
-                    or same_id(d.get("logist_id"), request_owner_id)
+    active_matching_deliveries = [
+        (deliv_key, d)
+        for deliv_key, d in matching_deliveries
+        if get_effective_delivery_status(d, request if isinstance(request, dict) else None)
+        not in {"completed", "cancelled"}
+    ]
+    delivery_id = None
+    if active_matching_deliveries:
+        for existing_delivery_key, existing_delivery in active_matching_deliveries:
+            canonical_delivery_id = existing_delivery.get("id")
+            if canonical_delivery_id is None:
+                canonical_delivery_id = (
+                    int(existing_delivery_key)
+                    if str(existing_delivery_key).isdigit()
+                    else existing_delivery_key
                 )
-                if offer_source == "logistics"
-                else same_id(d.get("exporter_id"), request_owner_id)
+                existing_delivery["id"] = canonical_delivery_id
+            if delivery_id is None and canonical_delivery_id is not None:
+                delivery_id = canonical_delivery_id
+            existing_delivery["offer_id"] = offer_id
+            if offer_source == "farmer":
+                existing_delivery["farmer_id"] = request_owner_id
+            elif offer_source == "logistics":
+                existing_delivery["customer_id"] = request_owner_id
+                if request.get("exporter_id"):
+                    existing_delivery["exporter_id"] = request.get("exporter_id")
+            else:
+                existing_delivery["exporter_id"] = request_owner_id
+            existing_delivery["logist_id"] = selected_logist_id
+            existing_delivery["pull_id"] = request.get("pull_id")
+            existing_delivery["route_from"] = (
+                request.get("route_from") or request.get("from") or request.get("from_city")
             )
-            and (
-                str(d.get("source") or "").strip().lower() in {"", offer_source}
-                or (
-                    offer_source == "logistics"
-                    and str(d.get("source") or "").strip().lower() == "logistic"
-                )
+            existing_delivery["route_to"] = (
+                request.get("route_to") or request.get("to") or request.get("to_city")
             )
-        ),
-        None,
-    )
-    if existing_delivery:
-        existing_delivery_status = normalize_transition_status(
-            existing_delivery.get("status")
-        )
-        if existing_delivery_status in {"completed", "cancelled"}:
-            await callback.answer(
-                "❌ По заявке уже есть закрытая доставка", show_alert=True
-            )
-            return
-        delivery_id = existing_delivery.get("id")
-        existing_delivery["offer_id"] = offer_id
-        if offer_source == "farmer":
-            existing_delivery["farmer_id"] = request_owner_id
-        elif offer_source == "logistics":
-            existing_delivery["customer_id"] = request_owner_id
-            if request.get("exporter_id"):
-                existing_delivery["exporter_id"] = request.get("exporter_id")
-        else:
-            existing_delivery["exporter_id"] = request_owner_id
-        existing_delivery["logist_id"] = get_offer_logist_id(offer)
-        existing_delivery["pull_id"] = request.get("pull_id")
-        existing_delivery["route_from"] = (
-            request.get("route_from") or request.get("from") or request.get("from_city")
-        )
-        existing_delivery["route_to"] = (
-            request.get("route_to") or request.get("to") or request.get("to_city")
-        )
-        existing_delivery["volume"] = request.get("volume")
-        existing_delivery["price"] = offer.get("price")
-        existing_delivery["vehicle_type"] = offer.get("vehicle_type")
-        existing_delivery["delivery_date"] = offer.get("delivery_date")
-        existing_delivery["status"] = "pending"
-        existing_delivery["source"] = offer_source
-        existing_delivery["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            existing_delivery["volume"] = request.get("volume")
+            existing_delivery["price"] = get_safe_float(offer.get("price"), 0)
+            existing_delivery["vehicle_type"] = offer.get("vehicle_type")
+            existing_delivery["delivery_date"] = offer.get("delivery_date")
+            existing_delivery["status"] = "pending"
+            existing_delivery["source"] = offer_source
+            existing_delivery["updated_at"] = now_sql
+        if delivery_id is None:
+            # Legacy safety: если доставка была без ключа/id, фиксируем технический id.
+            delivery_id = next_numeric_id(deliveries)
+            active_matching_deliveries[0][1]["id"] = delivery_id
     else:
         delivery_id = next_numeric_id(deliveries)
         delivery = {
             "id": delivery_id,
             "request_id": request_id,
             "offer_id": offer_id,
-            "logist_id": get_offer_logist_id(offer),
+            "logist_id": selected_logist_id,
             "pull_id": request.get("pull_id"),
             "route_from": request.get("route_from") or request.get("from") or request.get("from_city"),
             "route_to": request.get("route_to") or request.get("to") or request.get("to_city"),
             "volume": request.get("volume"),
-            "price": offer.get("price"),
+            "price": get_safe_float(offer.get("price"), 0),
             "vehicle_type": offer.get("vehicle_type"),
             "delivery_date": offer.get("delivery_date"),
             "status": "pending",
             "source": offer_source,
-            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "created_at": now_sql,
         }
         if offer_source == "farmer":
             delivery["farmer_id"] = request_owner_id
@@ -33482,7 +37397,8 @@ async def accept_offer_confirmed(callback: types.CallbackQuery, state: FSMContex
         if (
             logistic_offer_matches_request(other_offer, request_id, offer_source)
             and other_offer_id != offer_id
-            and normalize_transition_status(other_offer.get("status")) in {"pending", "active"}
+            and normalize_transition_status(other_offer.get("status"))
+            in OPEN_LOGISTIC_OFFER_STATUSES
         ):
             other_offer["status"] = "rejected"
             other_offer["rejected_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -33499,6 +37415,9 @@ async def accept_offer_confirmed(callback: types.CallbackQuery, state: FSMContex
                         "Принято другое предложение",
                     )
                 )
+    request["offers_count"] = count_open_logistic_offers_for_request(
+        request_id, offer_source
+    )
 
     # Сохраняем данные
     if offer_source == "farmer":
@@ -33523,11 +37442,11 @@ async def accept_offer_confirmed(callback: types.CallbackQuery, state: FSMContex
 
     text = "🎉 <b>ПРЕДЛОЖЕНИЕ ПРИНЯТО!</b>\n\n"
     text += f"✅ Предложение #{offer_id} успешно принято\n"
-    text += f"📦 Доставка #{delivery_id} создана\n\n"
+    text += f"📦 Доставка #{delivery_id} назначена\n\n"
     text += "━━━━━━━━━━━━━━━━━━━━\n\n"
     text += "<b>ДЕТАЛИ ДОСТАВКИ:</b>\n"
     text += f"🚚 Логист: {logist_name}\n"
-    text += f"💰 Стоимость: {offer.get('price', 0):,.0f} ₽\n"
+    text += f"💰 Стоимость: {get_safe_float(offer.get('price'), 0):,.0f} ₽\n"
     text += f"🚛 Транспорт: {offer.get('vehicle_type')}\n"
     text += f"📅 Дата: {offer.get('delivery_date')}\n\n"
 
@@ -33550,6 +37469,13 @@ async def accept_offer_confirmed(callback: types.CallbackQuery, state: FSMContex
     if offer_source == "farmer":
         keyboard.add(
             InlineKeyboardButton("📬 Мои заявки", callback_data="farmer_my_requests_menu")
+        )
+    elif offer_source == "logistics":
+        keyboard.add(
+            InlineKeyboardButton(
+                "📦 К логистической заявке",
+                callback_data=f"view_logistics_req:{request_id}",
+            )
         )
     else:
         keyboard.add(
@@ -33617,18 +37543,32 @@ async def reject_offer_start(callback: types.CallbackQuery, state: FSMContext):
                 return
     if offer_source == "farmer":
         _, request = find_farmer_request_by_id(request_id)
-        request_owner_id = (request if isinstance(request, dict) else {}).get("farmer_id")
+        request_owner_id = (request if isinstance(request, dict) else {}).get(
+            "farmer_id"
+        ) or (request if isinstance(request, dict) else {}).get("user_id")
     elif offer_source == "logistics":
         request = logistics_requests.get(request_id) or logistics_requests.get(str(request_id))
+        request_obj = request if isinstance(request, dict) else {}
         request_owner_id = (
-            (request if isinstance(request, dict) else {}).get("customer_id")
-            or (request if isinstance(request, dict) else {}).get("created_by")
-            or (request if isinstance(request, dict) else {}).get("exporter_id")
-            or (request if isinstance(request, dict) else {}).get("logist_id")
+            request_obj.get("customer_id")
+            or request_obj.get("created_by")
+            or request_obj.get("exporter_id")
         )
+        if not request_owner_id:
+            legacy_logist_owner_id = request_obj.get("logist_id")
+            has_assigned_logist_id = bool(
+                request_obj.get("assigned_logist_id")
+                or request_obj.get("selected_logistic")
+            )
+            if legacy_logist_owner_id and not has_assigned_logist_id:
+                request_owner_id = legacy_logist_owner_id
     else:
         _, request = find_shipping_request_by_id(request_id)
-        request_owner_id = (request if isinstance(request, dict) else {}).get("exporter_id")
+        request_owner_id = (
+            (request if isinstance(request, dict) else {}).get("exporter_id")
+            or (request if isinstance(request, dict) else {}).get("customer_id")
+            or (request if isinstance(request, dict) else {}).get("created_by")
+        )
 
     if not request:
         await callback.answer("❌ Заявка не найдена", show_alert=True)
@@ -33645,7 +37585,7 @@ async def reject_offer_start(callback: types.CallbackQuery, state: FSMContext):
         return
 
     offer_status = normalize_transition_status(offer.get("status") or "pending")
-    if offer_status not in {"pending", "active"}:
+    if offer_status not in OPEN_LOGISTIC_OFFER_STATUSES:
         await callback.answer("❌ Предложение уже обработано", show_alert=True)
         return
 
@@ -33657,7 +37597,7 @@ async def reject_offer_start(callback: types.CallbackQuery, state: FSMContext):
 
     text = f"❌ <b>ОТКЛОНЕНИЕ ПРЕДЛОЖЕНИЯ #{offer_id}</b>\n\n"
     text += f"🚚 Логист: {logist_name}\n"
-    text += f"💰 Цена: {offer.get('price', 0):,.0f} ₽\n\n"
+    text += f"💰 Цена: {get_safe_float(offer.get('price'), 0):,.0f} ₽\n\n"
     text += "━━━━━━━━━━━━━━━━━━━━\n\n"
     text += "<b>Укажите причину отклонения</b>\n"
     text += "<i>(необязательно, но рекомендуется)</i>\n\n"
@@ -33820,18 +37760,32 @@ async def reject_offer_execute(
                 return
     if offer_source == "farmer":
         _, request = find_farmer_request_by_id(request_id)
-        request_owner_id = (request if isinstance(request, dict) else {}).get("farmer_id")
+        request_owner_id = (request if isinstance(request, dict) else {}).get(
+            "farmer_id"
+        ) or (request if isinstance(request, dict) else {}).get("user_id")
     elif offer_source == "logistics":
         request = logistics_requests.get(request_id) or logistics_requests.get(str(request_id))
+        request_obj = request if isinstance(request, dict) else {}
         request_owner_id = (
-            (request if isinstance(request, dict) else {}).get("customer_id")
-            or (request if isinstance(request, dict) else {}).get("created_by")
-            or (request if isinstance(request, dict) else {}).get("exporter_id")
-            or (request if isinstance(request, dict) else {}).get("logist_id")
+            request_obj.get("customer_id")
+            or request_obj.get("created_by")
+            or request_obj.get("exporter_id")
         )
+        if not request_owner_id:
+            legacy_logist_owner_id = request_obj.get("logist_id")
+            has_assigned_logist_id = bool(
+                request_obj.get("assigned_logist_id")
+                or request_obj.get("selected_logistic")
+            )
+            if legacy_logist_owner_id and not has_assigned_logist_id:
+                request_owner_id = legacy_logist_owner_id
     else:
         _, request = find_shipping_request_by_id(request_id)
-        request_owner_id = (request if isinstance(request, dict) else {}).get("exporter_id")
+        request_owner_id = (
+            (request if isinstance(request, dict) else {}).get("exporter_id")
+            or (request if isinstance(request, dict) else {}).get("customer_id")
+            or (request if isinstance(request, dict) else {}).get("created_by")
+        )
 
     user_id = callback_or_fake.from_user.id
     user_role = (get_user_by_id(user_id) or {}).get("role")
@@ -33852,7 +37806,7 @@ async def reject_offer_execute(
             await callback_or_fake.answer("❌ Нет доступа", show_alert=True)
         return
     offer_status = normalize_transition_status(offer.get("status") or "pending")
-    if offer_status not in {"pending", "active"}:
+    if offer_status not in OPEN_LOGISTIC_OFFER_STATUSES:
         if hasattr(callback_or_fake, "answer"):
             await callback_or_fake.answer(
                 "❌ Предложение уже обработано", show_alert=True
@@ -33875,7 +37829,24 @@ async def reject_offer_execute(
         request["offers_count"] = count_logistic_offers_for_request(
             request_id, request_source
         )
-        if is_request_open_for_offers(request.get("status")):
+        request_status = get_effective_request_status(
+            request_id,
+            request_source,
+            request,
+            request_owner_id=(
+                request.get("customer_id")
+                or request.get("created_by")
+                or request.get("exporter_id")
+                or request.get("farmer_id")
+                or request.get("user_id")
+            ),
+            request_exporter_id=(
+                request.get("exporter_id")
+                or request.get("customer_id")
+                or request.get("created_by")
+            ),
+        )
+        if is_request_open_for_offers(request_status):
             request["status"] = "has_offers" if request["offers_count"] > 0 else "active"
         request_state_updated = True
 
@@ -33957,7 +37928,10 @@ async def show_my_shipping_requests(callback: types.CallbackQuery, state: FSMCon
     for req_id, req in shipping_requests.items():
         if not isinstance(req, dict):
             continue
-        if not same_id(req.get("exporter_id"), user_id):
+        request_owner_id = (
+            req.get("exporter_id") or req.get("customer_id") or req.get("created_by")
+        )
+        if not same_id(request_owner_id, user_id):
             continue
         canonical_id = req.get("id", req_id)
         canonical_key = f"exporter:{canonical_id}"
@@ -34011,7 +37985,27 @@ async def show_my_shipping_requests(callback: types.CallbackQuery, state: FSMCon
     }
 
     for req_id, req, _source in my_requests:
-        status = normalize_transition_status(req.get("status") or "active")
+        if _source == "logistics":
+            request_owner_id = (
+                req.get("customer_id")
+                or req.get("created_by")
+                or req.get("exporter_id")
+            )
+            request_exporter_id = req.get("exporter_id")
+        else:
+            request_owner_id = (
+                req.get("exporter_id")
+                or req.get("customer_id")
+                or req.get("created_by")
+            )
+            request_exporter_id = request_owner_id
+        status = get_effective_request_status(
+            req_id,
+            _source,
+            req,
+            request_owner_id=request_owner_id,
+            request_exporter_id=request_exporter_id,
+        )
         if status != "has_offers" and is_request_open_for_offers(status):
             status = "active"
         if status not in by_status:
@@ -34031,12 +38025,14 @@ async def show_my_shipping_requests(callback: types.CallbackQuery, state: FSMCon
     expeditor_selected = len(by_status["expeditor_selected"])
     in_progress = len(by_status["in_progress"])
     completed = len(by_status["completed"])
+    cancelled = len(by_status["cancelled"])
 
     text += f"🆕 Активные: <b>{active}</b>\n"
     text += f"👤 Назначены: <b>{assigned}</b>\n"
     text += f"🚛 Экспедитор выбран: <b>{expeditor_selected}</b>\n"
     text += f"🚚 В пути: <b>{in_progress}</b>\n"
     text += f"✅ Завершены: <b>{completed}</b>\n\n"
+    text += f"❌ Отменены: <b>{cancelled}</b>\n\n"
     text += "━━━━━━━━━━━━━━━━━━━━\n\n"
     text += "Выберите заявку:"
 
@@ -34050,6 +38046,7 @@ async def show_my_shipping_requests(callback: types.CallbackQuery, state: FSMCon
         ("expeditor_selected", "Экспедитор выбран", "🚛"),
         ("in_progress", "В пути", "🚚"),
         ("completed", "Завершены", "✅"),
+        ("cancelled", "Отменены", "❌"),
     ]:
         requests = by_status[status_key]
         if requests:
@@ -34066,7 +38063,8 @@ async def show_my_shipping_requests(callback: types.CallbackQuery, state: FSMCon
                         o
                         for o in logistic_offers.values()
                         if logistic_offer_matches_request(o, req_id, source)
-                        and normalize_transition_status(o.get("status")) in {"pending", "active"}
+                        and normalize_transition_status(o.get("status"))
+                        in OPEN_LOGISTIC_OFFER_STATUSES
                     ]
                 )
                 expeditor_offers_count = count_open_expeditor_request_offers_for_request(
@@ -34122,7 +38120,12 @@ async def view_my_request_details(callback: types.CallbackQuery, state: FSMConte
         return
     user_id = callback.from_user.id
 
-    if not same_id(request.get("exporter_id"), user_id):
+    request_owner_id = (
+        request.get("exporter_id")
+        or request.get("customer_id")
+        or request.get("created_by")
+    )
+    if not same_id(request_owner_id, user_id):
         await callback.answer("❌ Это не ваша заявка", show_alert=True)
         return
 
@@ -34133,20 +38136,27 @@ async def view_my_request_details(callback: types.CallbackQuery, state: FSMConte
     route_to = request.get("route_to") or request.get("to_city") or "Не указано"
     text = f"📦 <b>ЗАЯВКА #{request_id}</b>\n\n"
     text += f"🌾 Культура: <b>{pull_info.get('culture', 'Не указана')}</b>\n"
-    text += f"📦 Объём: <b>{request.get('volume', 0):.1f} т</b>\n"
+    text += f"📦 Объём: <b>{get_safe_float(request.get('volume'), 0):.1f} т</b>\n"
     text += f"📍 Откуда: {route_from}\n"
     text += f"📍 Куда: {route_to}\n"
     preferred_date = request.get("loading_date") or request.get("desired_date")
     if preferred_date:
         text += f"📅 Желаемая дата: {preferred_date}\n"
-    if request.get("budget"):
-        text += f"💰 Бюджет: {request.get('budget'):,.0f} ₽\n"
+    budget = get_safe_float(request.get("budget"), 0)
+    if budget > 0:
+        text += f"💰 Бюджет: {budget:,.0f} ₽\n"
     if request.get("requirements"):
         text += f"\n📋 Требования:\n{request.get('requirements')}\n"
     text += f"\n📅 Создана: {request.get('created_at', 'Не указано')}\n\n"
     text += "━━━━━━━━━━━━━━━━━━━━\n\n"
 
-    status = normalize_transition_status(request.get("status") or "active")
+    status = get_effective_request_status(
+        request_id,
+        "exporter",
+        request,
+        request_owner_id=request_owner_id,
+        request_exporter_id=request_owner_id,
+    )
     status_icon = status_map.get(status, "⚪").split()[0]
     status_name = get_status_name(status)
     text += f"📊 Статус: <b>{status_icon} {status_name}</b>\n\n"
@@ -34157,21 +38167,22 @@ async def view_my_request_details(callback: types.CallbackQuery, state: FSMConte
         if logistic_offer_matches_request(o, request_id, "exporter")
     ]
     pending_offers = [
-        o for o in all_offers if normalize_transition_status(o.get("status")) in {"pending", "active"}
+        o
+        for o in all_offers
+        if normalize_transition_status(o.get("status")) in OPEN_LOGISTIC_OFFER_STATUSES
     ]
     accepted_offers = [
         o for o in all_offers if normalize_transition_status(o.get("status")) == "accepted"
     ]
     expeditor_offers = [
-        o
-        for o in expeditor_request_offers.values()
-        if same_id(o.get("request_id"), request_id)
-        and str(o.get("source") or "").strip().lower() in {"", "exporter"}
+        offer
+        for _, _, offer in iter_request_related_expeditor_offers(request_id, "exporter")
     ]
     expeditor_pending_offers = [
         o
         for o in expeditor_offers
-        if normalize_transition_status(o.get("status") or "pending") in {"pending", "active"}
+        if normalize_transition_status(o.get("status") or "pending")
+        in OPEN_EXPEDITOR_OFFER_STATUSES
     ]
 
     text += "📬 Предложений:\n"
@@ -34230,7 +38241,7 @@ async def view_my_request_details(callback: types.CallbackQuery, state: FSMConte
                 callback_data=f"view_expeditor_offers_for_request:{request_id}",
             )
         )
-    elif status in ["in_progress", "completed"]:
+    elif status in ["in_progress", "completed", "cancelled"]:
         keyboard.add(
             InlineKeyboardButton(
                 "📦 Доставка", callback_data=f"view_delivery_by_request_{request_id}"
@@ -34271,11 +38282,21 @@ async def cancel_request_confirm(callback: types.CallbackQuery, state: FSMContex
         return
     user_id = callback.from_user.id
 
-    if not same_id(request.get("exporter_id"), user_id):
+    request_owner_id = (
+        request.get("exporter_id")
+        or request.get("customer_id")
+        or request.get("created_by")
+    )
+    if not same_id(request_owner_id, user_id):
         await callback.answer("❌ Нет доступа", show_alert=True)
         return
 
-    request_status = normalize_transition_status(request.get("status"))
+    request_status = get_effective_request_status(
+        request_id,
+        "exporter",
+        request,
+        request_exporter_id=request_owner_id,
+    )
     cancellable_statuses = {
         "pending",
         "active",
@@ -34295,7 +38316,7 @@ async def cancel_request_confirm(callback: types.CallbackQuery, state: FSMContex
         o
         for o in logistic_offers.values()
         if logistic_offer_matches_request(o, request_id, "exporter")
-        and normalize_transition_status(o.get("status")) in {"pending", "active"}
+        and normalize_transition_status(o.get("status")) in OPEN_LOGISTIC_OFFER_STATUSES
     ]
 
     text = f"❓ <b>ОТМЕНА ЗАЯВКИ #{request_id}</b>\n\n"
@@ -34339,10 +38360,21 @@ async def cancel_request_confirmed(callback: types.CallbackQuery, state: FSMCont
         return
     user_id = callback.from_user.id
 
-    if not same_id(request.get("exporter_id"), user_id):
+    request_owner_id = (
+        request.get("exporter_id")
+        or request.get("customer_id")
+        or request.get("created_by")
+    )
+    request_exporter_id = request_owner_id
+    if not same_id(request_owner_id, user_id):
         await callback.answer("❌ Нет доступа", show_alert=True)
         return
-    request_status = normalize_transition_status(request.get("status"))
+    request_status = get_effective_request_status(
+        request_id,
+        "exporter",
+        request,
+        request_exporter_id=request_exporter_id,
+    )
     cancellable_statuses = {
         "pending",
         "active",
@@ -34484,7 +38516,16 @@ async def cancel_request_confirmed(callback: types.CallbackQuery, state: FSMCont
             continue
         if not same_id(delivery.get("request_id"), request_id):
             continue
-        if not same_id(delivery.get("exporter_id"), request.get("exporter_id")):
+        delivery_owner_id = (
+            delivery.get("exporter_id")
+            or delivery.get("customer_id")
+            or delivery.get("created_by")
+        )
+        if (
+            request_exporter_id
+            and delivery_owner_id not in {None, ""}
+            and not same_id(delivery_owner_id, request_exporter_id)
+        ):
             continue
         delivery_source = str(delivery.get("source") or "").strip().lower()
         if delivery_source == "logistic":
@@ -34516,7 +38557,7 @@ async def cancel_request_confirmed(callback: types.CallbackQuery, state: FSMCont
                     continue
         if delivery_source != "exporter":
             continue
-        if normalize_transition_status(delivery.get("status")) in {
+        if get_effective_delivery_status(delivery) in {
             "completed",
             "cancelled",
         }:
@@ -34526,6 +38567,7 @@ async def cancel_request_confirmed(callback: types.CallbackQuery, state: FSMCont
         cancelled_deliveries += 1
 
     cancelled_deals = 0
+    all_pulls = pulls.get("pulls", {}) if isinstance(pulls, dict) else {}
     for deal in deals.values():
         if not isinstance(deal, dict):
             continue
@@ -34561,14 +38603,21 @@ async def cancel_request_confirmed(callback: types.CallbackQuery, state: FSMCont
                     continue
         if deal_source != "exporter":
             continue
-        if request.get("exporter_id") and not same_id(
-            deal.get("exporter_id"), request.get("exporter_id")
+        deal_pull_id = deal.get("pull_id")
+        deal_pull = all_pulls.get(deal_pull_id) or all_pulls.get(str(deal_pull_id), {})
+        deal_exporter_id = (
+            deal.get("exporter_id")
+            or deal_pull.get("exporter_id")
+            or deal_pull.get("creator_id")
+        )
+        if (
+            request_exporter_id
+            and deal_exporter_id not in {None, ""}
+            and not same_id(deal_exporter_id, request_exporter_id)
         ):
             continue
-        if normalize_transition_status(deal.get("status")) in {
-            "completed",
-            "cancelled",
-        }:
+        deal_effective_status = get_effective_deal_status(deal)
+        if deal_effective_status in {"completed", "cancelled"}:
             continue
         deal["status"] = "cancelled"
         deal["cancelled_at"] = now_str
@@ -34660,13 +38709,24 @@ async def cancel_logistics_request_confirm(
         request.get("customer_id")
         or request.get("created_by")
         or request.get("exporter_id")
-        or request.get("logist_id")
     )
+    if not owner_id:
+        legacy_logist_owner_id = request.get("logist_id")
+        has_assigned_logist_id = bool(
+            request.get("assigned_logist_id") or request.get("selected_logistic")
+        )
+        if legacy_logist_owner_id and not has_assigned_logist_id:
+            owner_id = legacy_logist_owner_id
     if not (user_role == "admin" or same_id(owner_id, user_id)):
         await callback.answer("❌ Нет доступа", show_alert=True)
         return
 
-    request_status = normalize_transition_status(request.get("status"))
+    request_status = get_effective_request_status(
+        request_id,
+        "logistics",
+        request,
+        request_owner_id=owner_id,
+    )
     cancellable_statuses = {
         "pending",
         "active",
@@ -34685,7 +38745,7 @@ async def cancel_logistics_request_confirm(
         o
         for o in logistic_offers.values()
         if logistic_offer_matches_request(o, request_id, "logistics")
-        and normalize_transition_status(o.get("status")) in {"pending", "active"}
+        and normalize_transition_status(o.get("status")) in OPEN_LOGISTIC_OFFER_STATUSES
     ]
 
     text = f"❓ <b>ОТМЕНА ЗАЯВКИ #{request_id}</b>\n\n"
@@ -34734,13 +38794,24 @@ async def cancel_logistics_request_confirmed(
         request.get("customer_id")
         or request.get("created_by")
         or request.get("exporter_id")
-        or request.get("logist_id")
     )
+    if not owner_id:
+        legacy_logist_owner_id = request.get("logist_id")
+        has_assigned_logist_id = bool(
+            request.get("assigned_logist_id") or request.get("selected_logistic")
+        )
+        if legacy_logist_owner_id and not has_assigned_logist_id:
+            owner_id = legacy_logist_owner_id
     if not (user_role == "admin" or same_id(owner_id, user_id)):
         await callback.answer("❌ Нет доступа", show_alert=True)
         return
 
-    request_status = normalize_transition_status(request.get("status"))
+    request_status = get_effective_request_status(
+        request_id,
+        "logistics",
+        request,
+        request_owner_id=owner_id,
+    )
     cancellable_statuses = {
         "pending",
         "active",
@@ -34915,11 +38986,21 @@ async def cancel_logistics_request_confirmed(
             delivery.get("customer_id")
             or delivery.get("created_by")
             or delivery.get("exporter_id")
-            or delivery.get("logist_id")
         )
-        if owner_id and not same_id(delivery_owner_id, owner_id):
+        if not delivery_owner_id:
+            legacy_logist_owner_id = delivery.get("logist_id")
+            has_assigned_logist_id = bool(
+                delivery.get("assigned_logist_id") or delivery.get("selected_logistic")
+            )
+            if legacy_logist_owner_id and not has_assigned_logist_id:
+                delivery_owner_id = legacy_logist_owner_id
+        if (
+            owner_id
+            and delivery_owner_id not in {None, ""}
+            and not same_id(delivery_owner_id, owner_id)
+        ):
             continue
-        if normalize_transition_status(delivery.get("status")) in {"completed", "cancelled"}:
+        if get_effective_delivery_status(delivery) in {"completed", "cancelled"}:
             continue
         delivery["status"] = "cancelled"
         delivery["cancelled_at"] = now_str
@@ -34966,9 +39047,14 @@ async def cancel_logistics_request_confirmed(
             or deal.get("exporter_id")
             or deal.get("logist_id")
         )
-        if owner_id and not same_id(deal_owner_id, owner_id):
+        if (
+            owner_id
+            and deal_owner_id not in {None, ""}
+            and not same_id(deal_owner_id, owner_id)
+        ):
             continue
-        if normalize_transition_status(deal.get("status")) in {"completed", "cancelled"}:
+        deal_effective_status = get_effective_deal_status(deal)
+        if deal_effective_status in {"completed", "cancelled"}:
             continue
         deal["status"] = "cancelled"
         deal["cancelled_at"] = now_str
@@ -35077,7 +39163,26 @@ async def show_exporter_deliveries(callback: types.CallbackQuery, state: FSMCont
             if delivery_source != "exporter":
                 continue
         else:
-            if not same_id(deliv.get("exporter_id"), user_id):
+            request_owner_id = None
+            if delivery_source == "exporter":
+                _, linked_request_for_owner = find_shipping_request_by_id(
+                    deliv.get("request_id")
+                )
+                if isinstance(linked_request_for_owner, dict):
+                    request_owner_id = (
+                        linked_request_for_owner.get("exporter_id")
+                        or linked_request_for_owner.get("customer_id")
+                        or linked_request_for_owner.get("created_by")
+                    )
+            deliv_owner_id = (
+                deliv.get("exporter_id")
+                or deliv.get("customer_id")
+                or deliv.get("created_by")
+            )
+            if not (
+                same_id(deliv_owner_id, user_id)
+                or same_id(request_owner_id, user_id)
+            ):
                 continue
             if delivery_source != "exporter":
                 continue
@@ -35109,7 +39214,7 @@ async def show_exporter_deliveries(callback: types.CallbackQuery, state: FSMCont
     by_status = {"pending": [], "in_progress": [], "completed": [], "cancelled": []}
 
     for deliv_id, deliv in my_deliveries:
-        status = normalize_transition_status(deliv.get("status", "pending"))
+        status = get_effective_delivery_status(deliv)
         if status in {"new", "assigned", "expeditor_selected", "accepted", "open"}:
             status = "pending"
         if status not in by_status:
@@ -35123,10 +39228,12 @@ async def show_exporter_deliveries(callback: types.CallbackQuery, state: FSMCont
     pending = len(by_status["pending"])
     in_progress = len(by_status["in_progress"])
     completed = len(by_status["completed"])
+    cancelled = len(by_status["cancelled"])
 
     text += f"🕐 Ожидают начала: <b>{pending}</b>\n"
     text += f"🚚 В пути: <b>{in_progress}</b>\n"
-    text += f"✅ Завершены: <b>{completed}</b>\n\n"
+    text += f"✅ Завершены: <b>{completed}</b>\n"
+    text += f"❌ Отменены: <b>{cancelled}</b>\n\n"
     text += "━━━━━━━━━━━━━━━━━━━━\n\n"
     text += "Выберите доставку:"
 
@@ -35137,12 +39244,13 @@ async def show_exporter_deliveries(callback: types.CallbackQuery, state: FSMCont
         ("pending", "Ожидают", "🕐"),
         ("in_progress", "В пути", "🚚"),
         ("completed", "Завершены", "✅"),
+        ("cancelled", "Отменены", "❌"),
     ]:
         delivs = by_status[status_key]
         if delivs:
             for deliv_id, deliv in delivs[:5]:
                 route = f"{deliv.get('route_from', '')} → {deliv.get('route_to', '')}"
-                volume = deliv.get("volume", 0)
+                volume = get_safe_float(deliv.get("volume"), 0)
 
                 button_text = f"{emoji} #{deliv_id} | {route[:20]} | {volume:.0f}т"
 
@@ -35181,7 +39289,12 @@ async def view_delivery_by_request(callback: types.CallbackQuery, state: FSMCont
     if not request:
         await callback.answer("❌ Заявка не найдена", show_alert=True)
         return
-    is_request_owner = same_id(request.get("exporter_id"), user_id)
+    request_owner_id = (
+        request.get("exporter_id")
+        or request.get("customer_id")
+        or request.get("created_by")
+    )
+    is_request_owner = same_id(request_owner_id, user_id)
     if not (is_request_owner or user_role == "admin"):
         await callback.answer("❌ Нет доступа", show_alert=True)
         return
@@ -35193,7 +39306,16 @@ async def view_delivery_by_request(callback: types.CallbackQuery, state: FSMCont
             continue
         if not same_id(deliv.get("request_id"), request_id):
             continue
-        if is_request_owner and not same_id(deliv.get("exporter_id"), user_id):
+        deliv_owner_id = (
+            deliv.get("exporter_id")
+            or deliv.get("customer_id")
+            or deliv.get("created_by")
+        )
+        if (
+            is_request_owner
+            and deliv_owner_id not in {None, ""}
+            and not same_id(deliv_owner_id, user_id)
+        ):
             continue
         deliv_source = str(deliv.get("source") or "").strip().lower()
         if deliv_source == "logistic":
@@ -35345,7 +39467,12 @@ async def rate_logistic_start(callback: types.CallbackQuery, state: FSMContext):
     linked_request = linked_request if isinstance(linked_request, dict) else {}
 
     if delivery_source == "farmer":
-        owner_id = linked_request.get("farmer_id") or delivery.get("farmer_id")
+        owner_id = (
+            linked_request.get("farmer_id")
+            or linked_request.get("user_id")
+            or delivery.get("farmer_id")
+            or delivery.get("user_id")
+        )
     elif delivery_source == "logistics":
         owner_id = (
             linked_request.get("customer_id")
@@ -35354,8 +39481,19 @@ async def rate_logistic_start(callback: types.CallbackQuery, state: FSMContext):
             or delivery.get("customer_id")
             or delivery.get("created_by")
             or delivery.get("exporter_id")
-            or delivery.get("logist_id")
         )
+        if not owner_id:
+            legacy_logist_owner_id = linked_request.get("logist_id") or delivery.get(
+                "logist_id"
+            )
+            has_assigned_logist_id = bool(
+                linked_request.get("assigned_logist_id")
+                or linked_request.get("selected_logistic")
+                or delivery.get("assigned_logist_id")
+                or delivery.get("selected_logistic")
+            )
+            if legacy_logist_owner_id and not has_assigned_logist_id:
+                owner_id = legacy_logist_owner_id
     else:
         owner_id = linked_request.get("exporter_id") or delivery.get("exporter_id")
 
@@ -35366,7 +39504,8 @@ async def rate_logistic_start(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer("❌ Нельзя оценить собственную доставку", show_alert=True)
         return
 
-    if normalize_transition_status(delivery.get("status")) != "completed":
+    delivery_status = get_effective_delivery_status(delivery, linked_request)
+    if delivery_status != "completed":
         await callback.answer(
             "❌ Можно оценить только завершённую доставку", show_alert=True
         )
@@ -35541,7 +39680,12 @@ async def rate_logistic_save(callback_or_fake, state: FSMContext, review: str = 
     linked_request = linked_request if isinstance(linked_request, dict) else {}
 
     if delivery_source == "farmer":
-        owner_id = linked_request.get("farmer_id") or delivery.get("farmer_id")
+        owner_id = (
+            linked_request.get("farmer_id")
+            or linked_request.get("user_id")
+            or delivery.get("farmer_id")
+            or delivery.get("user_id")
+        )
     elif delivery_source == "logistics":
         owner_id = (
             linked_request.get("customer_id")
@@ -35550,8 +39694,19 @@ async def rate_logistic_save(callback_or_fake, state: FSMContext, review: str = 
             or delivery.get("customer_id")
             or delivery.get("created_by")
             or delivery.get("exporter_id")
-            or delivery.get("logist_id")
         )
+        if not owner_id:
+            legacy_logist_owner_id = linked_request.get("logist_id") or delivery.get(
+                "logist_id"
+            )
+            has_assigned_logist_id = bool(
+                linked_request.get("assigned_logist_id")
+                or linked_request.get("selected_logistic")
+                or delivery.get("assigned_logist_id")
+                or delivery.get("selected_logistic")
+            )
+            if legacy_logist_owner_id and not has_assigned_logist_id:
+                owner_id = legacy_logist_owner_id
     else:
         owner_id = linked_request.get("exporter_id") or delivery.get("exporter_id")
 
@@ -35568,7 +39723,8 @@ async def rate_logistic_save(callback_or_fake, state: FSMContext, review: str = 
             )
         await state.finish()
         return
-    if normalize_transition_status(delivery.get("status")) != "completed":
+    delivery_status = get_effective_delivery_status(delivery, linked_request)
+    if delivery_status != "completed":
         if hasattr(callback_or_fake, "answer"):
             await callback_or_fake.answer(
                 "❌ Можно оценить только завершённую доставку",
@@ -35676,7 +39832,8 @@ async def view_logistic_profile(callback: types.CallbackQuery, state: FSMContext
     await state.finish()
 
     try:
-        logist_id = int(callback.data.split("_")[-1])
+        logist_id_raw = callback.data.split("_")[-1]
+        logist_id = int(logist_id_raw) if str(logist_id_raw).isdigit() else logist_id_raw
     except (IndexError, ValueError):
         await callback.answer("❌ Ошибка", show_alert=True)
         return
@@ -35696,8 +39853,13 @@ async def view_logistic_profile(callback: types.CallbackQuery, state: FSMContext
     text += "\n━━━━━━━━━━━━━━━━━━━━\n\n"
 
     # Рейтинг
-    if logist_id in logistic_ratings:
-        rating_data = logistic_ratings[logist_id]
+    rating_key = (
+        logist_id
+        if isinstance(logistic_ratings, dict) and logist_id in logistic_ratings
+        else str(logist_id)
+    )
+    if isinstance(logistic_ratings, dict) and rating_key in logistic_ratings:
+        rating_data = logistic_ratings[rating_key]
         avg_rating = rating_data["total_rating"] / rating_data["count"]
         stars = "⭐" * int(round(avg_rating))
 
@@ -35710,17 +39872,17 @@ async def view_logistic_profile(callback: types.CallbackQuery, state: FSMContext
 
     # Статистика доставок
     logist_deliveries = [
-        d for d in deliveries.values() if same_id(d.get("logist_id"), logist_id)
+        d for d in deliveries.values() if same_id(get_assigned_logist_id(d), logist_id)
     ]
 
     completed = len(
-        [d for d in logist_deliveries if normalize_transition_status(d.get("status")) == "completed"]
+        [d for d in logist_deliveries if get_effective_delivery_status(d) == "completed"]
     )
     in_progress = len(
         [
             d
             for d in logist_deliveries
-            if normalize_transition_status(d.get("status")) == "in_progress"
+            if get_effective_delivery_status(d) in {"in_progress", "expeditor_selected"}
         ]
     )
 
@@ -35730,11 +39892,15 @@ async def view_logistic_profile(callback: types.CallbackQuery, state: FSMContext
     text += f"📋 Всего: {len(logist_deliveries)}\n\n"
 
     # Последние отзывы
-    if logist_id in logistic_ratings and logistic_ratings[logist_id]["reviews"]:
+    if (
+        isinstance(logistic_ratings, dict)
+        and rating_key in logistic_ratings
+        and logistic_ratings[rating_key]["reviews"]
+    ):
         text += "━━━━━━━━━━━━━━━━━━━━\n\n"
         text += "<b>💬 ПОСЛЕДНИЕ ОТЗЫВЫ:</b>\n\n"
 
-        reviews = logistic_ratings[logist_id]["reviews"][-3:]  # Последние 3
+        reviews = logistic_ratings[rating_key]["reviews"][-3:]  # Последние 3
         for r in reversed(reviews):
             stars = "⭐" * r["rating"]
             text += f"{stars} {r['rating']}/5\n"
@@ -35948,19 +40114,7 @@ async def show_expeditor_my_offers(callback: types.CallbackQuery, state: FSMCont
     is_admin = user_role == "admin"
 
     # Получаем предложения пользователя (admin видит все предложения экспедиторов)
-    my_offers = []
-    seen_offer_ids = set()
-    for offer_id, offer in expeditor_offers.items():
-        if not isinstance(offer, dict):
-            continue
-        if not is_admin and not same_id(offer.get("expeditor_id"), user_id):
-            continue
-        canonical_id = offer.get("id", offer_id)
-        canonical_key = str(canonical_id)
-        if canonical_key in seen_offer_ids:
-            continue
-        seen_offer_ids.add(canonical_key)
-        my_offers.append((canonical_id, offer))
+    my_offers = list(iter_expeditor_self_offers(None if is_admin else user_id))
 
     if not my_offers:
         text = (
@@ -35972,11 +40126,12 @@ async def show_expeditor_my_offers(callback: types.CallbackQuery, state: FSMCont
         text += "<i>Создайте предложение в разделе 'Создать предложение'</i>"
 
         keyboard = InlineKeyboardMarkup()
-        keyboard.add(
-            InlineKeyboardButton(
-                "➕ Создать предложение", callback_data="create_expeditor_offer"
+        if not is_admin:
+            keyboard.add(
+                InlineKeyboardButton(
+                    "➕ Создать предложение", callback_data="create_expeditor_offer"
+                )
             )
-        )
         keyboard.add(
             InlineKeyboardButton("🔙 Главное меню", callback_data="back_to_main")
         )
@@ -35995,16 +40150,16 @@ async def show_expeditor_my_offers(callback: types.CallbackQuery, state: FSMCont
         "cancelled": [],
     }
 
-    for offer_id, offer in my_offers:
-        status = normalize_transition_status(offer.get("status", "active"))
+    for storage_name, offer_id, offer in my_offers:
+        status = get_effective_expeditor_offer_status(storage_name, offer)
         if status in {"open", "new", "pending"}:
             status = "active"
         elif status in {"accepted", "assigned"}:
             status = "selected"
         if status in by_status:
-            by_status[status].append((offer_id, offer))
+            by_status[status].append((storage_name, offer_id, offer))
         else:
-            by_status["active"].append((offer_id, offer))
+            by_status["active"].append((storage_name, offer_id, offer))
 
     text = (
         "📋 <b>ПРЕДЛОЖЕНИЯ ЭКСПЕДИТОРОВ</b>\n\n"
@@ -36042,23 +40197,28 @@ async def show_expeditor_my_offers(callback: types.CallbackQuery, state: FSMCont
     ]:
         offers = by_status[status_key]
         if offers:
-            for offer_id, offer in offers[:5]:
-                service = offer.get("service_type", "Услуга")
-                price = offer.get("price", 0)
+            for storage_name, offer_id, offer in offers[:5]:
+                service = (
+                    offer.get("service_type")
+                    or offer.get("services")
+                    or "Услуга"
+                )
+                price = get_safe_float(offer.get("price"), 0)
 
                 button_text = f"{emoji} #{offer_id} | {service[:20]} | {price:,.0f}₽"
 
                 keyboard.add(
                     InlineKeyboardButton(
-                        button_text, callback_data=f"view_expeditor_offer_{offer_id}"
+                        button_text, callback_data=f"view_expeditor_offer_{storage_name}_{offer_id}"
                     )
                 )
 
-    keyboard.add(
-        InlineKeyboardButton(
-            "➕ Новое предложение", callback_data="create_expeditor_offer"
+    if not is_admin:
+        keyboard.add(
+            InlineKeyboardButton(
+                "➕ Новое предложение", callback_data="create_expeditor_offer"
+            )
         )
-    )
     keyboard.add(
         InlineKeyboardButton("🔄 Обновить", callback_data="expeditor_my_offers")
     )
@@ -36069,15 +40229,73 @@ async def show_expeditor_my_offers(callback: types.CallbackQuery, state: FSMCont
 
 
 @dp.callback_query_handler(lambda c: c.data.startswith("edit_expeditor_offer_"), state="*")
-async def edit_expeditor_offer_legacy(callback: types.CallbackQuery, state: FSMContext):
-    """Fallback для старой кнопки редактирования оффера экспедитора."""
+async def edit_expeditor_offer(callback: types.CallbackQuery, state: FSMContext):
+    """Редактирование предложения экспедитора."""
     await state.finish()
-    keyboard = InlineKeyboardMarkup()
-    keyboard.add(InlineKeyboardButton("💼 Мои предложения", callback_data="expeditor_my_offers"))
-    await callback.message.answer(
-        "ℹ️ Это устаревшая кнопка редактирования.\n"
-        "Создайте новое предложение с нужными условиями.",
+    try:
+        offer_ref = callback.data.split("_")[-1]
+        offer_id = int(offer_ref) if str(offer_ref).isdigit() else offer_ref
+    except (IndexError, ValueError):
+        await callback.answer("❌ Ошибка получения ID", show_alert=True)
+        return
+
+    resolved_offer_id, offer = find_expeditor_offer_by_id(offer_id)
+    if not offer:
+        await callback.answer("❌ Предложение не найдено", show_alert=True)
+        return
+    offer_id = resolved_offer_id
+
+    user_id = callback.from_user.id
+    user_role = (get_user_by_id(user_id) or {}).get("role")
+    is_admin = user_role == "admin"
+
+    if not (is_admin or same_id(offer.get("expeditor_id"), user_id)):
+        await callback.answer("❌ Это не ваше предложение", show_alert=True)
+        return
+
+    if normalize_transition_status(offer.get("status")) not in OPEN_EXPEDITOR_OFFER_STATUSES:
+        await callback.answer(
+            "❌ Можно редактировать только активные предложения", show_alert=True
+        )
+        return
+
+    await state.update_data(
+        editing_expeditor_offer_id=offer_id,
+        service_type=offer.get("service_type", ""),
+        ports=offer.get("ports", ""),
+        price=get_safe_float(offer.get("price"), 0),
+        terms=offer.get("terms", ""),
+    )
+    await ExpeditorOfferStates.service_type.set()
+
+    current_price = get_safe_float(offer.get("price"), 0)
+    text = f"✏️ <b>РЕДАКТИРОВАНИЕ ПРЕДЛОЖЕНИЯ #{offer_id}</b>\n\n"
+    text += "Текущие данные:\n"
+    text += f"📋 {offer.get('service_type', 'Не указана')}\n"
+    text += f"🏢 {offer.get('ports', 'Не указаны')}\n"
+    text += f"💰 {current_price:,.0f} ₽\n"
+    text += f"📝 {offer.get('terms', 'Не указаны')}\n\n"
+    text += "Выберите новый тип услуги:"
+
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        InlineKeyboardButton("📄 Документы", callback_data="service:docs"),
+        InlineKeyboardButton("🏢 Таможня", callback_data="service:customs"),
+    )
+    keyboard.add(
+        InlineKeyboardButton("🚢 Фрахт", callback_data="service:freight"),
+        InlineKeyboardButton("📦 Полный сервис", callback_data="service:full"),
+    )
+    keyboard.add(
+        InlineKeyboardButton(
+            "❌ Отмена", callback_data=f"view_expeditor_offer_{offer_id}"
+        )
+    )
+
+    await callback.message.edit_text(
+        text,
         reply_markup=keyboard,
+        parse_mode="HTML",
     )
     await callback.answer()
 
@@ -36095,13 +40313,12 @@ async def view_expeditor_offer_details(
     await state.finish()
 
     try:
-        offer_ref = callback.data.split("_")[-1]
-        offer_id = int(offer_ref) if str(offer_ref).isdigit() else offer_ref
+        offer_ref = callback.data.removeprefix("view_expeditor_offer_")
     except (IndexError, ValueError):
         await callback.answer("❌ Ошибка получения ID", show_alert=True)
         return
 
-    resolved_offer_id, offer = find_expeditor_offer_by_id(offer_id)
+    offer_storage, resolved_offer_id, offer = find_expeditor_self_offer_by_ref(offer_ref)
     if not offer:
         await callback.answer("❌ Предложение не найдено", show_alert=True)
         return
@@ -36114,28 +40331,51 @@ async def view_expeditor_offer_details(
         await callback.answer("❌ Это не ваше предложение", show_alert=True)
         return
 
+    service_name = (
+        offer.get("service_type")
+        or offer.get("services")
+        or offer.get("services_text")
+        or "Не указана"
+    )
+    ports_value = offer.get("ports") or offer.get("regions") or "Не указаны"
+    created_at = offer.get("created_at") or offer.get("responded_at") or "Не указано"
+
     text = f"📋 <b>ПРЕДЛОЖЕНИЕ #{offer_id}</b>\n\n"
-    text += f"📦 Услуга: <b>{offer.get('service_type', 'Не указана')}</b>\n"
-    text += f"🚢 Порты: {offer.get('ports', 'Не указаны')}\n"
-    text += f"💰 Цена: <b>{offer.get('price', 0):,.0f} ₽</b>\n"
+    text += f"📦 Услуга: <b>{service_name}</b>\n"
+    text += f"🚢 Порты/регионы: {ports_value}\n"
+    text += f"💰 Цена: <b>{get_safe_float(offer.get('price'), 0):,.0f} ₽</b>\n"
     text += f"📅 Сроки: {offer.get('terms', 'Не указаны')}\n\n"
 
     if offer.get("description"):
         text += f"📝 Описание:\n<i>{offer.get('description')}</i>\n\n"
 
-    text += f"📅 Создано: {offer.get('created_at', 'Не указано')}\n\n"
+    if offer_storage == "request":
+        request_id = offer.get("request_id")
+        request_source = str(offer.get("source") or "").strip().lower()
+        if request_source == "logistic":
+            request_source = "logistics"
+        text += f"🧾 Заявка: #{request_id or '—'}\n"
+        if request_source in {"exporter", "logistics"}:
+            text += f"📡 Источник: {request_source}\n"
+        text += "\n"
+
+    text += f"📅 Создано: {created_at}\n\n"
     text += "━━━━━━━━━━━━━━━━━━━━\n\n"
 
     # Статус
-    status = normalize_transition_status(offer.get("status", "active"))
-    if status == "open":
+    status = get_effective_expeditor_offer_status(offer_storage, offer)
+    if status in {"open", "new", "pending"}:
         status = "active"
-    elif status == "accepted":
+    elif status in {"accepted", "assigned", "selected", "reserved"}:
         status = "selected"
 
     if status == "active":
         text += "📊 Статус: <b>🆕 Активно</b>\n"
-        text += "Ваше предложение видно экспортёрам"
+        text += (
+            "Ваше предложение видно заказчикам"
+            if offer_storage == "request"
+            else "Ваше предложение видно экспортёрам"
+        )
     elif status == "selected":
         text += "📊 Статус: <b>✅ Выбрано экспортёром</b>\n"
         if offer.get("exporter_id"):
@@ -36160,7 +40400,7 @@ async def view_expeditor_offer_details(
 
     keyboard = InlineKeyboardMarkup(row_width=2)
 
-    if status == "active":
+    if status in OPEN_EXPEDITOR_OFFER_STATUSES and offer_storage == "route":
         keyboard.add(
             InlineKeyboardButton(
                 "✏️ Редактировать", callback_data=f"edit_expeditor_offer_{offer_id}"
@@ -36206,7 +40446,7 @@ async def cancel_expeditor_offer(callback: types.CallbackQuery, state: FSMContex
         await callback.answer("❌ Нет доступа", show_alert=True)
         return
 
-    if normalize_transition_status(offer.get("status")) != "active":
+    if normalize_transition_status(offer.get("status")) not in OPEN_EXPEDITOR_OFFER_STATUSES:
         await callback.answer(
             "❌ Можно отменить только активные предложения", show_alert=True
         )
@@ -36248,12 +40488,15 @@ async def show_expeditor_available_pulls(
     is_admin = user_role == "admin"
 
     # Получаем предложения экспедитора для определения портов
-    my_offers = [
-        offer
-        for offer in expeditor_offers.values()
-        if (is_admin or same_id(offer.get("expeditor_id"), user_id))
-        and normalize_transition_status(offer.get("status")) == "active"
-    ]
+    my_offers = []
+    for offer in expeditor_offers.values():
+        if not isinstance(offer, dict):
+            continue
+        if not (is_admin or same_id(offer.get("expeditor_id"), user_id)):
+            continue
+        if normalize_transition_status(offer.get("status")) not in OPEN_EXPEDITOR_OFFER_STATUSES:
+            continue
+        my_offers.append(offer)
 
     # Собираем порты из предложений
     my_ports = set()
@@ -36329,7 +40572,7 @@ async def show_expeditor_available_pulls(
 
     for pull_id, pull in suitable_pulls[:10]:
         culture = pull.get("culture", "Не указана")
-        volume = pull.get("current_volume", 0)
+        volume = get_safe_float(pull.get("current_volume"), 0)
         port = pull.get("port", "Не указан")
 
         button_text = f"📦 #{pull_id} | {culture} {volume:.0f}т | {port}"
@@ -36370,7 +40613,8 @@ async def view_pull_for_expeditor(callback: types.CallbackQuery, state: FSMConte
         return
 
     try:
-        pull_id = int(callback.data.split("_")[-1])
+        pull_id_raw = callback.data.split("_")[-1]
+        pull_id = int(pull_id_raw) if str(pull_id_raw).isdigit() else pull_id_raw
     except (IndexError, ValueError):
         await callback.answer("❌ Ошибка получения ID", show_alert=True)
         return
@@ -36384,12 +40628,12 @@ async def view_pull_for_expeditor(callback: types.CallbackQuery, state: FSMConte
 
     text = f"📦 <b>ПУЛ #{pull_id}</b>\n\n"
     text += f"🌾 Культура: <b>{pull.get('culture', 'Не указана')}</b>\n"
-    text += f"📦 Объём: <b>{pull.get('current_volume', 0):.1f} т</b>\n"
+    text += f"📦 Объём: <b>{get_safe_float(pull.get('current_volume'), 0):.1f} т</b>\n"
     text += f"🚢 Порт отгрузки: {pull.get('port', 'Не указан')}\n"
     text += f"📅 Дата отгрузки: {pull.get('shipment_date', 'Не указана')}\n\n"
 
     # Информация об экспортёре
-    exporter_id = pull.get("exporter_id")
+    exporter_id = pull.get("exporter_id") or pull.get("creator_id")
     if exporter_id:
         exporter_info = get_user_by_id(exporter_id) or {}
         text += "<b>🏢 ЭКСПОРТЁР:</b>\n"
@@ -36405,6 +40649,19 @@ async def view_pull_for_expeditor(callback: types.CallbackQuery, state: FSMConte
     text += "или отправьте предложение услуг"
 
     keyboard = InlineKeyboardMarkup()
+    pull_status = normalize_transition_status(pull.get("status") or "active")
+    can_send_offer = (
+        pull_status in {"filled", "closed"}
+        and has_assigned_logist(pull)
+        and not has_assigned_expeditor(pull)
+    )
+    if can_send_offer and is_expeditor_role(user_role):
+        keyboard.add(
+            InlineKeyboardButton(
+                "✉️ Отправить предложение по пуллу",
+                callback_data=f"exp_offer_start:{pull_id}:{user_id}",
+            )
+        )
     keyboard.add(
         InlineKeyboardButton("💼 Мои предложения", callback_data="expeditor_my_offers")
     )
@@ -36430,41 +40687,60 @@ async def show_expeditor_statistics(callback: types.CallbackQuery, state: FSMCon
     is_admin = user_role == "admin"
 
     # Собираем статистику (admin видит агрегированно по всем экспедиторам)
-    my_offers = []
-    seen_offer_ids = set()
-    for offer_id, offer in expeditor_offers.items():
-        if not isinstance(offer, dict):
-            continue
-        if not is_admin and not same_id(offer.get("expeditor_id"), user_id):
-            continue
-        canonical_id = offer.get("id", offer_id)
-        canonical_key = str(canonical_id)
-        if canonical_key in seen_offer_ids:
-            continue
-        seen_offer_ids.add(canonical_key)
-        my_offers.append(offer)
+    my_offers = list(iter_expeditor_self_offers(None if is_admin else user_id))
+
+    effective_statuses = [
+        get_effective_expeditor_offer_status(storage_name, offer)
+        for storage_name, _, offer in my_offers
+    ]
 
     total_offers = len(my_offers)
     active_offers = len(
         [
-            o
-            for o in my_offers
-            if normalize_transition_status(o.get("status"))
-            in {"active", "open", "pending", "new"}
+            status
+            for status in effective_statuses
+            if status in {"active", "open", "pending", "new"}
         ]
     )
     selected_offers = len(
         [
-            o
-            for o in my_offers
-            if normalize_transition_status(o.get("status"))
-            in {"selected", "accepted", "assigned"}
+            status
+            for status in effective_statuses
+            if status in {"selected", "accepted", "assigned"}
+        ]
+    )
+    in_progress_offers = len(
+        [
+            status
+            for status in effective_statuses
+            if status == "in_progress"
+        ]
+    )
+    completed_offers = len(
+        [
+            status
+            for status in effective_statuses
+            if status == "completed"
+        ]
+    )
+    rejected_offers = len(
+        [
+            status
+            for status in effective_statuses
+            if status == "rejected"
+        ]
+    )
+    cancelled_offers = len(
+        [
+            status
+            for status in effective_statuses
+            if status == "cancelled"
         ]
     )
 
     # Подсчёт пулов по портам
     ports_dict = {}
-    for offer in my_offers:
+    for _, _, offer in my_offers:
         ports_str = offer.get("ports", "")
         if ports_str:
             for port in ports_str.split(","):
@@ -36475,7 +40751,11 @@ async def show_expeditor_statistics(callback: types.CallbackQuery, state: FSMCon
     text += "<b>ПРЕДЛОЖЕНИЯ:</b>\n"
     text += f"📋 Всего предложений: <b>{total_offers}</b>\n"
     text += f"🆕 Активных: <b>{active_offers}</b>\n"
-    text += f"✅ Выбрано: <b>{selected_offers}</b>\n\n"
+    text += f"✅ Выбрано: <b>{selected_offers}</b>\n"
+    text += f"🚚 В работе: <b>{in_progress_offers}</b>\n"
+    text += f"🏁 Завершено: <b>{completed_offers}</b>\n"
+    text += f"❌ Отклонено: <b>{rejected_offers}</b>\n"
+    text += f"🚫 Отменено: <b>{cancelled_offers}</b>\n\n"
 
     if selected_offers > 0 and total_offers > 0:
         success_rate = (selected_offers / total_offers) * 100
@@ -36490,7 +40770,11 @@ async def show_expeditor_statistics(callback: types.CallbackQuery, state: FSMCon
         text += "\n"
 
     # Средняя цена услуг
-    prices = [o.get("price", 0) for o in my_offers if o.get("price")]
+    prices = [
+        get_safe_float(offer.get("price"), 0)
+        for _, _, offer in my_offers
+        if offer.get("price")
+    ]
     if prices:
         avg_price = sum(prices) / len(prices)
         text += "<b>ЦЕНООБРАЗОВАНИЕ:</b>\n"
@@ -36586,9 +40870,10 @@ async def show_user_deals(message: types.Message, state: FSMContext):
             matches = len([d for d in user_batches if len(d.get("matches", [])) > 0])
 
             total = active + reserved + sold + canceled
-            total_volume = sum([b.get("volume", 0) for b in user_batches])
+            total_volume = sum(get_safe_float(b.get("volume"), 0) for b in user_batches)
             total_price = sum(
-                [b.get("volume", 0) * b.get("price", 0) for b in user_batches]
+                get_safe_float(b.get("volume"), 0) * get_safe_float(b.get("price"), 0)
+                for b in user_batches
             )
 
             text = (
@@ -36800,7 +41085,12 @@ async def show_user_deals(message: types.Message, state: FSMContext):
                 if canonical_key in seen_order_ids:
                     continue
                 seen_order_ids.add(canonical_key)
-                all_orders.append(delivery)
+                all_orders.append(
+                    {
+                        "delivery": delivery,
+                        "status": get_effective_delivery_status(delivery),
+                    }
+                )
 
             pending = len(
                 [
@@ -36826,10 +41116,20 @@ async def show_user_deals(message: types.Message, state: FSMContext):
                     if status_in_group(d.get("status"), {"completed"})
                 ]
             )
+            cancelled = len(
+                [
+                    d
+                    for d in all_orders
+                    if status_in_group(d.get("status"), {"cancelled"})
+                ]
+            )
 
-            total_volume = sum([o.get("volume", 0) for o in all_orders])
+            total_volume = sum(
+                [get_safe_float((o.get("delivery") or {}).get("volume"), 0) for o in all_orders]
+            )
 
-            def _request_total_price(delivery):
+            def _request_total_price(order):
+                delivery = order.get("delivery") if isinstance(order, dict) else {}
                 direct_price = get_safe_float(delivery.get("price"), 0)
                 if direct_price > 0:
                     return direct_price
@@ -36851,7 +41151,8 @@ async def show_user_deals(message: types.Message, state: FSMContext):
                 f"💰 Сумма: {total_price:,.0f}₽\n\n"
                 f"⏳ Ожидающие: {pending}\n"
                 f"🚗 В пути: {in_progress}\n"
-                f"✅ Доставлено: {completed}\n\n"
+                f"✅ Доставлено: {completed}\n"
+                f"❌ Отменено: {cancelled}\n\n"
                 "<b>Выберите статус:</b>"
             )
 
@@ -36877,6 +41178,13 @@ async def show_user_deals(message: types.Message, state: FSMContext):
                         callback_data="deals_status:logist:completed",
                     )
                 )
+            if cancelled > 0:
+                keyboard.add(
+                    InlineKeyboardButton(
+                        f"❌ Отменено ({cancelled})",
+                        callback_data="deals_status:logist:cancelled",
+                    )
+                )
 
             if len(all_orders) == 0:
                 text = (
@@ -36891,12 +41199,10 @@ async def show_user_deals(message: types.Message, state: FSMContext):
         elif is_expeditor_role(user_role):
             all_exp_items = []
             seen_offer_ids = set()
-            for offer_key, offer in expeditor_offers.items():
-                if not isinstance(offer, dict):
+            for storage_name, offer_id, offer in iter_expeditor_self_offers(user_id):
+                if storage_name != "route":
                     continue
-                if not same_id(offer.get("expeditor_id"), user_id):
-                    continue
-                canonical_id = offer.get("id", offer_key)
+                canonical_id = offer.get("id", offer_id)
                 canonical_key = str(canonical_id)
                 if canonical_key in seen_offer_ids:
                     continue
@@ -36904,7 +41210,9 @@ async def show_user_deals(message: types.Message, state: FSMContext):
                 all_exp_items.append(
                     {
                         "item_type": "offer",
-                        "status": offer.get("status"),
+                        "status": get_effective_expeditor_offer_status(
+                            storage_name, offer
+                        ),
                         "volume": get_safe_float(offer.get("max_volume"), 0)
                         or get_safe_float(offer.get("volume"), 0),
                         "price": get_safe_float(offer.get("price"), 0),
@@ -36925,7 +41233,7 @@ async def show_user_deals(message: types.Message, state: FSMContext):
                 all_exp_items.append(
                     {
                         "item_type": "delivery",
-                        "status": delivery.get("status"),
+                        "status": get_effective_delivery_status(delivery),
                         "volume": get_safe_float(delivery.get("volume"), 0),
                         "price": get_safe_float(delivery.get("price"), 0),
                     }
@@ -36965,9 +41273,20 @@ async def show_user_deals(message: types.Message, state: FSMContext):
                     if status_in_group(d.get("status"), {"completed"})
                 ]
             )
+            cancelled = len(
+                [
+                    d
+                    for d in all_exp_items
+                    if status_in_group(d.get("status"), {"cancelled"})
+                ]
+            )
 
-            total_volume = sum([d.get("volume", 0) for d in all_exp_items])
-            total_price = sum([d.get("price", 0) for d in all_exp_items])
+            total_volume = sum(
+                get_safe_float(d.get("volume"), 0) for d in all_exp_items
+            )
+            total_price = sum(
+                get_safe_float(d.get("price"), 0) for d in all_exp_items
+            )
 
             text = (
                 "✈️ <b>МОИ МАРШРУТЫ</b>\n\n"
@@ -36977,7 +41296,8 @@ async def show_user_deals(message: types.Message, state: FSMContext):
                 f"💰 Сумма: {total_price:,.0f}₽\n\n"
                 f"🟢 Активные: {active}\n"
                 f"⏳ В пути: {in_progress}\n"
-                f"✅ Доставлено: {delivered}\n\n"
+                f"✅ Доставлено: {delivered}\n"
+                f"❌ Отменено: {cancelled}\n\n"
                 "<b>Выберите статус:</b>"
             )
 
@@ -37001,6 +41321,13 @@ async def show_user_deals(message: types.Message, state: FSMContext):
                     InlineKeyboardButton(
                         f"✅ Доставлено ({delivered})",
                         callback_data="deals_status:expeditor:completed",
+                    )
+                )
+            if cancelled > 0:
+                keyboard.add(
+                    InlineKeyboardButton(
+                        f"❌ Отменено ({cancelled})",
+                        callback_data="deals_status:expeditor:cancelled",
                     )
                 )
 
@@ -37297,25 +41624,25 @@ async def filter_deals_by_status(callback: types.CallbackQuery):
                     # Показываем ВСЕ батчи
                     filtered_items.append(
                         {
-                            "index": idx,
-                            "culture": batch.get("culture", "N/A"),
-                            "volume": batch.get("volume", 0),
-                            "price": batch.get("price", 0),
-                            "status": batch_status,
-                            "id": batch.get("id", idx),
-                        }
+                                "index": idx,
+                                "culture": batch.get("culture", "N/A"),
+                                "volume": get_safe_float(batch.get("volume"), 0),
+                                "price": get_safe_float(batch.get("price"), 0),
+                                "status": batch_status,
+                                "id": batch.get("id", idx),
+                            }
                     )
                     logging.info("         ✅ ДОБАВЛЕНА в результаты (all)!")
                 elif search_status == "matches" and len(batch.get("matches", [])) > 0:
                     filtered_items.append(
                         {
-                            "index": idx,
-                            "culture": batch.get("culture", "N/A"),
-                            "volume": batch.get("volume", 0),
-                            "price": batch.get("price", 0),
-                            "status": batch_status,
-                            "id": batch.get("id", idx),
-                        }
+                                "index": idx,
+                                "culture": batch.get("culture", "N/A"),
+                                "volume": get_safe_float(batch.get("volume"), 0),
+                                "price": get_safe_float(batch.get("price"), 0),
+                                "status": batch_status,
+                                "id": batch.get("id", idx),
+                            }
                     )
                     logging.info("         ✅ ДОБАВЛЕНА в результаты (matches)!")
                 elif status_in_group(
@@ -37325,13 +41652,13 @@ async def filter_deals_by_status(callback: types.CallbackQuery):
                     # Показываем только с конкретным статусом
                     filtered_items.append(
                         {
-                            "index": idx,
-                            "culture": batch.get("culture", "N/A"),
-                            "volume": batch.get("volume", 0),
-                            "price": batch.get("price", 0),
-                            "status": batch_status,
-                            "id": batch.get("id", idx),
-                        }
+                                "index": idx,
+                                "culture": batch.get("culture", "N/A"),
+                                "volume": get_safe_float(batch.get("volume"), 0),
+                                "price": get_safe_float(batch.get("price"), 0),
+                                "status": batch_status,
+                                "id": batch.get("id", idx),
+                            }
                     )
                     logging.info("         ✅ ДОБАВЛЕНА в результаты!")
 
@@ -37374,9 +41701,11 @@ async def filter_deals_by_status(callback: types.CallbackQuery):
                             {
                                 "index": pull.get("id"),
                                 "culture": pull.get("culture", "N/A"),
-                                "volume": pull.get("current_volume", 0),
-                                "target": pull.get("target_volume", 0),
-                                "price": pull.get("price_per_ton", pull.get("price", 0)),
+                                "volume": get_safe_float(pull.get("current_volume"), 0),
+                                "target": get_safe_float(pull.get("target_volume"), 0),
+                                "price": get_safe_float(
+                                    pull.get("price_per_ton", pull.get("price")), 0
+                                ),
                                 "status": pull_status,
                                 "id": canonical_pull_id,
                             }
@@ -37391,9 +41720,11 @@ async def filter_deals_by_status(callback: types.CallbackQuery):
                             {
                                 "index": pull.get("id"),
                                 "culture": pull.get("culture", "N/A"),
-                                "volume": pull.get("current_volume", 0),
-                                "target": pull.get("target_volume", 0),
-                                "price": pull.get("price_per_ton", pull.get("price", 0)),
+                                "volume": get_safe_float(pull.get("current_volume"), 0),
+                                "target": get_safe_float(pull.get("target_volume"), 0),
+                                "price": get_safe_float(
+                                    pull.get("price_per_ton", pull.get("price")), 0
+                                ),
                                 "status": pull_status,
                                 "id": canonical_pull_id,
                             }
@@ -37464,7 +41795,9 @@ async def filter_deals_by_status(callback: types.CallbackQuery):
                         continue
                     seen_delivery_ids.add(canonical_key)
                     ship_count += 1
-                    ship_status = delivery.get("status", "Открыт")
+                    ship_status = get_effective_delivery_status(
+                        delivery, linked_request
+                    )
 
                     logging.info(
                         f"      Доставка #{delivery.get('id', canonical_id)}: "
@@ -37491,7 +41824,7 @@ async def filter_deals_by_status(callback: types.CallbackQuery):
                                     or "N/A"
                                 ),
                                 "volume": delivery.get("volume", 0),
-                                "price": delivery.get("price", 0),
+                                "price": get_safe_float(delivery.get("price"), 0),
                                 "status": ship_status,
                                 "id": f"delivery_{canonical_id}",
                             }
@@ -37525,8 +41858,8 @@ async def filter_deals_by_status(callback: types.CallbackQuery):
                                     or delivery.get("to")
                                     or "N/A"
                                 ),
-                                "volume": delivery.get("volume", 0),
-                                "price": delivery.get("price", 0),
+                                "volume": get_safe_float(delivery.get("volume"), 0),
+                                "price": get_safe_float(delivery.get("price"), 0),
                                 "status": ship_status,
                                 "id": f"delivery_{canonical_id}",
                             }
@@ -37553,7 +41886,9 @@ async def filter_deals_by_status(callback: types.CallbackQuery):
                         continue
                     seen_offer_ids.add(canonical_key)
                     offer_count += 1
-                    offer_status = offer.get("status", "Открыт")
+                    offer_status = get_effective_expeditor_offer_status(
+                        "route", offer
+                    )
 
                     logging.info(
                         f"      Маршрут #{offer.get('id')}: {offer.get('from_port')}→{offer.get('to_port')} → статус='{offer_status}'"
@@ -37578,8 +41913,8 @@ async def filter_deals_by_status(callback: types.CallbackQuery):
                                     or offer.get("to")
                                     or "N/A"
                                 ),
-                                "volume": offer.get("max_volume", 0),
-                                "price": offer.get("price", 0),
+                                "volume": get_safe_float(offer.get("max_volume"), 0),
+                                "price": get_safe_float(offer.get("price"), 0),
                                 "status": offer_status,
                                 "id": f"offer_{canonical_id}",
                             }
@@ -37608,8 +41943,8 @@ async def filter_deals_by_status(callback: types.CallbackQuery):
                                     or offer.get("to")
                                     or "N/A"
                                 ),
-                                "volume": offer.get("max_volume", 0),
-                                "price": offer.get("price", 0),
+                                "volume": get_safe_float(offer.get("max_volume"), 0),
+                                "price": get_safe_float(offer.get("price"), 0),
                                 "status": offer_status,
                                 "id": f"offer_{canonical_id}",
                             }
@@ -37671,9 +42006,8 @@ async def filter_deals_by_status(callback: types.CallbackQuery):
                     continue
                 seen_request_ids.add(canonical_key)
                 request_count += 1
-                req_status = delivery.get("status", "Открыт")
-                req_status_effective = normalize_transition_status(
-                    linked_request.get("status") or req_status
+                req_status = get_effective_delivery_status(
+                    delivery, linked_request
                 )
                 route_from = delivery.get("route_from") or delivery.get("from_city") or delivery.get(
                     "from"
@@ -37686,7 +42020,7 @@ async def filter_deals_by_status(callback: types.CallbackQuery):
                     matches_status = True
                 elif search_status == "active":
                     matches_status = status_in_group(
-                        req_status_effective,
+                        req_status,
                         {
                             "active",
                             "open",
@@ -37700,7 +42034,7 @@ async def filter_deals_by_status(callback: types.CallbackQuery):
                         },
                     )
                 else:
-                    matches_status = status_in_group(req_status_effective, {search_status})
+                    matches_status = status_in_group(req_status, {search_status})
 
                 if not matches_status:
                     continue
@@ -37710,8 +42044,8 @@ async def filter_deals_by_status(callback: types.CallbackQuery):
                         "index": delivery.get("id", canonical_id),
                         "from": route_from,
                         "to": route_to,
-                        "volume": delivery.get("volume", 0),
-                        "price": delivery.get("price", 0),
+                        "volume": get_safe_float(delivery.get("volume"), 0),
+                        "price": get_safe_float(delivery.get("price"), 0),
                         "status": req_status,
                         "id": f"delivery_{canonical_id}",
                     }
@@ -37776,7 +42110,9 @@ async def filter_deals_by_status(callback: types.CallbackQuery):
                         "closed": "🔒",
                         "filled": "✅",
                         "shipped": "🚢",
+                        "sold": "🎯",
                         "completed": "🎉",
+                        "cancelled": "❌",
                     }
                     status_icon = status_emoji_map.get(
                         normalize_transition_status(item["status"]), "❓"
@@ -38161,17 +42497,17 @@ async def show_deal_detail(callback: types.CallbackQuery):
                         text += "━━━━━━━━━━━━━━━━━━━━━━\n"
                         text += f"🌾 Культура: <b>{pull.get('culture', '—')}</b>\n"
                         text += (
-                            f"📦 Объём: <b>{pull.get('current_volume', 0):,.1f}/"
-                            f"{pull.get('target_volume', 0):,.1f} т</b>\n"
+                            f"📦 Объём: <b>{get_safe_float(pull.get('current_volume'), 0):,.1f}/"
+                            f"{get_safe_float(pull.get('target_volume'), 0):,.1f} т</b>\n"
                         )
                         text += f"🏗️ Порт: <b>{pull.get('port', '—')}</b>\n"
                         text += (
-                            f"💰 Цена/т: <b>{pull.get('price_per_ton', 0):,.1f} ₽</b>\n"
+                            f"💰 Цена/т: <b>{get_safe_float(pull.get('price_per_ton', pull.get('price')), 0):,.1f} ₽</b>\n"
                         )
                         text += f"📊 Статус: <b>{pull_status.upper()}</b>\n"
 
                         exporter_id = pull.get("exporter_id") or pull.get("creator_id")
-                        if exporter_id and exporter_id in users:
+                        if exporter_id and get_user_by_id(exporter_id):
                             exporter = get_user_by_id(exporter_id) or {}
                             text += "\n<b>📤 ЭКСПОРТЕР</b>\n"
                             text += "━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -38189,13 +42525,13 @@ async def show_deal_detail(callback: types.CallbackQuery):
                             text += "━━━━━━━━━━━━━━━━━━━━━━\n"
                             for idx_p, p in enumerate(participants, 1):
                                 text += f"{idx_p}. <b>{p.get('farmer_name', 'Unknown')}</b>\n"
-                                text += f"   📦 {p.get('volume', 0):,.1f} т\n"
+                                text += f"   📦 {get_safe_float(p.get('volume'), 0):,.1f} т\n"
 
                         # Логистика + экспедиторы
                         logistics, logistics_id = get_logistics_by_pull(pull_id)
                         selected_logist_id = get_assigned_logist_id(pull)
                         selected_expeditor_id = get_assigned_expeditor_id(pull)
-                        if logistics and logistics.get("logist_id") in users:
+                        if logistics and get_user_by_id(logistics.get("logist_id")):
                             logist = get_user_by_id(logistics.get("logist_id")) or {}
                             text += "\n<b>🚚 ЛОГИСТ</b>\n"
                             text += "━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -38220,7 +42556,7 @@ async def show_deal_detail(callback: types.CallbackQuery):
                                     expeditors_list, 1
                                 ):
                                     exp_user_id = expeditor.get("user_id")
-                                    if exp_user_id and exp_user_id in users:
+                                    if exp_user_id and get_user_by_id(exp_user_id):
                                         expeditor_user = get_user_by_id(exp_user_id) or {}
                                         text += f"{idx_exp}. <b>{expeditor_user.get('name', 'Не указано')}</b>\n"
                                         text += (
@@ -38343,7 +42679,7 @@ async def show_deal_detail(callback: types.CallbackQuery):
                                 text += f"   📦 Партия: {volume:,.1f} т\n"
                                 text += f"   ⭐ Класс: {p.get('quality_class', '—')}\n"
 
-                                if farmer_id and farmer_id in users:
+                                if farmer_id and get_user_by_id(farmer_id):
                                     farmer = get_user_by_id(farmer_id) or {}
                                     text += f"   ☎️ {farmer.get('phone', '—')}\n"
                         else:
@@ -38354,7 +42690,7 @@ async def show_deal_detail(callback: types.CallbackQuery):
                         logistics, logistics_id = get_logistics_by_pull(pull_id)
                         selected_logist_id = get_assigned_logist_id(pull)
                         selected_expeditor_id = get_assigned_expeditor_id(pull)
-                        if logistics and logistics.get("logist_id") in users:
+                        if logistics and get_user_by_id(logistics.get("logist_id")):
                             logist = get_user_by_id(logistics.get("logist_id")) or {}
                             text += "\n<b>🚚 ЛОГИСТ</b>\n"
                             text += "━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -38379,7 +42715,7 @@ async def show_deal_detail(callback: types.CallbackQuery):
                                     expeditors_list, 1
                                 ):
                                     exp_user_id = expeditor.get("user_id")
-                                    if exp_user_id and exp_user_id in users:
+                                    if exp_user_id and get_user_by_id(exp_user_id):
                                         exp_user = get_user_by_id(exp_user_id) or {}
                                         text += f"{idx_e}. <b>{exp_user.get('name', 'Не указано')}</b>\n"
                                         text += (
@@ -38502,10 +42838,21 @@ async def show_deal_detail(callback: types.CallbackQuery):
                     if not (is_admin or same_id(owner_logist_id, user_id)):
                         text = "❌ <b>Нет доступа к доставке</b>"
                     else:
-                        current_status = normalize_transition_status(
-                            linked_request.get("status")
-                            or request.get("status", "pending")
-                        )
+                        if item_id_str.startswith("delivery_"):
+                            current_status = get_effective_delivery_status(
+                                request, linked_request
+                            )
+                        else:
+                            current_status = get_effective_request_status(
+                                request.get("id", deal_id),
+                                "exporter",
+                                request,
+                                request_exporter_id=(
+                                    request.get("exporter_id")
+                                    or request.get("customer_id")
+                                    or request.get("created_by")
+                                ),
+                            )
                         route_from = (
                             request.get("route_from")
                             or request.get("from_city")
@@ -38532,7 +42879,7 @@ async def show_deal_detail(callback: types.CallbackQuery):
                         text = "<b>🚚 ДОСТАВКА ЛОГИСТА</b>\n\n"
                         text += f"🆔 ID: <b>#{request.get('id', deal_id)}</b>\n"
                         text += f"📍 Маршрут: <b>{route_from} → {route_to}</b>\n"
-                        text += f"📦 Объём: <b>{request.get('volume', 0):,.1f} т</b>\n"
+                        text += f"📦 Объём: <b>{get_safe_float(request.get('volume'), 0):,.1f} т</b>\n"
                         text += f"💰 Цена: <b>{request_price:,.0f} ₽</b>\n"
                         text += f"📊 Статус: <b>{status_map.get(current_status, current_status)}</b>\n"
 
@@ -38688,9 +43035,8 @@ async def show_deal_detail(callback: types.CallbackQuery):
                                         linked_request_id
                                     )
                                 linked_request = linked_request if isinstance(linked_request, dict) else {}
-                            req_status = normalize_transition_status(
-                                linked_request.get("status")
-                                or delivery.get("status", "in_progress")
+                            req_status = get_effective_delivery_status(
+                                delivery, linked_request
                             )
                             route_from = (
                                 delivery.get("route_from")
@@ -38717,11 +43063,11 @@ async def show_deal_detail(callback: types.CallbackQuery):
                             text = "<b>✈️ ДОСТАВКА ЭКСПЕДИТОРА</b>\n\n"
                             text += f"🆔 ID: <b>#{delivery.get('id', delivery_id)}</b>\n"
                             text += f"📍 Маршрут: <b>{route_from} → {route_to}</b>\n"
-                            text += f"📦 Объём: <b>{delivery.get('volume', 0):,.1f} т</b>\n"
+                            text += f"📦 Объём: <b>{get_safe_float(delivery.get('volume'), 0):,.1f} т</b>\n"
                             text += f"💰 Цена: <b>{req_price:,.0f} ₽</b>\n"
                             text += f"📊 Статус: <b>{status_map.get(req_status, req_status)}</b>\n"
 
-                            if req_status in {"in_progress", "expeditor_selected"} and not is_admin:
+                            if req_status == "in_progress" and not is_admin:
                                 keyboard.add(
                                     InlineKeyboardButton(
                                         "✅ Завершить доставку",
@@ -38759,8 +43105,31 @@ async def show_deal_detail(callback: types.CallbackQuery):
                     ):
                         text = "❌ <b>Нет доступа к заявке</b>"
                     else:
-                        req_status = normalize_transition_status(
-                            request.get("status", "in_progress")
+                        request_owner_id = (
+                            request.get("owner_id")
+                            or request.get("exporter_id")
+                            or request.get("farmer_id")
+                            or request.get("user_id")
+                        )
+                        if not request_owner_id:
+                            legacy_logist_owner_id = request.get("logist_id")
+                            has_assigned_logist_id = bool(
+                                request.get("assigned_logist_id")
+                                or request.get("selected_logistic")
+                            )
+                            if legacy_logist_owner_id and not has_assigned_logist_id:
+                                request_owner_id = legacy_logist_owner_id
+
+                        req_status = get_effective_request_status(
+                            request.get("id", req_id),
+                            request_source,
+                            request,
+                            request_owner_id=request_owner_id,
+                            request_exporter_id=(
+                                request_owner_id
+                                if request_source == "exporter"
+                                else request.get("exporter_id")
+                            ),
                         )
                         route_from = (
                             request.get("route_from")
@@ -38787,11 +43156,11 @@ async def show_deal_detail(callback: types.CallbackQuery):
                         text = "<b>✈️ ДОСТАВКА ЭКСПЕДИТОРА</b>\n\n"
                         text += f"🆔 ID: <b>#{request.get('id', req_id)}</b>\n"
                         text += f"📍 Маршрут: <b>{route_from} → {route_to}</b>\n"
-                        text += f"📦 Объём: <b>{request.get('volume', 0):,.1f} т</b>\n"
+                        text += f"📦 Объём: <b>{get_safe_float(request.get('volume'), 0):,.1f} т</b>\n"
                         text += f"💰 Цена: <b>{req_price:,.0f} ₽</b>\n"
                         text += f"📊 Статус: <b>{status_map.get(req_status, req_status)}</b>\n"
 
-                        if req_status in {"in_progress", "expeditor_selected"} and not is_admin:
+                        if req_status == "in_progress" and not is_admin:
                             request_id_for_delivery = request.get("id", req_id)
                             linked_delivery_id = request.get("delivery_id")
                             if linked_delivery_id is None:
@@ -38840,7 +43209,9 @@ async def show_deal_detail(callback: types.CallbackQuery):
                     elif not (is_admin or same_id(freight.get("expeditor_id"), user_id)):
                         text = "❌ <b>Нет доступа к маршруту</b>"
                     else:
-                        current_status = normalize_transition_status(freight.get("status", "active"))
+                        current_status = get_effective_expeditor_offer_status(
+                            "route", freight
+                        )
                         from_port = (
                             freight.get("from_port")
                             or freight.get("route_from")
@@ -38857,18 +43228,15 @@ async def show_deal_detail(callback: types.CallbackQuery):
                         text += f"🆔 ID: <b>#{freight.get('id', deal_id)}</b>\n"
                         text += f"📍 Маршрут: <b>{from_port} → {to_port}</b>\n"
                         text += (
-                            f"📦 Объём: <b>{freight.get('max_volume', freight.get('volume', 0)):,.1f} т</b>\n"
+                            f"📦 Объём: <b>{get_safe_float(freight.get('max_volume', freight.get('volume')), 0):,.1f} т</b>\n"
                         )
-                        text += f"💰 Цена: <b>{freight.get('price', 0):,.0f} ₽</b>\n"
+                        text += f"💰 Цена: <b>{get_safe_float(freight.get('price'), 0):,.0f} ₽</b>\n"
                         text += f"📊 Статус: <b>{status_map.get(current_status, current_status)}</b>\n"
 
                         if current_status in {
-                            "active",
-                            "open",
                             "accepted",
                             "selected",
                             "assigned",
-                            "pending",
                         } and not is_admin:
                             keyboard.add(
                                 InlineKeyboardButton(
@@ -38945,22 +43313,25 @@ async def change_farmer_batch_status(callback: types.CallbackQuery):
 
         user_batches = get_user_batches(user_id)
 
-        try:
-            deal_id_int = int(deal_id)
-        except (ValueError, TypeError):
+        deal_id_value = int(deal_id) if str(deal_id).isdigit() else str(deal_id).strip()
+        if deal_id_value == "":
             await callback.answer("❌ Ошибка ID батча", show_alert=True)
             return
 
         batch = None
         batch_idx = None
         for idx, candidate in enumerate(user_batches):
-            if same_id(candidate.get("id"), deal_id_int):
+            if same_id(candidate.get("id"), deal_id_value):
                 batch = candidate
                 batch_idx = idx
                 break
-        if batch is None and 0 <= deal_id_int < len(user_batches):
-            batch = user_batches[deal_id_int]
-            batch_idx = deal_id_int
+        if (
+            batch is None
+            and isinstance(deal_id_value, int)
+            and 0 <= deal_id_value < len(user_batches)
+        ):
+            batch = user_batches[deal_id_value]
+            batch_idx = deal_id_value
         if batch is None:
             await callback.answer("❌ Батч не найден", show_alert=True)
             return
@@ -39141,7 +43512,6 @@ async def change_logist_delivery_status(callback: types.CallbackQuery):
             await callback.answer("❌ Нет доступа", show_alert=True)
             return
 
-        old_status = normalize_transition_status(delivery.get("status", "pending"))
         new_status = normalize_transition_status(new_status)
         delivery_source = str(delivery.get("source") or "").strip().lower()
         if delivery_source == "logistic":
@@ -39191,6 +43561,43 @@ async def change_logist_delivery_status(callback: types.CallbackQuery):
                     )
                     return
 
+        if source == "shipping_requests":
+            request_owner_id_for_status = None
+            request_exporter_id_for_status = None
+            if delivery_source == "farmer":
+                request_owner_id_for_status = delivery.get("farmer_id") or delivery.get(
+                    "user_id"
+                )
+            elif delivery_source == "logistics":
+                request_owner_id_for_status = (
+                    delivery.get("customer_id")
+                    or delivery.get("created_by")
+                    or delivery.get("exporter_id")
+                )
+                if not request_owner_id_for_status:
+                    legacy_logist_owner_id = delivery.get("logist_id")
+                    has_assigned_logist_id = bool(
+                        delivery.get("assigned_logist_id")
+                        or delivery.get("selected_logistic")
+                    )
+                    if legacy_logist_owner_id and not has_assigned_logist_id:
+                        request_owner_id_for_status = legacy_logist_owner_id
+            else:
+                request_exporter_id_for_status = (
+                    delivery.get("exporter_id")
+                    or delivery.get("customer_id")
+                    or delivery.get("created_by")
+                )
+            old_status = get_effective_request_status(
+                delivery.get("id", delivery_id),
+                delivery_source,
+                delivery,
+                request_owner_id=request_owner_id_for_status,
+                request_exporter_id=request_exporter_id_for_status,
+            )
+        else:
+            old_status = get_effective_delivery_status(delivery)
+
         valid = {
             "pending": ["in_progress", "cancelled"],
             "active": ["in_progress", "cancelled"],
@@ -39220,7 +43627,11 @@ async def change_logist_delivery_status(callback: types.CallbackQuery):
             return
         if new_status != old_status and source == "shipping_requests":
             linked_request_id_for_expeditor_guard = delivery.get("id", delivery_id)
-            linked_exporter_id_for_expeditor_guard = delivery.get("exporter_id")
+            linked_exporter_id_for_expeditor_guard = (
+                delivery.get("exporter_id")
+                or delivery.get("customer_id")
+                or delivery.get("created_by")
+            )
             for linked_delivery in deliveries.values():
                 if not isinstance(linked_delivery, dict):
                     continue
@@ -39229,9 +43640,18 @@ async def change_logist_delivery_status(callback: types.CallbackQuery):
                     linked_request_id_for_expeditor_guard,
                 ):
                     continue
-                if linked_exporter_id_for_expeditor_guard and not same_id(
-                    linked_delivery.get("exporter_id"),
-                    linked_exporter_id_for_expeditor_guard,
+                linked_delivery_owner_id = (
+                    linked_delivery.get("exporter_id")
+                    or linked_delivery.get("customer_id")
+                    or linked_delivery.get("created_by")
+                )
+                if (
+                    linked_exporter_id_for_expeditor_guard
+                    and linked_delivery_owner_id not in {None, ""}
+                    and not same_id(
+                        linked_delivery_owner_id,
+                        linked_exporter_id_for_expeditor_guard,
+                    )
                 ):
                     continue
                 linked_delivery_source = str(
@@ -39289,13 +43709,20 @@ async def change_logist_delivery_status(callback: types.CallbackQuery):
             linked_request_id = delivery.get("request_id")
             linked_offer_id = delivery.get("offer_id")
             if delivery_source == "farmer":
-                delivery_owner_id = delivery.get("farmer_id")
+                delivery_owner_id = delivery.get("farmer_id") or delivery.get("user_id")
             elif delivery_source == "logistics":
                 delivery_owner_id = (
                     delivery.get("customer_id")
                     or delivery.get("created_by")
                     or delivery.get("exporter_id")
-                    or delivery.get("logist_id")
+                    or (
+                        delivery.get("logist_id")
+                        if not (
+                            delivery.get("assigned_logist_id")
+                            or delivery.get("selected_logistic")
+                        )
+                        else None
+                    )
                 )
             else:
                 delivery_owner_id = delivery.get("exporter_id")
@@ -39305,8 +43732,15 @@ async def change_logist_delivery_status(callback: types.CallbackQuery):
                 if delivery_source == "exporter":
                     _, req = find_shipping_request_by_id(linked_request_id)
                     if isinstance(req, dict):
-                        if delivery_owner_id and not same_id(
-                            req.get("exporter_id"), delivery_owner_id
+                        req_owner_id = (
+                            req.get("exporter_id")
+                            or req.get("customer_id")
+                            or req.get("created_by")
+                        )
+                        if (
+                            delivery_owner_id
+                            and req_owner_id not in {None, ""}
+                            and not same_id(req_owner_id, delivery_owner_id)
                         ):
                             req = None
                 elif delivery_source == "logistics":
@@ -39318,17 +43752,58 @@ async def change_logist_delivery_status(callback: types.CallbackQuery):
                             req.get("customer_id")
                             or req.get("created_by")
                             or req.get("exporter_id")
-                            or req.get("logist_id")
+                            or (
+                                req.get("logist_id")
+                                if not (
+                                    req.get("assigned_logist_id")
+                                    or req.get("selected_logistic")
+                                )
+                                else None
+                            )
                         )
-                        if delivery_owner_id and not same_id(
-                            req_owner_id, delivery_owner_id
+                        if (
+                            delivery_owner_id
+                            and req_owner_id not in {None, ""}
+                            and not same_id(req_owner_id, delivery_owner_id)
                         ):
                             req = None
                 elif delivery_source == "farmer":
                     _, req = find_farmer_request_by_id(linked_request_id)
+                    if isinstance(req, dict):
+                        req_owner_id = req.get("farmer_id") or req.get("user_id")
+                        if (
+                            delivery_owner_id
+                            and req_owner_id not in {None, ""}
+                            and not same_id(req_owner_id, delivery_owner_id)
+                        ):
+                            req = None
 
                 if isinstance(req, dict):
-                    req_status_norm = normalize_transition_status(req.get("status"))
+                    req_status_norm = get_effective_request_status(
+                        linked_request_id,
+                        delivery_source,
+                        req,
+                        request_owner_id=(
+                            req.get("farmer_id")
+                            or req.get("user_id")
+                            or req.get("customer_id")
+                            or req.get("created_by")
+                            or req.get("exporter_id")
+                            or (
+                                req.get("logist_id")
+                                if not (
+                                    req.get("assigned_logist_id")
+                                    or req.get("selected_logistic")
+                                )
+                                else None
+                            )
+                        ),
+                        request_exporter_id=(
+                            req.get("exporter_id")
+                            or req.get("customer_id")
+                            or req.get("created_by")
+                        ),
+                    )
                     if req_status_norm in {"completed", "cancelled"} and new_status != "completed":
                         req = None
                 if isinstance(req, dict):
@@ -39364,15 +43839,15 @@ async def change_logist_delivery_status(callback: types.CallbackQuery):
                         continue
                     status_norm = normalize_transition_status(offer.get("status"))
                     if new_status == "in_progress":
-                        if status_norm in {"accepted", "assigned", "in_progress"}:
+                        if status_norm in SELECTED_LOGISTIC_OFFER_STATUSES:
                             offer["status"] = "in_progress"
                             touched_logistic_offers = True
                     elif new_status == "pending":
-                        if status_norm in {"in_progress", "assigned", "accepted"}:
+                        if status_norm in SELECTED_LOGISTIC_OFFER_STATUSES:
                             offer["status"] = "accepted"
                             touched_logistic_offers = True
                     elif new_status == "completed":
-                        if status_norm in {"accepted", "assigned", "in_progress"}:
+                        if status_norm in SELECTED_LOGISTIC_OFFER_STATUSES:
                             offer["status"] = "completed"
                             offer["completed_at"] = datetime.now().strftime(
                                 "%Y-%m-%d %H:%M:%S"
@@ -39388,38 +43863,60 @@ async def change_logist_delivery_status(callback: types.CallbackQuery):
             elif linked_offer_id is not None:
                 _, offer = find_logistic_offer_by_id(linked_offer_id)
                 if isinstance(offer, dict):
+                    offer_status_norm = normalize_transition_status(offer.get("status"))
+                    offer_changed = False
                     if new_status == "in_progress":
-                        offer["status"] = "in_progress"
+                        if offer_status_norm in SELECTED_LOGISTIC_OFFER_STATUSES:
+                            offer["status"] = "in_progress"
+                            offer_changed = True
                     elif new_status == "pending":
-                        offer["status"] = "accepted"
+                        if offer_status_norm in SELECTED_LOGISTIC_OFFER_STATUSES:
+                            offer["status"] = "accepted"
+                            offer_changed = True
                     elif new_status == "completed":
-                        offer["status"] = "completed"
-                        offer["completed_at"] = datetime.now().strftime(
-                            "%Y-%m-%d %H:%M:%S"
-                        )
+                        if offer_status_norm in SELECTED_LOGISTIC_OFFER_STATUSES:
+                            offer["status"] = "completed"
+                            offer["completed_at"] = datetime.now().strftime(
+                                "%Y-%m-%d %H:%M:%S"
+                            )
+                            offer_changed = True
                     elif new_status == "cancelled":
-                        offer["status"] = "cancelled"
-                        offer["cancelled_at"] = datetime.now().strftime(
-                            "%Y-%m-%d %H:%M:%S"
-                        )
-                    touched_logistic_offers = True
+                        if offer_status_norm not in {"completed", "cancelled", "rejected"}:
+                            offer["status"] = "cancelled"
+                            offer["cancelled_at"] = datetime.now().strftime(
+                                "%Y-%m-%d %H:%M:%S"
+                            )
+                            offer_changed = True
+                    if offer_changed:
+                        touched_logistic_offers = True
 
             save_deliveries()
         else:
             linked_request_id = delivery.get("id", delivery_id)
-            linked_exporter_id = delivery.get("exporter_id")
+            linked_exporter_id = (
+                delivery.get("exporter_id")
+                or delivery.get("customer_id")
+                or delivery.get("created_by")
+            )
             for deliv in deliveries.values():
                 if not isinstance(deliv, dict):
                     continue
                 if not same_id(deliv.get("request_id"), linked_request_id):
                     continue
-                if linked_exporter_id and not same_id(
-                    deliv.get("exporter_id"), linked_exporter_id
+                deliv_owner_id = (
+                    deliv.get("exporter_id")
+                    or deliv.get("customer_id")
+                    or deliv.get("created_by")
+                )
+                if (
+                    linked_exporter_id
+                    and deliv_owner_id not in {None, ""}
+                    and not same_id(deliv_owner_id, linked_exporter_id)
                 ):
                     continue
                 if str(deliv.get("source") or "").strip().lower() not in {"", "exporter"}:
                     continue
-                if normalize_transition_status(deliv.get("status")) in {"completed", "cancelled"}:
+                if get_effective_delivery_status(deliv) in {"completed", "cancelled"}:
                     continue
                 deliv["status"] = new_status
                 if new_status == "in_progress":
@@ -39432,49 +43929,37 @@ async def change_logist_delivery_status(callback: types.CallbackQuery):
                     deliv["cancelled_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 touched_shipping_requests = True
 
-            for offer in logistic_offers.values():
-                if not isinstance(offer, dict):
-                    continue
-                if not logistic_offer_matches_request(offer, linked_request_id, "exporter"):
-                    continue
-                if new_status == "in_progress":
-                    if normalize_transition_status(offer.get("status")) in {
-                        "accepted",
-                        "assigned",
-                        "in_progress",
-                    }:
-                        offer["status"] = "in_progress"
-                        touched_logistic_offers = True
-                elif new_status == "pending":
-                    if normalize_transition_status(offer.get("status")) in {
-                        "in_progress",
-                        "assigned",
-                        "accepted",
-                    }:
-                        offer["status"] = "accepted"
-                        touched_logistic_offers = True
-                elif new_status == "completed":
-                    if normalize_transition_status(offer.get("status")) in {
-                        "accepted",
-                        "assigned",
-                        "in_progress",
-                    }:
-                        offer["status"] = "completed"
-                        offer["completed_at"] = datetime.now().strftime(
-                            "%Y-%m-%d %H:%M:%S"
-                        )
-                        touched_logistic_offers = True
-                elif new_status == "cancelled":
-                    if normalize_transition_status(offer.get("status")) not in {
-                        "completed",
-                        "cancelled",
-                        "rejected",
-                    }:
-                        offer["status"] = "cancelled"
-                        offer["cancelled_at"] = datetime.now().strftime(
-                            "%Y-%m-%d %H:%M:%S"
-                        )
-                        touched_logistic_offers = True
+                for offer in logistic_offers.values():
+                    if not isinstance(offer, dict):
+                        continue
+                    if not logistic_offer_matches_request(offer, linked_request_id, "exporter"):
+                        continue
+                    if new_status == "in_progress":
+                        if normalize_transition_status(offer.get("status")) in SELECTED_LOGISTIC_OFFER_STATUSES:
+                            offer["status"] = "in_progress"
+                            touched_logistic_offers = True
+                    elif new_status == "pending":
+                        if normalize_transition_status(offer.get("status")) in SELECTED_LOGISTIC_OFFER_STATUSES:
+                            offer["status"] = "accepted"
+                            touched_logistic_offers = True
+                    elif new_status == "completed":
+                        if normalize_transition_status(offer.get("status")) in SELECTED_LOGISTIC_OFFER_STATUSES:
+                            offer["status"] = "completed"
+                            offer["completed_at"] = datetime.now().strftime(
+                                "%Y-%m-%d %H:%M:%S"
+                            )
+                            touched_logistic_offers = True
+                    elif new_status == "cancelled":
+                        if normalize_transition_status(offer.get("status")) not in {
+                            "completed",
+                            "cancelled",
+                            "rejected",
+                        }:
+                            offer["status"] = "cancelled"
+                            offer["cancelled_at"] = datetime.now().strftime(
+                                "%Y-%m-%d %H:%M:%S"
+                            )
+                            touched_logistic_offers = True
 
             save_shipping_requests()
             save_deliveries()
@@ -39486,9 +43971,16 @@ async def change_logist_delivery_status(callback: types.CallbackQuery):
             delivery.get("customer_id")
             or delivery.get("created_by")
             or delivery.get("exporter_id")
-            or delivery.get("logist_id")
+            or (
+                delivery.get("logist_id")
+                if not (
+                    delivery.get("assigned_logist_id") or delivery.get("selected_logistic")
+                )
+                else None
+            )
         )
         if delivery_source in {"exporter", "farmer", "logistics"}:
+            all_pulls = pulls.get("pulls", {}) if isinstance(pulls, dict) else {}
             for deal in deals.values():
                 if not isinstance(deal, dict):
                     continue
@@ -39505,12 +43997,32 @@ async def change_logist_delivery_status(callback: types.CallbackQuery):
                         continue
                 if deal_source != delivery_source:
                     continue
-                if delivery_source == "exporter" and linked_exporter_id_for_deal and not same_id(
-                    deal.get("exporter_id"), linked_exporter_id_for_deal
+                deal_pull_id = deal.get("pull_id")
+                deal_pull = all_pulls.get(deal_pull_id) or all_pulls.get(str(deal_pull_id), {})
+                deal_exporter_id = (
+                    deal.get("exporter_id")
+                    or deal_pull.get("exporter_id")
+                    or deal_pull.get("creator_id")
+                )
+                if (
+                    delivery_source == "exporter"
+                    and linked_exporter_id_for_deal
+                    and deal_exporter_id not in {None, ""}
+                    and not same_id(deal_exporter_id, linked_exporter_id_for_deal)
                 ):
                     continue
-                if delivery_source == "farmer" and linked_owner_id_for_deal and not same_id(
-                    deal.get("farmer_id"), linked_owner_id_for_deal
+                deal_farmer_ids = deal.get("farmer_ids") or []
+                legacy_farmer_id = deal.get("farmer_id")
+                if legacy_farmer_id not in {None, ""} and not any(
+                    same_id(legacy_farmer_id, fid) for fid in deal_farmer_ids
+                ):
+                    deal_farmer_ids = [*deal_farmer_ids, legacy_farmer_id]
+                if (
+                    delivery_source == "farmer"
+                    and linked_owner_id_for_deal
+                    and not any(
+                        same_id(fid, linked_owner_id_for_deal) for fid in deal_farmer_ids
+                    )
                 ):
                     continue
                 if delivery_source == "logistics" and linked_owner_id_for_deal and not same_id(
@@ -39521,8 +44033,8 @@ async def change_logist_delivery_status(callback: types.CallbackQuery):
                     linked_owner_id_for_deal,
                 ):
                     continue
-                deal_status_norm = normalize_transition_status(deal.get("status"))
-                if deal_status_norm in {"completed", "cancelled"}:
+                deal_effective_status = get_effective_deal_status(deal)
+                if deal_effective_status in {"completed", "cancelled"}:
                     continue
                 if new_status == "completed":
                     deal["status"] = "completed"
@@ -39532,18 +44044,19 @@ async def change_logist_delivery_status(callback: types.CallbackQuery):
                     deal["status"] = "cancelled"
                     deal["cancelled_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     touched_deals = True
-                elif new_status == "pending" and deal_status_norm in {"in_progress"}:
+                elif new_status == "pending" and deal_effective_status == "in_progress":
                     deal["status"] = "assigned"
                     touched_deals = True
-                elif new_status == "in_progress" and deal_status_norm in {
-                    "pending",
-                    "assigned",
-                    "accepted",
-                    "new",
-                    "active",
-                }:
+                elif (
+                    new_status == "in_progress"
+                    and deal_effective_status != "in_progress"
+                    and deal_effective_status
+                    not in {"completed", "cancelled"}
+                ):
                     deal["status"] = "in_progress"
-                    deal["started_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    deal.setdefault(
+                        "started_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    )
                     touched_deals = True
 
             if linked_request_id_for_deal is not None and new_status in {
@@ -39703,6 +44216,9 @@ async def change_expeditor_freight_status(callback: types.CallbackQuery):
         if request_source_guard == "logistic":
             request_source_guard = "logistics"
         if request_source_guard not in {"exporter", "farmer", "logistics"}:
+            if linked_request_id_guard is None and linked_delivery_id_guard is None:
+                # Standalone-маршрут без привязки к заявке/доставке.
+                request_source_guard = "exporter"
             if linked_delivery_id_guard is not None:
                 _, delivery_guard_for_source = find_delivery_by_id(linked_delivery_id_guard)
                 if isinstance(delivery_guard_for_source, dict):
@@ -39746,8 +44262,9 @@ async def change_expeditor_freight_status(callback: types.CallbackQuery):
                         show_alert=True,
                     )
                     return
+        req_guard = None
+        has_selected_expeditor_guard = False
         if linked_request_id_guard is not None:
-            req_guard = None
             if request_source_guard == "farmer":
                 _, req_guard = find_farmer_request_by_id(linked_request_id_guard)
             elif request_source_guard == "logistics":
@@ -39760,6 +44277,39 @@ async def change_expeditor_freight_status(callback: types.CallbackQuery):
                 _, req_guard = find_shipping_request_by_id(linked_request_id_guard)
             if isinstance(req_guard, dict):
                 assigned_expeditor_id_guard = get_assigned_expeditor_id(req_guard)
+                request_owner_id_guard = None
+                request_exporter_id_guard = None
+                if request_source_guard == "farmer":
+                    request_owner_id_guard = req_guard.get("farmer_id") or req_guard.get(
+                        "user_id"
+                    )
+                elif request_source_guard == "logistics":
+                    request_owner_id_guard = (
+                        req_guard.get("customer_id")
+                        or req_guard.get("created_by")
+                        or req_guard.get("exporter_id")
+                    )
+                    if not request_owner_id_guard:
+                        legacy_logist_owner_id = req_guard.get("logist_id")
+                        has_assigned_logist_id = bool(
+                            req_guard.get("assigned_logist_id")
+                            or req_guard.get("selected_logistic")
+                        )
+                        if legacy_logist_owner_id and not has_assigned_logist_id:
+                            request_owner_id_guard = legacy_logist_owner_id
+                else:
+                    request_exporter_id_guard = (
+                        req_guard.get("exporter_id")
+                        or req_guard.get("customer_id")
+                        or req_guard.get("created_by")
+                    )
+                req_guard_status = get_effective_request_status(
+                    linked_request_id_guard,
+                    request_source_guard,
+                    req_guard,
+                    request_owner_id=request_owner_id_guard,
+                    request_exporter_id=request_exporter_id_guard,
+                )
                 if assigned_expeditor_id_guard and not same_id(
                     assigned_expeditor_id_guard, user_id
                 ):
@@ -39768,10 +44318,41 @@ async def change_expeditor_freight_status(callback: types.CallbackQuery):
                         show_alert=True,
                     )
                     return
+                if assigned_expeditor_id_guard and same_id(
+                    assigned_expeditor_id_guard, user_id
+                ):
+                    has_selected_expeditor_guard = True
+                if (
+                    new_status == "in_progress"
+                    and req_guard_status in {"completed", "cancelled"}
+                ):
+                    await callback.answer(
+                        "❌ Нельзя перевести в работу: связанная заявка уже закрыта",
+                        show_alert=True,
+                    )
+                    return
+                if new_status == "completed":
+                    if req_guard_status == "completed":
+                        await callback.answer(
+                            "ℹ️ Связанная заявка уже завершена",
+                            show_alert=True,
+                        )
+                        return
+                    if req_guard_status == "cancelled":
+                        await callback.answer(
+                            "❌ Нельзя завершить маршрут: связанная заявка отменена",
+                            show_alert=True,
+                        )
+                        return
+        delivery_guard = None
         if linked_delivery_id_guard is not None:
             _, delivery_guard = find_delivery_by_id(linked_delivery_id_guard)
             if isinstance(delivery_guard, dict):
                 assigned_delivery_expeditor = get_assigned_expeditor_id(delivery_guard)
+                delivery_guard_status = get_effective_delivery_status(
+                    delivery_guard,
+                    req_guard if isinstance(req_guard, dict) else None,
+                )
                 if assigned_delivery_expeditor and not same_id(
                     assigned_delivery_expeditor, user_id
                 ):
@@ -39780,6 +44361,42 @@ async def change_expeditor_freight_status(callback: types.CallbackQuery):
                         show_alert=True,
                     )
                     return
+                if assigned_delivery_expeditor and same_id(
+                    assigned_delivery_expeditor, user_id
+                ):
+                    has_selected_expeditor_guard = True
+                if (
+                    new_status == "in_progress"
+                    and delivery_guard_status in {"completed", "cancelled"}
+                ):
+                    await callback.answer(
+                        "❌ Нельзя перевести в работу: связанная доставка уже закрыта",
+                        show_alert=True,
+                    )
+                    return
+                if new_status == "completed":
+                    if delivery_guard_status == "completed":
+                        await callback.answer(
+                            "ℹ️ Связанная доставка уже завершена",
+                            show_alert=True,
+                        )
+                        return
+                    if delivery_guard_status == "cancelled":
+                        await callback.answer(
+                            "❌ Нельзя завершить маршрут: связанная доставка отменена",
+                            show_alert=True,
+                        )
+                        return
+        if (
+            new_status in {"in_progress", "completed"}
+            and (linked_request_id_guard is not None or linked_delivery_id_guard is not None)
+            and not has_selected_expeditor_guard
+        ):
+            await callback.answer(
+                "❌ Маршрут ещё не выбран заказчиком",
+                show_alert=True,
+            )
+            return
 
         # ✅ ЕСЛИ СТАТУС "completed" - закрываем ТОЛЬКО связанные сущности
         if new_status == "completed":
@@ -39804,6 +44421,8 @@ async def change_expeditor_freight_status(callback: types.CallbackQuery):
             if request_source == "logistic":
                 request_source = "logistics"
             if request_source not in {"exporter", "farmer", "logistics"}:
+                if linked_request_id is None and linked_delivery_id is None:
+                    request_source = "exporter"
                 if linked_delivery_id is not None:
                     _, linked_delivery_obj = find_delivery_by_id(linked_delivery_id)
                     if isinstance(linked_delivery_obj, dict):
@@ -39890,10 +44509,11 @@ async def change_expeditor_freight_status(callback: types.CallbackQuery):
                             show_alert=True,
                         )
                         return
-                    req_status = normalize_transition_status(req_obj.get("status"))
                     linked_exporter_id = req_obj.get("exporter_id")
                     if request_source == "farmer":
-                        request_owner_id = req_obj.get("farmer_id")
+                        request_owner_id = req_obj.get("farmer_id") or req_obj.get(
+                            "user_id"
+                        )
                     elif request_source == "logistics":
                         request_owner_id = (
                             req_obj.get("customer_id")
@@ -39903,6 +44523,17 @@ async def change_expeditor_freight_status(callback: types.CallbackQuery):
                         )
                     else:
                         request_owner_id = req_obj.get("exporter_id")
+                    req_status = get_effective_request_status(
+                        linked_request_id,
+                        request_source,
+                        req_obj,
+                        request_owner_id=request_owner_id,
+                        request_exporter_id=(
+                            req_obj.get("exporter_id")
+                            or req_obj.get("customer_id")
+                            or req_obj.get("created_by")
+                        ),
+                    )
                     if req_status not in {"completed", "cancelled"}:
                         req_obj["expeditor_id"] = user_id
                         req_obj["selected_expeditor"] = user_id
@@ -39932,10 +44563,10 @@ async def change_expeditor_freight_status(callback: types.CallbackQuery):
                                 offer_status_norm = normalize_transition_status(
                                     offer.get("status")
                                 )
-                                if offer_status_norm in {"accepted", "in_progress", "assigned"}:
+                                if offer_status_norm in SELECTED_LOGISTIC_OFFER_STATUSES:
                                     offer["status"] = "completed"
                                     offer["completed_at"] = now_str
-                                elif offer_status_norm in {"pending", "active", "new", "open"}:
+                                elif offer_status_norm in OPEN_LOGISTIC_OFFER_STATUSES:
                                     offer["status"] = "rejected"
                                     offer["rejected_at"] = now_str
                                     offer["rejection_reason"] = "Заявка завершена экспедитором"
@@ -39965,18 +44596,12 @@ async def change_expeditor_freight_status(callback: types.CallbackQuery):
                             if exp_status in {"completed", "cancelled", "rejected"}:
                                 continue
                             if same_id(exp_offer.get("expeditor_id"), user_id):
-                                if exp_status not in {"accepted", "assigned", "in_progress"}:
+                                if exp_status not in SELECTED_EXPEDITOR_OFFER_STATUSES:
                                     continue
                                 exp_offer["status"] = "completed"
                                 exp_offer["completed_at"] = now_str
                             else:
-                                if exp_status not in {
-                                    "accepted",
-                                    "assigned",
-                                    "in_progress",
-                                    "pending",
-                                    "active",
-                                }:
+                                if exp_status not in MUTABLE_EXPEDITOR_OFFER_STATUSES:
                                     continue
                                 exp_offer["status"] = "rejected"
                                 exp_offer["rejected_at"] = now_str
@@ -39987,6 +44612,50 @@ async def change_expeditor_freight_status(callback: types.CallbackQuery):
                         if expeditor_request_offers_updated:
                             save_expeditor_data()
 
+                        expeditor_routes_updated = False
+                        for exp_route in expeditor_offers.values():
+                            if not isinstance(exp_route, dict):
+                                continue
+                            if not same_id(exp_route.get("request_id"), linked_request_id):
+                                continue
+                            route_source = str(exp_route.get("source") or "").strip().lower()
+                            if route_source == "logistic":
+                                route_source = "logistics"
+                            if route_source not in {"exporter", "farmer", "logistics"}:
+                                inferred_source = infer_logistic_offer_source(
+                                    exp_route.get("request_id")
+                                )
+                                if inferred_source in {"exporter", "farmer", "logistics"}:
+                                    route_source = inferred_source
+                                else:
+                                    continue
+                            if request_source == "exporter":
+                                if route_source not in {"", "exporter"}:
+                                    continue
+                            elif route_source != request_source:
+                                continue
+                            route_status = normalize_transition_status(
+                                exp_route.get("status") or "pending"
+                            )
+                            if route_status in {"completed", "cancelled", "rejected"}:
+                                continue
+                            if same_id(exp_route.get("id"), freight.get("id", freight_id)):
+                                if route_status not in SELECTED_EXPEDITOR_OFFER_STATUSES:
+                                    continue
+                                exp_route["status"] = "completed"
+                                exp_route["completed_at"] = now_str
+                            else:
+                                if route_status not in MUTABLE_EXPEDITOR_OFFER_STATUSES:
+                                    continue
+                                exp_route["status"] = "rejected"
+                                exp_route["rejected_at"] = now_str
+                                exp_route["rejection_reason"] = (
+                                    "Заявка завершена выбранным экспедитором"
+                                )
+                            expeditor_routes_updated = True
+                        if expeditor_routes_updated:
+                            save_expeditor_offers()
+
             # Финализируем пул только если нет активных заявок по этому pull_id.
             if isinstance(pull_obj, dict) and linked_pull_id is not None and not pull_terminal:
                 has_open_pull_requests = False
@@ -39995,11 +44664,25 @@ async def change_expeditor_freight_status(callback: types.CallbackQuery):
                         continue
                     if not same_id(req.get("pull_id"), linked_pull_id):
                         continue
-                    if pull_owner_id and not same_id(req.get("exporter_id"), pull_owner_id):
+                    req_owner_id = (
+                        req.get("exporter_id")
+                        or req.get("customer_id")
+                        or req.get("created_by")
+                    )
+                    if (
+                        pull_owner_id
+                        and req_owner_id not in {None, ""}
+                        and not same_id(req_owner_id, pull_owner_id)
+                    ):
                         continue
                     if str(req.get("source") or "").strip().lower() not in {"", "exporter"}:
                         continue
-                    req_status = normalize_transition_status(req.get("status"))
+                    req_status = get_effective_request_status(
+                        req.get("id"),
+                        "exporter",
+                        req,
+                        request_exporter_id=pull_owner_id,
+                    )
                     if req_status not in {"completed", "cancelled", "rejected"}:
                         has_open_pull_requests = True
                         break
@@ -40013,11 +44696,27 @@ async def change_expeditor_freight_status(callback: types.CallbackQuery):
                             req.get("customer_id")
                             or req.get("created_by")
                             or req.get("exporter_id")
-                            or req.get("logist_id")
+                            or (
+                                req.get("logist_id")
+                                if not (
+                                    req.get("assigned_logist_id")
+                                    or req.get("selected_logistic")
+                                )
+                                else None
+                            )
                         )
-                        if pull_owner_id and not same_id(req_owner_id, pull_owner_id):
+                        if (
+                            pull_owner_id
+                            and req_owner_id not in {None, ""}
+                            and not same_id(req_owner_id, pull_owner_id)
+                        ):
                             continue
-                        req_status = normalize_transition_status(req.get("status"))
+                        req_status = get_effective_request_status(
+                            req.get("id"),
+                            "logistics",
+                            req,
+                            request_owner_id=req_owner_id,
+                        )
                         if req_status not in {"completed", "cancelled", "rejected"}:
                             has_open_pull_requests = True
                             break
@@ -40080,11 +44779,11 @@ async def change_expeditor_freight_status(callback: types.CallbackQuery):
                     if pull_offer_status in {"completed", "cancelled", "rejected"}:
                         continue
                     if same_id(pull_offer.get("expeditor_id"), user_id):
-                        if pull_offer_status not in {"accepted", "assigned", "in_progress"}:
+                        if pull_offer_status not in SELECTED_EXPEDITOR_OFFER_STATUSES:
                             continue
                         pull_offer["status"] = "completed"
                         pull_offer["completed_at"] = now_str
-                    elif pull_offer_status in {"accepted", "active", "pending", "in_progress"}:
+                    elif pull_offer_status in MUTABLE_EXPEDITOR_OFFER_STATUSES:
                         pull_offer["status"] = "rejected"
                         pull_offer["rejected_at"] = now_str
                         pull_offer["rejection_reason"] = "Пул завершён выбранным экспедитором"
@@ -40096,6 +44795,14 @@ async def change_expeditor_freight_status(callback: types.CallbackQuery):
             for delivery in deliveries.values():
                 if not isinstance(delivery, dict):
                     continue
+                delivery_exporter_owner_id = (
+                    delivery.get("exporter_id")
+                    or delivery.get("customer_id")
+                    or delivery.get("created_by")
+                )
+                delivery_farmer_owner_id = (
+                    delivery.get("farmer_id") or delivery.get("user_id")
+                )
                 is_target_delivery = False
                 if (
                     linked_delivery_id is not None
@@ -40119,7 +44826,7 @@ async def change_expeditor_freight_status(callback: types.CallbackQuery):
                             request_sync_source == "farmer"
                             and (
                                 request_owner_id is None
-                                or same_id(delivery.get("farmer_id"), request_owner_id)
+                                or same_id(delivery_farmer_owner_id, request_owner_id)
                             )
                         )
                         or (
@@ -40130,7 +44837,14 @@ async def change_expeditor_freight_status(callback: types.CallbackQuery):
                                     delivery.get("customer_id")
                                     or delivery.get("created_by")
                                     or delivery.get("exporter_id")
-                                    or delivery.get("logist_id"),
+                                    or (
+                                        delivery.get("logist_id")
+                                        if not (
+                                            delivery.get("assigned_logist_id")
+                                            or delivery.get("selected_logistic")
+                                        )
+                                        else None
+                                    ),
                                     request_owner_id,
                                 )
                             )
@@ -40139,7 +44853,8 @@ async def change_expeditor_freight_status(callback: types.CallbackQuery):
                             request_sync_source == "exporter"
                             and (
                                 linked_exporter_id is None
-                                or same_id(delivery.get("exporter_id"), linked_exporter_id)
+                                or delivery_exporter_owner_id in {None, ""}
+                                or same_id(delivery_exporter_owner_id, linked_exporter_id)
                             )
                         )
                     )
@@ -40164,7 +44879,8 @@ async def change_expeditor_freight_status(callback: types.CallbackQuery):
                         delivery.get("expeditor_id"), user_id
                     ):
                         continue
-                    if normalize_transition_status(delivery.get("status")) in {
+                    delivery_effective_status = get_effective_delivery_status(delivery)
+                    if delivery_effective_status in {
                         "completed",
                         "cancelled",
                     }:
@@ -40179,11 +44895,12 @@ async def change_expeditor_freight_status(callback: types.CallbackQuery):
                 save_deliveries()
 
             # Связанные сделки (legacy и текущие сценарии)
+            all_pulls = pulls.get("pulls", {}) if isinstance(pulls, dict) else {}
             for deal in deals.values():
                 if not isinstance(deal, dict):
                     continue
-                deal_status = normalize_transition_status(deal.get("status"))
-                if deal_status in {"completed", "cancelled"}:
+                deal_effective_status = get_effective_deal_status(deal)
+                if deal_effective_status in {"completed", "cancelled"}:
                     continue
                 deal_source = str(deal.get("source") or "").strip().lower()
                 if deal_source == "logistic":
@@ -40194,6 +44911,19 @@ async def change_expeditor_freight_status(callback: types.CallbackQuery):
                         deal_source = inferred_source
                     else:
                         continue
+                deal_farmer_ids = deal.get("farmer_ids") or []
+                legacy_farmer_id = deal.get("farmer_id")
+                if legacy_farmer_id not in {None, ""} and not any(
+                    same_id(legacy_farmer_id, fid) for fid in deal_farmer_ids
+                ):
+                    deal_farmer_ids = [*deal_farmer_ids, legacy_farmer_id]
+                deal_pull_id = deal.get("pull_id")
+                deal_pull = all_pulls.get(deal_pull_id) or all_pulls.get(str(deal_pull_id), {})
+                deal_exporter_id = (
+                    deal.get("exporter_id")
+                    or deal_pull.get("exporter_id")
+                    or deal_pull.get("creator_id")
+                )
 
                 same_pull = (
                     pull_terminal
@@ -40209,12 +44939,13 @@ async def change_expeditor_freight_status(callback: types.CallbackQuery):
                     and (
                         request_sync_source != "exporter"
                         or linked_exporter_id is None
-                        or same_id(deal.get("exporter_id"), linked_exporter_id)
+                        or deal_exporter_id in {None, ""}
+                        or same_id(deal_exporter_id, linked_exporter_id)
                     )
                     and (
                         request_sync_source != "farmer"
                         or request_owner_id is None
-                        or same_id(deal.get("farmer_id"), request_owner_id)
+                        or any(same_id(fid, request_owner_id) for fid in deal_farmer_ids)
                     )
                     and (
                         request_sync_source != "logistics"
@@ -40263,6 +44994,8 @@ async def change_expeditor_freight_status(callback: types.CallbackQuery):
             if request_source == "logistic":
                 request_source = "logistics"
             if request_source not in {"exporter", "farmer", "logistics"}:
+                if linked_request_id is None and linked_delivery_id is None:
+                    request_source = "exporter"
                 if linked_delivery_id is not None:
                     _, linked_delivery_obj = find_delivery_by_id(linked_delivery_id)
                     if isinstance(linked_delivery_obj, dict):
@@ -40350,7 +45083,6 @@ async def change_expeditor_freight_status(callback: types.CallbackQuery):
                         pull_obj["shipped_at"] = now_str
                         touched_pulls = True
                         updated_items += 1
-
                 for pull_offer in expeditor_pull_offers.values():
                     if not isinstance(pull_offer, dict):
                         continue
@@ -40361,7 +45093,7 @@ async def change_expeditor_freight_status(callback: types.CallbackQuery):
                     pull_offer_status = normalize_transition_status(
                         pull_offer.get("status") or "pending"
                     )
-                    if pull_offer_status in {"accepted", "assigned", "in_progress"}:
+                    if pull_offer_status in SELECTED_EXPEDITOR_OFFER_STATUSES:
                         pull_offer["status"] = "in_progress"
                         pull_offer["started_at"] = now_str
                         touched_expeditor_data = True
@@ -40390,7 +45122,9 @@ async def change_expeditor_freight_status(callback: types.CallbackQuery):
                         linked_exporter_id = req_obj.get("exporter_id")
                         if request_source == "farmer":
                             touched_farmer_requests = True
-                            request_owner_id = req_obj.get("farmer_id")
+                            request_owner_id = req_obj.get("farmer_id") or req_obj.get(
+                                "user_id"
+                            )
                         elif request_source == "logistics":
                             touched_logistics_requests = True
                             request_owner_id = (
@@ -40410,7 +45144,7 @@ async def change_expeditor_freight_status(callback: types.CallbackQuery):
                     if not logistic_offer_matches_request(offer, linked_request_id, request_source):
                         continue
                     offer_status = normalize_transition_status(offer.get("status"))
-                    if offer_status in {"accepted", "assigned", "in_progress"}:
+                    if offer_status in SELECTED_LOGISTIC_OFFER_STATUSES:
                         offer["status"] = "in_progress"
                         offer["started_at"] = now_str
                         touched_logistic_offers = True
@@ -40438,7 +45172,7 @@ async def change_expeditor_freight_status(callback: types.CallbackQuery):
                     exp_status = normalize_transition_status(
                         exp_offer.get("status") or "pending"
                     )
-                    if exp_status in {"accepted", "assigned", "in_progress"}:
+                    if exp_status in SELECTED_EXPEDITOR_OFFER_STATUSES:
                         exp_offer["status"] = "in_progress"
                         exp_offer["started_at"] = now_str
                         touched_expeditor_data = True
@@ -40446,6 +45180,14 @@ async def change_expeditor_freight_status(callback: types.CallbackQuery):
             for delivery in deliveries.values():
                 if not isinstance(delivery, dict):
                     continue
+                delivery_exporter_owner_id = (
+                    delivery.get("exporter_id")
+                    or delivery.get("customer_id")
+                    or delivery.get("created_by")
+                )
+                delivery_farmer_owner_id = (
+                    delivery.get("farmer_id") or delivery.get("user_id")
+                )
                 is_target_delivery = False
                 if (
                     linked_delivery_id is not None
@@ -40468,7 +45210,7 @@ async def change_expeditor_freight_status(callback: types.CallbackQuery):
                             request_source == "farmer"
                             and (
                                 request_owner_id is None
-                                or same_id(delivery.get("farmer_id"), request_owner_id)
+                                or same_id(delivery_farmer_owner_id, request_owner_id)
                             )
                         )
                         or (
@@ -40479,7 +45221,14 @@ async def change_expeditor_freight_status(callback: types.CallbackQuery):
                                     delivery.get("customer_id")
                                     or delivery.get("created_by")
                                     or delivery.get("exporter_id")
-                                    or delivery.get("logist_id"),
+                                    or (
+                                        delivery.get("logist_id")
+                                        if not (
+                                            delivery.get("assigned_logist_id")
+                                            or delivery.get("selected_logistic")
+                                        )
+                                        else None
+                                    ),
                                     request_owner_id,
                                 )
                             )
@@ -40488,7 +45237,8 @@ async def change_expeditor_freight_status(callback: types.CallbackQuery):
                             request_source == "exporter"
                             and (
                                 linked_exporter_id is None
-                                or same_id(delivery.get("exporter_id"), linked_exporter_id)
+                                or delivery_exporter_owner_id in {None, ""}
+                                or same_id(delivery_exporter_owner_id, linked_exporter_id)
                             )
                         )
                     )
@@ -40513,7 +45263,7 @@ async def change_expeditor_freight_status(callback: types.CallbackQuery):
                     delivery.get("expeditor_id"), user_id
                 ):
                     continue
-                deliv_status = normalize_transition_status(delivery.get("status"))
+                deliv_status = get_effective_delivery_status(delivery)
                 if deliv_status in {"completed", "cancelled"}:
                     continue
                 delivery["expeditor_id"] = user_id
@@ -40523,6 +45273,7 @@ async def change_expeditor_freight_status(callback: types.CallbackQuery):
                 updated_items += 1
 
             if linked_request_id is not None:
+                all_pulls = pulls.get("pulls", {}) if isinstance(pulls, dict) else {}
                 for deal in deals.values():
                     if not isinstance(deal, dict):
                         continue
@@ -40539,29 +45290,61 @@ async def change_expeditor_freight_status(callback: types.CallbackQuery):
                             continue
                     if deal_source != request_source:
                         continue
-                    if request_source == "exporter" and linked_exporter_id and not same_id(
-                        deal.get("exporter_id"), linked_exporter_id
+                    deal_pull_id = deal.get("pull_id")
+                    deal_pull = all_pulls.get(deal_pull_id) or all_pulls.get(str(deal_pull_id), {})
+                    deal_exporter_id = (
+                        deal.get("exporter_id")
+                        or deal_pull.get("exporter_id")
+                        or deal_pull.get("creator_id")
+                    )
+                    if (
+                        request_source == "exporter"
+                        and linked_exporter_id
+                        and deal_exporter_id not in {None, ""}
+                        and not same_id(deal_exporter_id, linked_exporter_id)
                     ):
                         continue
-                    if request_source == "farmer" and request_owner_id and not same_id(
-                        deal.get("farmer_id"), request_owner_id
+                    if (
+                        request_source == "farmer"
+                        and request_owner_id
+                        and (
+                            (deal.get("farmer_ids") or [])
+                            or (deal.get("farmer_id") not in {None, ""})
+                        )
+                        and not any(
+                            same_id(fid, request_owner_id)
+                            for fid in [
+                                *(deal.get("farmer_ids") or []),
+                                *(
+                                    []
+                                    if deal.get("farmer_id") in {None, ""}
+                                    else [deal.get("farmer_id")]
+                                ),
+                            ]
+                        )
                     ):
                         continue
-                    if request_source == "logistics" and request_owner_id and not same_id(
+                    deal_owner_id = (
                         deal.get("customer_id")
                         or deal.get("created_by")
                         or deal.get("exporter_id")
-                        or deal.get("logist_id"),
-                        request_owner_id,
+                        or deal.get("logist_id")
+                    )
+                    if (
+                        request_source == "logistics"
+                        and request_owner_id
+                        and deal_owner_id not in {None, ""}
+                        and not same_id(deal_owner_id, request_owner_id)
                     ):
                         continue
-                    deal_status = normalize_transition_status(deal.get("status"))
-                    if deal_status in {"completed", "cancelled"}:
+                    deal_effective_status = get_effective_deal_status(deal)
+                    if deal_effective_status in {"completed", "cancelled"}:
                         continue
-                    if deal_status in {"pending", "assigned", "accepted", "new", "open", "active"}:
-                        deal["status"] = "in_progress"
-                        deal["started_at"] = now_str
-                        touched_deals = True
+                    if deal_effective_status == "in_progress":
+                        continue
+                    deal["status"] = "in_progress"
+                    deal.setdefault("started_at", now_str)
+                    touched_deals = True
 
             if touched_pulls:
                 save_pulls_to_pickle()
@@ -40649,7 +45432,8 @@ async def change_pull_status(callback: types.CallbackQuery):
         if len(parts) < 2:
             await callback.answer("❌ Некорректные данные", show_alert=True)
             return
-        pull_id = int(parts[1])
+        pull_id_raw = parts[1]
+        pull_id = int(pull_id_raw) if str(pull_id_raw).isdigit() else pull_id_raw
         user_id = callback.from_user.id
 
         all_pulls = pulls.get("pulls", {})
@@ -40741,7 +45525,8 @@ async def confirm_pull_status(callback: types.CallbackQuery):
         if len(parts) < 3:
             await callback.answer("❌ Некорректные данные", show_alert=True)
             return
-        pull_id = int(parts[1])
+        pull_id_raw = parts[1]
+        pull_id = int(pull_id_raw) if str(pull_id_raw).isdigit() else pull_id_raw
         new_status = normalize_transition_status(parts[2])
         if not new_status:
             await callback.answer("❌ Не указан статус", show_alert=True)
@@ -40788,8 +45573,8 @@ async def confirm_pull_status(callback: types.CallbackQuery):
 
         # Валидации статусов
         if new_status == "filled":
-            current = pull.get("current_volume", 0)
-            target = pull.get("target_volume", 0)
+            current = get_safe_float(pull.get("current_volume"), 0)
+            target = get_safe_float(pull.get("target_volume"), 0)
             if current < target:
                 await callback.answer(
                     f"⚠️ Пул не полностью заполнен!\n{current:.0f}/{target:.0f}т",
@@ -40856,7 +45641,16 @@ async def confirm_pull_status(callback: types.CallbackQuery):
                     continue
                 if not same_id(req.get("pull_id"), pull_id):
                     continue
-                if pull_owner_id and not same_id(req.get("exporter_id"), pull_owner_id):
+                req_owner_id = (
+                    req.get("exporter_id")
+                    or req.get("customer_id")
+                    or req.get("created_by")
+                )
+                if (
+                    pull_owner_id
+                    and req_owner_id not in {None, ""}
+                    and not same_id(req_owner_id, pull_owner_id)
+                ):
                     continue
                 if str(req.get("source") or "").strip().lower() not in {"", "exporter"}:
                     continue
@@ -40864,7 +45658,12 @@ async def confirm_pull_status(callback: types.CallbackQuery):
                 if req_id is not None:
                     affected_request_ids.add(req_id)
                     affected_requests_by_id[str(req_id)] = req
-                req_status = normalize_transition_status(req.get("status"))
+                req_status = get_effective_request_status(
+                    req.get("id"),
+                    "exporter",
+                    req,
+                    request_exporter_id=pull_owner_id,
+                )
                 if req_status in {"completed", "cancelled"}:
                     continue
                 req["status"] = target_status
@@ -40874,13 +45673,31 @@ async def confirm_pull_status(callback: types.CallbackQuery):
             for delivery in deliveries.values():
                 if not isinstance(delivery, dict):
                     continue
-                if not same_id(delivery.get("pull_id"), pull_id):
+                linked_by_pull = same_id(delivery.get("pull_id"), pull_id)
+                linked_by_request = any(
+                    same_id(delivery.get("request_id"), req_id)
+                    for req_id in affected_request_ids
+                )
+                if not (linked_by_pull or linked_by_request):
                     continue
-                if pull_owner_id and not same_id(delivery.get("exporter_id"), pull_owner_id):
+                delivery_owner_id = (
+                    delivery.get("exporter_id")
+                    or delivery.get("customer_id")
+                    or delivery.get("created_by")
+                )
+                if (
+                    pull_owner_id
+                    and delivery_owner_id not in {None, ""}
+                    and not same_id(delivery_owner_id, pull_owner_id)
+                ):
                     continue
                 if str(delivery.get("source") or "").strip().lower() not in {"", "exporter"}:
                     continue
-                delivery_status = normalize_transition_status(delivery.get("status"))
+                linked_request = affected_requests_by_id.get(str(delivery.get("request_id")))
+                delivery_status = get_effective_delivery_status(
+                    delivery,
+                    linked_request if isinstance(linked_request, dict) else None,
+                )
                 if delivery_status in {"completed", "cancelled"}:
                     continue
                 delivery["status"] = target_status
@@ -40890,12 +45707,28 @@ async def confirm_pull_status(callback: types.CallbackQuery):
             for deal in deals.values():
                 if not isinstance(deal, dict):
                     continue
-                if not same_id(deal.get("pull_id"), pull_id):
+                linked_by_pull = same_id(deal.get("pull_id"), pull_id)
+                linked_by_request = any(
+                    same_id(deal.get("request_id"), req_id)
+                    for req_id in affected_request_ids
+                )
+                if not (linked_by_pull or linked_by_request):
                     continue
-                if pull_owner_id and not same_id(deal.get("exporter_id"), pull_owner_id):
+                deal_pull_id = deal.get("pull_id")
+                deal_pull = all_pulls.get(deal_pull_id) or all_pulls.get(str(deal_pull_id), {})
+                deal_exporter_id = (
+                    deal.get("exporter_id")
+                    or deal_pull.get("exporter_id")
+                    or deal_pull.get("creator_id")
+                )
+                if (
+                    pull_owner_id
+                    and deal_exporter_id not in {None, ""}
+                    and not same_id(deal_exporter_id, pull_owner_id)
+                ):
                     continue
-                deal_status = normalize_transition_status(deal.get("status"))
-                if deal_status in {"completed", "cancelled"}:
+                deal_effective_status = get_effective_deal_status(deal)
+                if deal_effective_status in {"completed", "cancelled"}:
                     continue
                 deal["status"] = target_status
                 deal[timestamp_field] = now_sql
@@ -40916,11 +45749,11 @@ async def confirm_pull_status(callback: types.CallbackQuery):
 
                     offer_status = normalize_transition_status(offer.get("status"))
                     if target_status == "completed":
-                        if offer_status in {"accepted", "assigned", "in_progress"}:
+                        if offer_status in SELECTED_LOGISTIC_OFFER_STATUSES:
                             offer["status"] = "completed"
                             offer["completed_at"] = now_sql
                             touched_logistic_offers = True
-                        elif offer_status in {"pending", "active", "new", "open"}:
+                        elif offer_status in OPEN_LOGISTIC_OFFER_STATUSES:
                             offer["status"] = "rejected"
                             offer["rejected_at"] = now_sql
                             offer["rejection_reason"] = "Пул завершён"
@@ -40958,32 +45791,16 @@ async def confirm_pull_status(callback: types.CallbackQuery):
                         if assigned_expeditor_id and same_id(
                             exp_offer.get("expeditor_id"), assigned_expeditor_id
                         ):
-                            if exp_status in {"accepted", "assigned", "in_progress"}:
+                            if exp_status in SELECTED_EXPEDITOR_OFFER_STATUSES:
                                 exp_offer["status"] = "completed"
                                 exp_offer["completed_at"] = now_sql
                                 touched_expeditor_request_offers = True
-                        elif exp_status in {
-                            "accepted",
-                            "assigned",
-                            "in_progress",
-                            "pending",
-                            "active",
-                            "new",
-                            "open",
-                        }:
+                        elif exp_status in MUTABLE_EXPEDITOR_OFFER_STATUSES:
                             exp_offer["status"] = "rejected"
                             exp_offer["rejected_at"] = now_sql
                             exp_offer["rejection_reason"] = "Пул завершён"
                             touched_expeditor_request_offers = True
-                    elif exp_status in {
-                        "accepted",
-                        "assigned",
-                        "in_progress",
-                        "pending",
-                        "active",
-                        "new",
-                        "open",
-                    }:
+                    elif exp_status in MUTABLE_EXPEDITOR_OFFER_STATUSES:
                         exp_offer["status"] = "rejected"
                         exp_offer["rejected_at"] = now_sql
                         exp_offer["rejection_reason"] = "Пул отменён экспортёром"
@@ -41013,10 +45830,10 @@ async def confirm_pull_status(callback: types.CallbackQuery):
                     continue
 
                 if target_status == "completed":
-                    if route_status in {"accepted", "assigned", "in_progress"}:
+                    if route_status in SELECTED_EXPEDITOR_OFFER_STATUSES:
                         exp_route["status"] = "completed"
                         exp_route["completed_at"] = now_sql
-                    elif route_status in {"pending", "active", "new", "open"}:
+                    elif route_status in MUTABLE_EXPEDITOR_OFFER_STATUSES:
                         exp_route["status"] = "rejected"
                         exp_route["rejected_at"] = now_sql
                         exp_route["rejection_reason"] = "Пул завершён"
@@ -41101,7 +45918,16 @@ async def confirm_pull_status(callback: types.CallbackQuery):
                 continue
             if not same_id(req.get("pull_id"), pull_id):
                 continue
-            if pull_owner_id and not same_id(req.get("exporter_id"), pull_owner_id):
+            req_owner_id = (
+                req.get("exporter_id")
+                or req.get("customer_id")
+                or req.get("created_by")
+            )
+            if (
+                pull_owner_id
+                and req_owner_id not in {None, ""}
+                and not same_id(req_owner_id, pull_owner_id)
+            ):
                 continue
             req_logist_id = get_assigned_logist_id(req)
             if req_logist_id:
@@ -41111,7 +45937,16 @@ async def confirm_pull_status(callback: types.CallbackQuery):
                 continue
             if not same_id(delivery.get("pull_id"), pull_id):
                 continue
-            if pull_owner_id and not same_id(delivery.get("exporter_id"), pull_owner_id):
+            delivery_owner_id = (
+                delivery.get("exporter_id")
+                or delivery.get("customer_id")
+                or delivery.get("created_by")
+            )
+            if (
+                pull_owner_id
+                and delivery_owner_id not in {None, ""}
+                and not same_id(delivery_owner_id, pull_owner_id)
+            ):
                 continue
             delivery_logist_id = get_assigned_logist_id(delivery)
             if delivery_logist_id:
@@ -41120,9 +45955,9 @@ async def confirm_pull_status(callback: types.CallbackQuery):
         # Фермеры-участники через pullparticipants
         participants = pullparticipants.get(pull_id) or pullparticipants.get(str(pull_id), [])
         farmer_ids = set(
-            p.get("farmer_id")
+            p.get("farmer_id") or p.get("user_id")
             for p in participants
-            if p.get("farmer_id")
+            if p.get("farmer_id") or p.get("user_id")
         )
         all_notify_ids = farmer_ids | logist_ids
         normalized_notify_ids = []
@@ -41148,7 +45983,7 @@ async def confirm_pull_status(callback: types.CallbackQuery):
             "<b>✅ Статус пула изменился!</b>\n\n"
             f"📤 Пул: <b>#{pull_id}</b>\n"
             f"🌾 Культура: <b>{pull.get('culture', 'Не указана')}</b>\n"
-            f"📊 Объём: <b>{pull.get('current_volume', 0):,.1f} т</b>\n"
+            f"📊 Объём: <b>{get_safe_float(pull.get('current_volume'), 0):,.1f} т</b>\n"
             f"🔄 Было: {status_map.get(old_status, old_status)}\n"
             f"➡️ Стало: <b>{status_map.get(new_status, new_status)}</b>\n"
             f"📅 Время: {pull['updated_at']}"
@@ -41268,14 +46103,16 @@ async def view_pools_alias(callback: types.CallbackQuery, state: FSMContext):
     keyboard = InlineKeyboardMarkup(row_width=1)
     for pull in open_pulls[:10]:
         pull_id = pull.get("pull_id")
+        current_volume = get_safe_float(pull.get("current_volume"), 0)
+        target_volume = get_safe_float(pull.get("target_volume"), 0)
         progress = (
-            pull.get("current_volume", 0) / pull.get("target_volume", 1) * 100
-            if pull.get("target_volume", 1) > 0
+            (current_volume / target_volume * 100)
+            if target_volume > 0
             else 0
         )
         keyboard.add(
             InlineKeyboardButton(
-                f"🌾 {pull.get('culture', '?')} - {pull.get('target_volume', 0)}т ({progress:.0f}%)",
+                f"🌾 {pull.get('culture', '?')} - {target_volume:.0f}т ({progress:.0f}%)",
                 callback_data=f"view_pull:{pull_id}",
             )
         )
@@ -41313,30 +46150,22 @@ async def back_to_deals_alias(callback: types.CallbackQuery, state: FSMContext):
 
 
 @dp.callback_query_handler(lambda c: c.data == "back_to_pools", state="*")
-async def back_to_pools_alias(callback: types.CallbackQuery):
-    await callback.message.edit_text(
-        "📋 Вернитесь к списку пулов.",
-        reply_markup=InlineKeyboardMarkup().add(
-            InlineKeyboardButton("◀️ К пулам", callback_data="back_to_pools_list")
-        ),
-    )
-    await callback.answer()
+async def back_to_pools_alias(callback: types.CallbackQuery, state: FSMContext):
+    """Legacy alias: возвращает в универсальный список пулов по роли."""
+    await state.finish()
+    await back_to_pulls(callback)
 
 
 @dp.callback_query_handler(lambda c: c.data == "expeditor_available_deals", state="*")
-async def expeditor_available_deals_alias(callback: types.CallbackQuery):
+async def expeditor_available_deals_alias(
+    callback: types.CallbackQuery, state: FSMContext
+):
     user_id = callback.from_user.id
     role = (get_user_by_id(user_id) or {}).get("role")
     if not (is_expeditor_role(role) or role == "admin"):
         await callback.answer("❌ Раздел доступен только экспедиторам", show_alert=True)
         return
-    await callback.message.edit_text(
-        "📋 Используйте меню экспедитора для просмотра сделок.",
-        reply_markup=InlineKeyboardMarkup().add(
-            InlineKeyboardButton("🏠 Главное меню", callback_data="back_to_main")
-        ),
-    )
-    await callback.answer()
+    await my_deals_callback(callback, state)
 
 
 @dp.callback_query_handler(
@@ -41353,15 +46182,17 @@ async def legacy_confirm_cancel_alias(callback: types.CallbackQuery, state: FSMC
 
 
 @dp.callback_query_handler(lambda c: c.data.startswith("edit_date_"), state="*")
-async def legacy_edit_date_alias(callback: types.CallbackQuery):
-    await callback.message.edit_text(
-        "ℹ️ Изменение даты в этом экране больше не поддерживается.\n"
-        "Откройте карточку предложения заново.",
-        reply_markup=InlineKeyboardMarkup().add(
-            InlineKeyboardButton("🏠 Главное меню", callback_data="back_to_main")
-        ),
-    )
-    await callback.answer()
+async def legacy_edit_date_alias(callback: types.CallbackQuery, state: FSMContext):
+    """Совместимость: старый edit_date_* перенаправляем в новый поток."""
+    await state.finish()
+    try:
+        offer_ref = callback.data.split("_")[-1]
+        offer_id = int(offer_ref) if str(offer_ref).isdigit() else offer_ref
+    except (IndexError, ValueError):
+        await callback.answer("❌ Ошибка данных", show_alert=True)
+        return
+    callback.data = f"edit_offer_field:delivery_date:{offer_id}"
+    await edit_offer_field(callback, state)
 
 
 @dp.callback_query_handler(lambda c: c.data == "edit_profile", state="*")
@@ -41496,13 +46327,7 @@ async def back_to_exp_deliveries_alias(callback: types.CallbackQuery, state: FSM
             assigned_expeditor_id = get_assigned_expeditor_id(linked_request)
         if not same_id(assigned_expeditor_id, user_id):
             continue
-        delivery_status_norm = normalize_transition_status(deliv.get("status"))
-        request_status_norm = normalize_transition_status(linked_request.get("status"))
-        effective_status = (
-            request_status_norm
-            if request_status_norm in {"in_progress", "expeditor_selected"}
-            else delivery_status_norm
-        )
+        effective_status = get_effective_delivery_status(deliv, linked_request)
         if effective_status not in {
             "in_progress",
             "expeditor_selected",
@@ -41646,7 +46471,7 @@ async def delivery_history_alias(callback: types.CallbackQuery, state: FSMContex
                 assigned_expeditor_id = get_assigned_expeditor_id(linked_request)
             if not same_id(assigned_expeditor_id, user_id):
                 continue
-            if normalize_transition_status(deliv.get("status")) != "completed":
+            if get_effective_delivery_status(deliv, linked_request) != "completed":
                 continue
             canonical_id = deliv.get("id", deliv_id)
             canonical_key = str(canonical_id)
@@ -41669,7 +46494,7 @@ async def delivery_history_alias(callback: types.CallbackQuery, state: FSMContex
         for deliv_id, deliv in completed[-10:]:
             text += (
                 f"🚚 <b>Доставка #{deliv_id}</b>\n"
-                f"   {deliv.get('culture', 'N/A')} | {(deliv.get('volume', 0) or 0):.0f} т\n"
+                f"   {deliv.get('culture', 'N/A')} | {get_safe_float(deliv.get('volume'), 0):.0f} т\n"
                 f"   ✅ Завершена: {deliv.get('completed_at', '—')}\n\n"
             )
 
@@ -41687,7 +46512,7 @@ async def delivery_history_alias(callback: types.CallbackQuery, state: FSMContex
                 continue
             if not same_id(get_assigned_logist_id(deliv), user_id):
                 continue
-            if normalize_transition_status(deliv.get("status")) != "completed":
+            if get_effective_delivery_status(deliv) != "completed":
                 continue
             canonical_id = deliv.get("id", deliv_id)
             canonical_key = str(canonical_id)
@@ -41713,7 +46538,7 @@ async def delivery_history_alias(callback: types.CallbackQuery, state: FSMContex
             text += (
                 f"🚚 <b>Доставка #{deliv_id}</b>\n"
                 f"   {(deliv.get('route_from') or deliv.get('from_city') or '—')} → {(deliv.get('route_to') or deliv.get('to_city') or '—')}\n"
-                f"   💰 {deliv.get('price', 0):,.0f} ₽\n\n".replace(",", " ")
+                f"   💰 {get_safe_float(deliv.get('price'), 0):,.0f} ₽\n\n".replace(",", " ")
             )
 
         kb = InlineKeyboardMarkup()
@@ -41761,8 +46586,18 @@ async def legacy_transport_callback_alias(
 @dp.callback_query_handler(state="*")
 async def unknown_callback_fallback(callback: types.CallbackQuery, state: FSMContext):
     """Последний fallback: не даём callback-ам зависать без ответа."""
-    await state.finish()
+    current_state = await state.get_state()
     await callback.answer("ℹ️ Эта кнопка больше не активна.", show_alert=False)
+    logging.info(
+        "Unknown callback ignored: data=%s user_id=%s state=%s",
+        callback.data,
+        callback.from_user.id if callback.from_user else None,
+        current_state,
+    )
+    # В активном FSM-сценарии не сбрасываем состояние и не перерисовываем сообщение,
+    # чтобы пользователь не терял прогресс текущей формы.
+    if current_state:
+        return
     try:
         await callback.message.edit_text(
             "ℹ️ Эта кнопка больше не поддерживается.\n"
