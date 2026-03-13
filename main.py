@@ -14607,6 +14607,44 @@ async def farmer_choose_expeditor(callback: types.CallbackQuery):
             "❌ По заявке уже есть закрытая доставка", show_alert=True
         )
         return
+    has_closed_deal = False
+    for deal in deals.values():
+        if not isinstance(deal, dict):
+            continue
+        if not same_id(deal.get("request_id"), request_id):
+            continue
+        deal_source = str(deal.get("source") or "").strip().lower()
+        if deal_source == "logistic":
+            deal_source = "logistics"
+        if deal_source != "farmer":
+            continue
+        deal_owner_id = (
+            deal.get("farmer_id")
+            or deal.get("user_id")
+            or deal.get("customer_id")
+            or deal.get("created_by")
+            or deal.get("exporter_id")
+        )
+        if (
+            farmer_id
+            and deal_owner_id not in {None, ""}
+            and not same_id(deal_owner_id, farmer_id)
+        ):
+            continue
+        deal_effective_status = get_effective_deal_status(deal)
+        if deal_effective_status in {"completed", "cancelled"}:
+            has_closed_deal = True
+            break
+        if deal_effective_status in {"in_progress", "expeditor_selected"}:
+            await callback.answer(
+                "❌ По заявке уже есть сделка в работе", show_alert=True
+            )
+            return
+    if has_closed_deal:
+        await callback.answer(
+            "❌ По заявке уже есть закрытая сделка", show_alert=True
+        )
+        return
 
     now_sql = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     request["selected_expeditor_id"] = exp_id
@@ -16088,6 +16126,12 @@ async def show_logistics_for_pull(callback: types.CallbackQuery):
             "❌ По закрытому пуллу нельзя выбирать логиста", show_alert=True
         )
         return
+    if pull_status not in {"filled", "closed"}:
+        await callback.answer(
+            "❌ Выбор логиста доступен только для собранного пулла",
+            show_alert=True,
+        )
+        return
     user_id = callback.from_user.id
     user_role = (get_user_by_id(user_id) or {}).get("role")
     pull_owner_id = pull.get("exporter_id") or pull.get("creator_id")
@@ -16106,6 +16150,56 @@ async def show_logistics_for_pull(callback: types.CallbackQuery):
     if has_assigned_expeditor(pull):
         await callback.answer("❌ По пулу уже выбран экспедитор", show_alert=True)
         return
+    for delivery in deliveries.values():
+        if not isinstance(delivery, dict):
+            continue
+        if not same_id(delivery.get("pull_id"), pull_id):
+            continue
+        delivery_owner_id = (
+            delivery.get("exporter_id")
+            or delivery.get("customer_id")
+            or delivery.get("created_by")
+        )
+        if (
+            pull_owner_id
+            and delivery_owner_id not in {None, ""}
+            and not same_id(delivery_owner_id, pull_owner_id)
+        ):
+            continue
+        delivery_effective_status = get_effective_delivery_status(delivery)
+        if delivery_effective_status in {"in_progress", "expeditor_selected"}:
+            await callback.answer(
+                "❌ По пулу уже есть доставка в работе", show_alert=True
+            )
+            return
+        if delivery_effective_status in {"completed", "cancelled"}:
+            await callback.answer(
+                "❌ По пулу уже есть закрытая доставка", show_alert=True
+            )
+            return
+    for deal in deals.values():
+        if not isinstance(deal, dict):
+            continue
+        if not same_id(deal.get("pull_id"), pull_id):
+            continue
+        deal_exporter_id = deal.get("exporter_id") or pull_owner_id
+        if (
+            pull_owner_id
+            and deal_exporter_id not in {None, ""}
+            and not same_id(deal_exporter_id, pull_owner_id)
+        ):
+            continue
+        deal_effective_status = get_effective_deal_status(deal)
+        if deal_effective_status in {"in_progress", "expeditor_selected"}:
+            await callback.answer(
+                "❌ По пулу уже есть сделка в работе", show_alert=True
+            )
+            return
+        if deal_effective_status in {"completed", "cancelled"}:
+            await callback.answer(
+                "❌ По пулу уже есть закрытая сделка", show_alert=True
+            )
+            return
 
     port = pull.get("port")
     if not port:
@@ -16347,6 +16441,12 @@ async def confirm_select_logistic(callback: types.CallbackQuery):
     if is_pull_open_status(pull.get("status")):
         await callback.answer("⚠️ Пулл ещё не собран", show_alert=True)
         return
+    pull_status = normalize_transition_status(pull.get("status") or "active")
+    if pull_status in {"cancelled", "sold", "completed"}:
+        await callback.answer(
+            "❌ По закрытому пуллу нельзя выбирать логиста", show_alert=True
+        )
+        return
     user_id = callback.from_user.id
     user_role = (get_user_by_id(user_id) or {}).get("role")
     pull_owner_id = pull.get("exporter_id") or pull.get("creator_id")
@@ -16355,6 +16455,72 @@ async def confirm_select_logistic(callback: types.CallbackQuery):
         return
     if has_assigned_logist(pull):
         await callback.answer("❌ По пулу уже выбран логист", show_alert=True)
+        return
+    if has_assigned_expeditor(pull):
+        await callback.answer(
+            "❌ По пулу уже выбран экспедитор, логиста менять нельзя",
+            show_alert=True,
+        )
+        return
+
+    has_closed_delivery = False
+    for delivery in deliveries.values():
+        if not isinstance(delivery, dict):
+            continue
+        if not same_id(delivery.get("pull_id"), pull_id):
+            continue
+        delivery_owner_id = (
+            delivery.get("exporter_id")
+            or delivery.get("customer_id")
+            or delivery.get("created_by")
+        )
+        if (
+            pull_owner_id
+            and delivery_owner_id not in {None, ""}
+            and not same_id(delivery_owner_id, pull_owner_id)
+        ):
+            continue
+        delivery_effective_status = get_effective_delivery_status(delivery)
+        if delivery_effective_status in {"completed", "cancelled"}:
+            has_closed_delivery = True
+            break
+        if delivery_effective_status in {"in_progress", "expeditor_selected"}:
+            await callback.answer(
+                "❌ По пулу уже есть доставка в работе", show_alert=True
+            )
+            return
+    if has_closed_delivery:
+        await callback.answer(
+            "❌ По пулу уже есть закрытая доставка", show_alert=True
+        )
+        return
+
+    has_closed_deal = False
+    for deal in deals.values():
+        if not isinstance(deal, dict):
+            continue
+        if not same_id(deal.get("pull_id"), pull_id):
+            continue
+        deal_exporter_id = deal.get("exporter_id") or pull_owner_id
+        if (
+            pull_owner_id
+            and deal_exporter_id not in {None, ""}
+            and not same_id(deal_exporter_id, pull_owner_id)
+        ):
+            continue
+        deal_effective_status = get_effective_deal_status(deal)
+        if deal_effective_status in {"completed", "cancelled"}:
+            has_closed_deal = True
+            break
+        if deal_effective_status in {"in_progress", "expeditor_selected"}:
+            await callback.answer(
+                "❌ По пулу уже есть сделка в работе", show_alert=True
+            )
+            return
+    if has_closed_deal:
+        await callback.answer(
+            "❌ По пулу уже есть закрытая сделка", show_alert=True
+        )
         return
 
     user_data = get_user_by_id(log_id) or {}
@@ -16377,11 +16543,138 @@ async def confirm_select_logistic(callback: types.CallbackQuery):
         or user_data.get("company")
         or user_data.get("name", "Компания")
     )
+    pull_port = pull.get("port")
+    card_ports = card.get("ports")
+    if isinstance(card_ports, str):
+        card_ports = [p.strip() for p in card_ports.split(",") if p.strip()]
+    if not isinstance(card_ports, list):
+        card_ports = []
+    normalized_card_ports = {str(p).strip().lower() for p in card_ports if str(p).strip()}
+    if pull_port and normalized_card_ports and "все порты" not in normalized_card_ports:
+        if str(pull_port).strip().lower() not in normalized_card_ports:
+            await callback.answer(
+                "❌ Карточка логиста не подходит по порту для этого пулла",
+                show_alert=True,
+            )
+            return
+
+    now_sql = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     # Назначаем логиста пуллу
     pull["selected_logistic"] = log_id
     pull["logist_id"] = log_id
-    pull["selected_logistic_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    pull["selected_logistic_at"] = now_sql
+
+    # Синхронизируем связанные заявки/сделки/доставки по pull_id,
+    # чтобы назначенный логист был виден в связанных сущностях.
+    for req in shipping_requests.values():
+        if not isinstance(req, dict):
+            continue
+        if not same_id(req.get("pull_id"), pull_id):
+            continue
+        req_owner_id = (
+            req.get("exporter_id")
+            or req.get("customer_id")
+            or req.get("created_by")
+        )
+        if (
+            pull_owner_id
+            and req_owner_id not in {None, ""}
+            and not same_id(req_owner_id, pull_owner_id)
+        ):
+            continue
+        req_status = get_effective_request_status(
+            req.get("id"),
+            "exporter",
+            req,
+            request_owner_id=req_owner_id,
+            request_exporter_id=req_owner_id,
+        )
+        if req_status in {"completed", "cancelled", "rejected"}:
+            continue
+        if has_assigned_logist(req):
+            continue
+        if has_assigned_expeditor(req):
+            continue
+        req["selected_logistic"] = log_id
+        req["assigned_logist_id"] = log_id
+        req["logist_id"] = log_id
+        req.setdefault("selected_logistic_at", now_sql)
+        req.setdefault("assigned_at", now_sql)
+        if req_status in {"", "pending", "active", "new", "open", "has_offers"}:
+            req["status"] = "assigned"
+
+    for deal in deals.values():
+        if not isinstance(deal, dict):
+            continue
+        if not same_id(deal.get("pull_id"), pull_id):
+            continue
+        deal_exporter_id = deal.get("exporter_id") or pull_owner_id
+        if (
+            pull_owner_id
+            and deal_exporter_id not in {None, ""}
+            and not same_id(deal_exporter_id, pull_owner_id)
+        ):
+            continue
+        deal_effective_status = get_effective_deal_status(deal)
+        if deal_effective_status in {"completed", "cancelled"}:
+            continue
+        if has_assigned_logist(deal):
+            continue
+        if has_assigned_expeditor(deal):
+            continue
+        deal["logistic_id"] = log_id
+        deal.setdefault("logistic_selected_at", now_sql)
+        if deal_effective_status in {
+            "",
+            "pending",
+            "matched",
+            "new",
+            "active",
+            "open",
+            "accepted",
+            "selected",
+            "reserved",
+            "assigned",
+        }:
+            deal["status"] = "assigned"
+
+    for delivery in deliveries.values():
+        if not isinstance(delivery, dict):
+            continue
+        if not same_id(delivery.get("pull_id"), pull_id):
+            continue
+        delivery_owner_id = (
+            delivery.get("exporter_id")
+            or delivery.get("customer_id")
+            or delivery.get("created_by")
+        )
+        if (
+            pull_owner_id
+            and delivery_owner_id not in {None, ""}
+            and not same_id(delivery_owner_id, pull_owner_id)
+        ):
+            continue
+        delivery_effective_status = get_effective_delivery_status(delivery)
+        if delivery_effective_status in {"completed", "cancelled"}:
+            continue
+        if has_assigned_logist(delivery):
+            continue
+        if has_assigned_expeditor(delivery):
+            continue
+        delivery["logist_id"] = log_id
+        delivery.setdefault("assigned_at", now_sql)
+        if delivery_effective_status in {
+            "",
+            "pending",
+            "new",
+            "active",
+            "open",
+            "accepted",
+            "selected",
+            "reserved",
+        }:
+            delivery["status"] = "pending"
     save_data()
 
     # Уведомляем логиста
@@ -16454,6 +16747,56 @@ async def show_expeditors_for_pull(callback: types.CallbackQuery):
     if has_assigned_expeditor(pull):
         await callback.answer("❌ По пулу уже выбран экспедитор", show_alert=True)
         return
+    for delivery in deliveries.values():
+        if not isinstance(delivery, dict):
+            continue
+        if not same_id(delivery.get("pull_id"), pull_id):
+            continue
+        delivery_owner_id = (
+            delivery.get("exporter_id")
+            or delivery.get("customer_id")
+            or delivery.get("created_by")
+        )
+        if (
+            pull_owner_id
+            and delivery_owner_id not in {None, ""}
+            and not same_id(delivery_owner_id, pull_owner_id)
+        ):
+            continue
+        delivery_effective_status = get_effective_delivery_status(delivery)
+        if delivery_effective_status in {"in_progress", "expeditor_selected"}:
+            await callback.answer(
+                "❌ По пулу уже есть доставка в работе", show_alert=True
+            )
+            return
+        if delivery_effective_status in {"completed", "cancelled"}:
+            await callback.answer(
+                "❌ По пулу уже есть закрытая доставка", show_alert=True
+            )
+            return
+    for deal in deals.values():
+        if not isinstance(deal, dict):
+            continue
+        if not same_id(deal.get("pull_id"), pull_id):
+            continue
+        deal_exporter_id = deal.get("exporter_id") or pull_owner_id
+        if (
+            pull_owner_id
+            and deal_exporter_id not in {None, ""}
+            and not same_id(deal_exporter_id, pull_owner_id)
+        ):
+            continue
+        deal_effective_status = get_effective_deal_status(deal)
+        if deal_effective_status in {"in_progress", "expeditor_selected"}:
+            await callback.answer(
+                "❌ По пулу уже есть сделка в работе", show_alert=True
+            )
+            return
+        if deal_effective_status in {"completed", "cancelled"}:
+            await callback.answer(
+                "❌ По пулу уже есть закрытая сделка", show_alert=True
+            )
+            return
 
     port = pull.get("port")
     if not port:
@@ -17081,6 +17424,7 @@ async def view_expeditor_offer_for_pull(callback: types.CallbackQuery):
         offer_status in MUTABLE_EXPEDITOR_OFFER_STATUSES
         and not has_assigned_expeditor(pull)
         and has_assigned_logist(pull)
+        and pull_status in {"filled", "closed"}
         and pull_status not in {"cancelled", "sold", "completed"}
         and not has_conflicting_delivery
         and not has_conflicting_deal
@@ -17137,6 +17481,12 @@ async def choose_expeditor_offer_for_pull(callback: types.CallbackQuery):
     if pull_status in {"cancelled", "sold", "completed"}:
         await callback.answer(
             "❌ По закрытому пуллу нельзя выбирать экспедитора", show_alert=True
+        )
+        return
+    if pull_status not in {"filled", "closed"}:
+        await callback.answer(
+            "❌ Выбор экспедитора доступен только для собранного пулла",
+            show_alert=True,
         )
         return
     user_id = callback.from_user.id
@@ -37542,6 +37892,12 @@ async def accept_offer_confirmed(callback: types.CallbackQuery, state: FSMContex
     if get_assigned_logist_id(request):
         await callback.answer("❌ По заявке уже назначен логист", show_alert=True)
         return
+    if has_assigned_expeditor(request):
+        await callback.answer(
+            "❌ Нельзя выбрать логиста после назначения экспедитора",
+            show_alert=True,
+        )
+        return
 
     # Защита от повторной обработки: оффер должен быть в открытом статусе
     offer_status = normalize_transition_status(offer.get("status") or "pending")
@@ -37620,6 +37976,70 @@ async def accept_offer_confirmed(callback: types.CallbackQuery, state: FSMContex
     ):
         await callback.answer(
             "❌ По заявке уже есть доставка в работе", show_alert=True
+        )
+        return
+    has_closed_deal = False
+    for deal in deals.values():
+        if not isinstance(deal, dict):
+            continue
+        if not same_id(deal.get("request_id"), request_id):
+            continue
+        deal_source = str(deal.get("source") or "").strip().lower()
+        if deal_source == "logistic":
+            deal_source = "logistics"
+        if offer_source == "exporter":
+            if deal_source not in {"", "exporter"}:
+                continue
+            deal_owner_id = (
+                deal.get("exporter_id")
+                or deal.get("customer_id")
+                or deal.get("created_by")
+            )
+        elif offer_source == "logistics":
+            if deal_source != "logistics":
+                continue
+            deal_owner_id = (
+                deal.get("customer_id")
+                or deal.get("created_by")
+                or deal.get("exporter_id")
+            )
+            if not deal_owner_id:
+                legacy_logist_owner_id = deal.get("logist_id")
+                has_assigned_logist_id = bool(
+                    deal.get("assigned_logist_id")
+                    or deal.get("selected_logistic")
+                    or deal.get("logistic_id")
+                )
+                if legacy_logist_owner_id and not has_assigned_logist_id:
+                    deal_owner_id = legacy_logist_owner_id
+        else:
+            if deal_source != "farmer":
+                continue
+            deal_owner_id = (
+                deal.get("farmer_id")
+                or deal.get("user_id")
+                or deal.get("customer_id")
+                or deal.get("created_by")
+                or deal.get("exporter_id")
+            )
+        if (
+            request_owner_id
+            and deal_owner_id not in {None, ""}
+            and not same_id(deal_owner_id, request_owner_id)
+        ):
+            continue
+        deal_effective_status = get_effective_deal_status(deal)
+        if deal_effective_status in {"completed", "cancelled"}:
+            has_closed_deal = True
+            break
+        if deal_effective_status in {"in_progress", "expeditor_selected"}:
+            await callback.answer(
+                "❌ По заявке уже есть сделка в работе", show_alert=True
+            )
+            return
+    if has_closed_deal:
+        await callback.answer(
+            "❌ По заявке уже есть закрытая сделка", show_alert=True
         )
         return
 
