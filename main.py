@@ -17027,11 +17027,63 @@ async def view_expeditor_offer_for_pull(callback: types.CallbackQuery):
 
     keyboard = InlineKeyboardMarkup(row_width=1)
     pull_status = normalize_transition_status(pull.get("status") or "active")
+    pull_owner_id = pull.get("exporter_id") or pull.get("creator_id")
+    has_conflicting_delivery = False
+    has_conflicting_deal = False
+    for delivery in deliveries.values():
+        if not isinstance(delivery, dict):
+            continue
+        if not same_id(delivery.get("pull_id"), pull_id):
+            continue
+        delivery_owner_id = (
+            delivery.get("exporter_id")
+            or delivery.get("customer_id")
+            or delivery.get("created_by")
+        )
+        if (
+            pull_owner_id
+            and delivery_owner_id not in {None, ""}
+            and not same_id(delivery_owner_id, pull_owner_id)
+        ):
+            continue
+        delivery_effective_status = get_effective_delivery_status(delivery)
+        if delivery_effective_status in {
+            "completed",
+            "cancelled",
+            "in_progress",
+            "expeditor_selected",
+        }:
+            has_conflicting_delivery = True
+            break
+    if not has_conflicting_delivery:
+        for deal in deals.values():
+            if not isinstance(deal, dict):
+                continue
+            if not same_id(deal.get("pull_id"), pull_id):
+                continue
+            deal_exporter_id = deal.get("exporter_id") or pull_owner_id
+            if (
+                pull_owner_id
+                and deal_exporter_id not in {None, ""}
+                and not same_id(deal_exporter_id, pull_owner_id)
+            ):
+                continue
+            deal_effective_status = get_effective_deal_status(deal)
+            if deal_effective_status in {
+                "completed",
+                "cancelled",
+                "in_progress",
+                "expeditor_selected",
+            }:
+                has_conflicting_deal = True
+                break
     can_choose_offer = (
         offer_status in MUTABLE_EXPEDITOR_OFFER_STATUSES
         and not has_assigned_expeditor(pull)
         and has_assigned_logist(pull)
         and pull_status not in {"cancelled", "sold", "completed"}
+        and not has_conflicting_delivery
+        and not has_conflicting_deal
     )
     if can_choose_offer:
         keyboard.add(
@@ -17114,12 +17166,73 @@ async def choose_expeditor_offer_for_pull(callback: types.CallbackQuery):
             "❌ Сначала выберите логиста для пулла", show_alert=True
         )
         return
+    has_closed_delivery = False
+    for delivery in deliveries.values():
+        if not isinstance(delivery, dict):
+            continue
+        if not same_id(delivery.get("pull_id"), pull_id):
+            continue
+        delivery_owner_id = (
+            delivery.get("exporter_id")
+            or delivery.get("customer_id")
+            or delivery.get("created_by")
+        )
+        if (
+            pull_owner_id
+            and delivery_owner_id not in {None, ""}
+            and not same_id(delivery_owner_id, pull_owner_id)
+        ):
+            continue
+        delivery_effective_status = get_effective_delivery_status(delivery)
+        if delivery_effective_status in {"completed", "cancelled"}:
+            has_closed_delivery = True
+            break
+        if delivery_effective_status in {"in_progress", "expeditor_selected"}:
+            await callback.answer(
+                "❌ По пулу уже есть доставка в работе", show_alert=True
+            )
+            return
+    if has_closed_delivery:
+        await callback.answer(
+            "❌ По пулу уже есть закрытая доставка", show_alert=True
+        )
+        return
+
+    has_closed_deal = False
+    for deal in deals.values():
+        if not isinstance(deal, dict):
+            continue
+        if not same_id(deal.get("pull_id"), pull_id):
+            continue
+        deal_exporter_id = deal.get("exporter_id") or pull_owner_id
+        if (
+            pull_owner_id
+            and deal_exporter_id not in {None, ""}
+            and not same_id(deal_exporter_id, pull_owner_id)
+        ):
+            continue
+        deal_effective_status = get_effective_deal_status(deal)
+        if deal_effective_status in {"completed", "cancelled"}:
+            has_closed_deal = True
+            break
+        if deal_effective_status in {"in_progress", "expeditor_selected"}:
+            await callback.answer(
+                "❌ По пулу уже есть сделка в работе", show_alert=True
+            )
+            return
+    if has_closed_deal:
+        await callback.answer(
+            "❌ По пулу уже есть закрытая сделка", show_alert=True
+        )
+        return
+
+    now_sql = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     # фиксируем выбор
     pull["selected_expeditor"] = expeditor_id
     pull["selected_expeditor_id"] = expeditor_id
     pull["expeditor_id"] = expeditor_id
-    pull["selected_expeditor_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    pull["selected_expeditor_at"] = now_sql
     exp_ids = pull.get("expeditor_ids") or []
     if not any(same_id(existing_id, expeditor_id) for existing_id in exp_ids):
         exp_ids.append(expeditor_id)
@@ -17134,16 +17247,130 @@ async def choose_expeditor_offer_for_pull(callback: types.CallbackQuery):
                 selected_status = normalize_transition_status(o.get("status") or "pending")
                 if selected_status != "in_progress":
                     o["status"] = "accepted"
-                o.setdefault("accepted_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                o.setdefault("accepted_at", now_sql)
             else:
+                other_status = normalize_transition_status(o.get("status") or "pending")
                 if (
-                    normalize_transition_status(o.get("status"))
-                    in MUTABLE_EXPEDITOR_OFFER_STATUSES
-                    and normalize_transition_status(o.get("status")) != "in_progress"
+                    other_status in MUTABLE_EXPEDITOR_OFFER_STATUSES
+                    and other_status != "in_progress"
                 ):
                     o["status"] = "rejected"
-                    o["rejected_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    o["rejected_at"] = now_sql
                     o["rejection_reason"] = "Выбрано другое предложение экспедитора"
+
+    # Синхронизируем связанные заявки/доставки/сделки по pull_id,
+    # чтобы назначенный экспедитор был виден во всех релевантных сущностях.
+    for req in shipping_requests.values():
+        if not isinstance(req, dict):
+            continue
+        if not same_id(req.get("pull_id"), pull_id):
+            continue
+        req_owner_id = req.get("exporter_id") or req.get("customer_id") or req.get("created_by")
+        if (
+            pull_owner_id
+            and req_owner_id not in {None, ""}
+            and not same_id(req_owner_id, pull_owner_id)
+        ):
+            continue
+        req_status = get_effective_request_status(
+            req.get("id"),
+            "exporter",
+            req,
+            request_owner_id=req_owner_id,
+            request_exporter_id=req_owner_id,
+        )
+        if req_status in {"completed", "cancelled", "rejected"}:
+            continue
+        if not has_assigned_logist(req):
+            continue
+        req["selected_expeditor"] = expeditor_id
+        req["selected_expeditor_id"] = expeditor_id
+        req["expeditor_id"] = expeditor_id
+        req.setdefault("selected_expeditor_at", now_sql)
+        if req_status in {
+            "",
+            "pending",
+            "assigned",
+            "new",
+            "active",
+            "open",
+            "accepted",
+            "reserved",
+            "selected",
+            "expeditor_selected",
+        }:
+            req["status"] = "expeditor_selected"
+
+    for delivery in deliveries.values():
+        if not isinstance(delivery, dict):
+            continue
+        if not same_id(delivery.get("pull_id"), pull_id):
+            continue
+        delivery_owner_id = (
+            delivery.get("exporter_id")
+            or delivery.get("customer_id")
+            or delivery.get("created_by")
+        )
+        if (
+            pull_owner_id
+            and delivery_owner_id not in {None, ""}
+            and not same_id(delivery_owner_id, pull_owner_id)
+        ):
+            continue
+        delivery_effective_status = get_effective_delivery_status(delivery)
+        if delivery_effective_status in {"completed", "cancelled"}:
+            continue
+        delivery["expeditor_id"] = expeditor_id
+        if delivery_effective_status in {
+            "",
+            "pending",
+            "assigned",
+            "new",
+            "active",
+            "open",
+            "accepted",
+            "reserved",
+            "selected",
+            "expeditor_selected",
+        }:
+            delivery["status"] = "expeditor_selected"
+        delivery.setdefault("accepted_at", now_sql)
+
+    for deal in deals.values():
+        if not isinstance(deal, dict):
+            continue
+        if not same_id(deal.get("pull_id"), pull_id):
+            continue
+        deal_exporter_id = deal.get("exporter_id") or pull_owner_id
+        if (
+            pull_owner_id
+            and deal_exporter_id not in {None, ""}
+            and not same_id(deal_exporter_id, pull_owner_id)
+        ):
+            continue
+        deal_effective_status = get_effective_deal_status(deal)
+        if deal_effective_status in {"completed", "cancelled"}:
+            continue
+        if not has_assigned_logist(deal):
+            continue
+        deal["expeditor_id"] = expeditor_id
+        deal.setdefault("selected_expeditor", expeditor_id)
+        deal.setdefault("selected_expeditor_id", expeditor_id)
+        deal.setdefault("expeditor_selected_at", now_sql)
+        if deal_effective_status in {
+            "",
+            "pending",
+            "matched",
+            "assigned",
+            "new",
+            "active",
+            "open",
+            "accepted",
+            "reserved",
+            "selected",
+            "expeditor_selected",
+        }:
+            deal["status"] = "expeditor_selected"
 
     save_data()
 
@@ -22441,6 +22668,42 @@ async def choose_logistic_offer_for_request(callback: types.CallbackQuery):
             "❌ По заявке уже есть доставка в работе", show_alert=True
         )
         return
+    has_closed_deal = False
+    for deal in deals.values():
+        if not isinstance(deal, dict):
+            continue
+        if not same_id(deal.get("request_id"), request_id):
+            continue
+        deal_source = str(deal.get("source") or "").strip().lower()
+        if deal_source == "logistic":
+            deal_source = "logistics"
+        if deal_source not in {"", "exporter"}:
+            continue
+        deal_exporter_id = (
+            deal.get("exporter_id")
+            or deal.get("customer_id")
+            or deal.get("created_by")
+        )
+        if (
+            request_exporter_id
+            and deal_exporter_id not in {None, ""}
+            and not same_id(deal_exporter_id, request_exporter_id)
+        ):
+            continue
+        deal_effective_status = get_effective_deal_status(deal)
+        if deal_effective_status in {"completed", "cancelled"}:
+            has_closed_deal = True
+            break
+        if deal_effective_status in {"in_progress", "expeditor_selected"}:
+            await callback.answer(
+                "❌ По заявке уже есть сделка в работе", show_alert=True
+            )
+            return
+    if has_closed_deal:
+        await callback.answer(
+            "❌ По заявке уже есть закрытая сделка", show_alert=True
+        )
+        return
     active_matching_deliveries = [
         (deliv_key, d)
         for deliv_key, d in matching_deliveries
@@ -22749,6 +23012,67 @@ async def choose_expeditor_offer_for_request(callback: types.CallbackQuery):
         if delivery_effective_status in {"in_progress", "expeditor_selected"}:
             await callback.answer(
                 "❌ По заявке уже есть доставка в работе", show_alert=True
+            )
+            return
+    if request_source in {"exporter", "logistics"}:
+        has_closed_deal = False
+        for deal in deals.values():
+            if not isinstance(deal, dict):
+                continue
+            if not same_id(deal.get("request_id"), request_id):
+                continue
+            deal_source = str(deal.get("source") or "").strip().lower()
+            if deal_source == "logistic":
+                deal_source = "logistics"
+            if request_source == "exporter":
+                if deal_source not in {"", "exporter"}:
+                    continue
+                deal_owner_id = (
+                    deal.get("exporter_id")
+                    or deal.get("customer_id")
+                    or deal.get("created_by")
+                )
+                if (
+                    request_exporter_id
+                    and deal_owner_id not in {None, ""}
+                    and not same_id(deal_owner_id, request_exporter_id)
+                ):
+                    continue
+            else:
+                if deal_source != "logistics":
+                    continue
+                deal_owner_id = (
+                    deal.get("customer_id")
+                    or deal.get("created_by")
+                    or deal.get("exporter_id")
+                )
+                if not deal_owner_id:
+                    legacy_logist_owner_id = deal.get("logist_id")
+                    has_assigned_logist_id = bool(
+                        deal.get("assigned_logist_id")
+                        or deal.get("selected_logistic")
+                        or deal.get("logistic_id")
+                    )
+                    if legacy_logist_owner_id and not has_assigned_logist_id:
+                        deal_owner_id = legacy_logist_owner_id
+                if (
+                    request_owner_id
+                    and deal_owner_id not in {None, ""}
+                    and not same_id(deal_owner_id, request_owner_id)
+                ):
+                    continue
+            deal_effective_status = get_effective_deal_status(deal)
+            if deal_effective_status in {"completed", "cancelled"}:
+                has_closed_deal = True
+                break
+            if deal_effective_status in {"in_progress", "expeditor_selected"}:
+                await callback.answer(
+                    "❌ По заявке уже есть сделка в работе", show_alert=True
+                )
+                return
+        if has_closed_deal:
+            await callback.answer(
+                "❌ По заявке уже есть закрытая сделка", show_alert=True
             )
             return
 
@@ -34424,7 +34748,7 @@ async def select_expeditor_handler(callback: types.CallbackQuery):
         if deal_status in {"completed", "cancelled", "canceled"}:
             await callback.answer("❌ Сделка уже закрыта", show_alert=True)
             return
-        if deal_status == "in_progress":
+        if deal_status in {"in_progress", "expeditor_selected"}:
             await callback.answer(
                 "❌ Сделка уже в работе, экспедитора менять нельзя",
                 show_alert=True,
