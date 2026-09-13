@@ -1,85 +1,96 @@
-# 🤖 EXPORTUM Bot - Документация
+# 🤖 EXPORTUM Bot — Documentation
 
-## 🚀 Быстрый старт
+<div align="center">
+
+[![Python](https://img.shields.io/badge/Python-3.x-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
+[![Aiogram](https://img.shields.io/badge/Aiogram-2.25.2-26A5E4?style=for-the-badge&logo=telegram&logoColor=white)](https://docs.aiogram.dev/)
+[![Telegram](https://img.shields.io/badge/Telegram-Bot-26A5E4?style=for-the-badge&logo=telegram&logoColor=white)](https://core.telegram.org/bots)
+[![Pandas](https://img.shields.io/badge/Pandas-Data-150458?style=for-the-badge&logo=pandas&logoColor=white)](https://pandas.pydata.org/)
+[![Google Sheets](https://img.shields.io/badge/Google_Sheets-Integration-34A853?style=for-the-badge&logo=googlesheets&logoColor=white)](https://developers.google.com/sheets/api)
+[![pytest](https://img.shields.io/badge/pytest-Verification-0A9EDC?style=for-the-badge&logo=pytest&logoColor=white)](https://pytest.org/)
+
+</div>
+
+## 🚀 Quick start
 
 ```bash
 cp .env.example .env
-# заполнить .env своими значениями
+# fill .env with your own values
 python3 -m venv .venv
 ./.venv/bin/python -m pip install -r requirements.txt
 ./run.sh
 ```
 
-## 📋 Описание
+## 📋 Description
 
-**EXPORTUM** — Telegram-бот для агропромышленной платформы, объединяющий фермеров, экспортёров, логистов и экспедиторов для эффективной организации поставок зерна.
+**EXPORTUM** is a Telegram bot for an agricultural logistics platform that connects farmers, exporters, logistics providers and freight forwarders to coordinate grain shipments efficiently.
 
-## 🧠 Логика статусов (актуально на 13.03.2026)
+## 🧠 Status logic (current as of 2026-03-13)
 
-### Этапы по заявке
-- `active/open/new/has_offers` — заявка открыта для логистов.
-- `assigned` — логист выбран.
-- `expeditor_selected` — экспедитор выбран.
-- `in_progress` — перевозка в работе.
-- `completed/cancelled/rejected` — терминальные состояния.
+### Request lifecycle
+- `active/open/new/has_offers` — request is open to logistics providers.
+- `assigned` — logistics provider selected.
+- `expeditor_selected` — freight forwarder selected.
+- `in_progress` — shipment is in progress.
+- `completed/cancelled/rejected` — terminal states.
 
-### Правила выбора исполнителей
-- Экспедитор выбирается только после назначения логиста.
-- При активной или закрытой доставке повторное назначение блокируется.
-- При выборе одного оффера конкурирующие mutable-офферы переводятся в `rejected`.
-- Оффер со статусом `in_progress` не откатывается обратно в `accepted`.
+### Assignee-selection rules
+- A freight forwarder can be selected only after a logistics provider has been assigned.
+- Reassignment is blocked when a delivery is active or already closed.
+- When one offer is selected, competing mutable offers move to `rejected`.
+- An offer in `in_progress` is never rolled back to `accepted`.
 
-### Нормализация статусов офферов
-- Открытые статусы логиста: `pending`, `active`, `new`, `open`.
-- Открытые статусы экспедитора: `pending`, `active`, `new`, `open`.
-- Выбранные/рабочие: `accepted`, `assigned`, `selected`, `reserved`, `in_progress`.
-- Для проверок переходов используются effective-статусы (`get_effective_*_status`), а не только raw `status` в записи.
+### Offer-status normalization
+- Open logistics-provider statuses: `pending`, `active`, `new`, `open`.
+- Open freight-forwarder statuses: `pending`, `active`, `new`, `open`.
+- Selected/working statuses: `accepted`, `assigned`, `selected`, `reserved`, `in_progress`.
+- Transition checks use effective statuses (`get_effective_*_status`) rather than relying only on the raw `status` field.
 
-### Основные функции:
-- Создание и управление пулами зерна
-- Поиск и подбор партий
-- Организация логистики и экспедирования
-- Управление сделками и доставками
-- Административная панель для мониторинга и управления
-
----
-
-## 👥 Роли пользователей
-
-### 🌾 Фермер
-- Создание партий зерна (культура, объём, цена, качество)
-- Присоединение к пулам экспортёров
-- Просмотр доступных пулов и совпадений
-- Управление своими партиями
-
-### 📦 Экспортёр
-- Создание пулов (культура, объём, порт, цена FOB)
-- Выбор логистов и экспедиторов
-- Управление пулами (закрытие, завершение)
-- Просмотр участников и статистики
-
-### 🚚 Логист
-- Создание карточки логиста (транспорт, маршруты, цены)
-- Просмотр доступных заявок на логистику
-- Подача предложений по доставке
-- Управление своими перевозками
-
-### 🚛 Экспедитор
-- Создание карточки экспедитора (услуги, порты, опыт)
-- Просмотр доступных сделок
-- Подача предложений по экспедированию
-- Управление своими заявками
-
-### 🔐 Администратор
-- Статистика системы
-- Аналитика (регионы, культуры, порты)
-- Экспорт данных (CSV, JSON)
-- Управление пользователями
-- Рассылка сообщений
+### Main features
+- Create and manage grain pools.
+- Search and match grain batches.
+- Organize logistics and freight forwarding.
+- Manage deals and deliveries.
+- Administrative panel for monitoring and management.
 
 ---
 
-## 📊 Структура данных
+## 👥 User roles
+
+### 🌾 Farmer
+- Create grain batches: crop, volume, price and quality.
+- Join exporter pools.
+- Browse available pools and matches.
+- Manage own batches.
+
+### 📦 Exporter
+- Create pools: crop, volume, port and FOB price.
+- Select logistics providers and freight forwarders.
+- Manage pools: close and complete.
+- Review participants and statistics.
+
+### 🚚 Logistics provider
+- Create a logistics profile: vehicle, routes and pricing.
+- Browse available logistics requests.
+- Submit delivery offers.
+- Manage active shipments.
+
+### 🚛 Freight forwarder
+- Create a freight-forwarder profile: services, ports and experience.
+- Browse available deals.
+- Submit forwarding offers.
+- Manage own requests.
+
+### 🔐 Administrator
+- System statistics.
+- Analytics by regions, crops and ports.
+- Data export to CSV and JSON.
+- User management.
+- Broadcast messaging.
+
+---
+
+## 📊 Data structures
 
 ### `users` (dict)
 ```python
@@ -133,7 +144,7 @@ python3 -m venv .venv
             "culture": str,
             "volume": float,
             "price": float,
-            "status": str,  # "Активна", "Зарезервирована", "sold"
+            "status": str,  # runtime values include "Активна", "Зарезервирована", "sold"
             "region": str,
             "moisture": float,
             "impurity": float,
@@ -173,156 +184,161 @@ python3 -m venv .venv
 }
 ```
 
----
-
-## 🔄 Основные E2E-сценарии
-
-### Фермер
-
-1. **Регистрация** → `/start` → Выбор роли "Фермер" → Заполнение данных
-2. **Создание партии** → "➕ Добавить партию" → Ввод данных (культура, объём, цена, качество)
-3. **Поиск пулов** → "🔍 Найти пулы" → Просмотр доступных пулов → Присоединение к пулу
-4. **Управление партиями** → "📦 Мои партии" → Просмотр/редактирование/удаление
-
-### Экспортёр
-
-1. **Регистрация** → `/start` → Выбор роли "Экспортёр" → Заполнение данных
-2. **Создание пула** → "➕ Создать пул" → Ввод данных (культура, объём, порт, цена) → Выбор типа документов
-3. **Выбор логиста** → Просмотр карточек логистов → Выбор логиста → Уведомление логисту
-4. **Выбор экспедитора** → Просмотр карточек экспедиторов → Выбор экспедитора → Уведомление экспедитору
-5. **Завершение пула** → "🎉 Завершить пул" → Подтверждение → Уведомления всем участникам
-
-### Логист
-
-1. **Регистрация** → `/start` → Выбор роли "Логист" → Заполнение данных
-2. **Создание карточки** → "💳 Моя карточка" → "➕ Создать карточку" → Ввод данных (транспорт, маршруты, цены)
-3. **Просмотр заявок** → "📋 Доступные заявки" → Просмотр заявок → Подача предложения
-4. **Управление перевозками** → "🚚 Мои перевозки" → Просмотр активных доставок
-
-### Экспедитор
-
-1. **Регистрация** → `/start` → Выбор роли "Экспедитор" → Заполнение данных
-2. **Создание карточки** → "💳 Моя карточка" → "➕ Создать карточку" → Ввод данных (услуги, порты, опыт)
-3. **Просмотр сделок** → "📋 Доступные сделки" → Просмотр доступных пулов → Подача предложения
-
-### Администратор
-
-1. **Вход** → `/admin` → Проверка прав → Админ-панель
-2. **Статистика** → "📊 Статистика" → Просмотр общей статистики системы
-3. **Аналитика** → "📈 Аналитика" → Просмотр аналитики (регионы, культуры, порты)
-4. **Экспорт данных** → "📤 Экспорт данных" → Выбор типа данных → Скачивание файла
-5. **Управление пользователями** → "👥 Пользователи" → Просмотр списка → Детали пользователя
-6. **Рассылка** → "📢 Рассылка" → Ввод сообщения → Подтверждение → Отправка всем пользователям
+> Runtime/UI strings that are still stored in Russian are preserved exactly where their literal value matters.
 
 ---
 
-## 🚀 Команды запуска
+## 🔄 Main E2E scenarios
 
-### Основные команды:
-- `/start` — начало работы, регистрация/вход
-- `/admin` — вход в админ-панель (только для администратора)
+### Farmer
 
-### Навигация:
-- Кнопки главного меню (зависят от роли)
-- Callback-кнопки для переходов между разделами
-- Кнопки "Назад" для возврата в предыдущее меню
+1. **Registration** → `/start` → select role `Фермер` → enter profile data.
+2. **Create batch** → `➕ Добавить партию` → enter crop, volume, price and quality.
+3. **Find pools** → `🔍 Найти пулы` → browse available pools → join a pool.
+4. **Manage batches** → `📦 Мои партии` → view/edit/delete.
+
+### Exporter
+
+1. **Registration** → `/start` → select role `Экспортёр` → enter profile data.
+2. **Create pool** → `➕ Создать пул` → enter crop, volume, port and price → select document type.
+3. **Select logistics provider** → browse provider cards → select provider → provider receives a notification.
+4. **Select freight forwarder** → browse forwarder cards → select forwarder → forwarder receives a notification.
+5. **Complete pool** → `🎉 Завершить пул` → confirmation → notifications to all participants.
+
+### Logistics provider
+
+1. **Registration** → `/start` → select role `Логист` → enter profile data.
+2. **Create profile card** → `💳 Моя карточка` → `➕ Создать карточку` → enter vehicle, routes and prices.
+3. **Browse requests** → `📋 Доступные заявки` → open request → submit an offer.
+4. **Manage shipments** → `🚚 Мои перевозки` → review active deliveries.
+
+### Freight forwarder
+
+1. **Registration** → `/start` → select role `Экспедитор` → enter profile data.
+2. **Create profile card** → `💳 Моя карточка` → `➕ Создать карточку` → enter services, ports and experience.
+3. **Browse deals** → `📋 Доступные сделки` → review available pools → submit an offer.
+
+### Administrator
+
+1. **Login** → `/admin` → permission check → admin panel.
+2. **Statistics** → `📊 Статистика` → review overall system statistics.
+3. **Analytics** → `📈 Аналитика` → review regions, crops and ports.
+4. **Data export** → `📤 Экспорт данных` → choose data type → download file.
+5. **User management** → `👥 Пользователи` → list → user details.
+6. **Broadcast** → `📢 Рассылка` → enter message → confirm → send to all users.
+
+> The current Telegram UI is Russian, so literal button labels are kept unchanged in the documentation.
 
 ---
 
-## ⚙️ Настройки
+## 🚀 Runtime commands
 
-### Переменные окружения:
-- `BOT_TOKEN` — токен Telegram-бота (обязательно)
-- `ADMIN_ID` — Telegram ID администратора (обязательно)
-- `DATA_DIR` — директория для хранения данных (по умолчанию: `data/`)
+### Main commands
+- `/start` — start the bot and enter registration/login flow.
+- `/admin` — open the admin panel for administrators only.
 
-### Файлы данных (pickle):
-- `users.pkl` — пользователи
-- `pools.pkl` — пулы
-- `batches.pkl` — партии
-- `logistics_cards.pkl` — карточки логистов
-- `expeditor_cards.pkl` — карточки экспедиторов
-- `shipping_requests.pkl` — заявки на доставку
-- `logistic_offers.pkl` — предложения логистов
-- `expeditor_pool_offers.pkl` — предложения экспедиторов по пулам
-- `expeditor_request_offers.pkl` — предложения экспедиторов по заявкам
+### Navigation
+- Main-menu buttons depend on the active user role.
+- Callback buttons move between sections.
+- `Назад` buttons return to the previous menu.
 
 ---
 
-## 📁 Структура кода
+## ⚙️ Configuration
 
-### Основные секции:
+### Environment variables
+- `BOT_TOKEN` — Telegram bot token, required.
+- `ADMIN_ID` — administrator Telegram ID, required.
+- `DATA_DIR` — data-storage directory, defaults to `data/`.
 
-#### 1. Импорты и конфигурация (строки 1-200)
-- Импорты библиотек
-- Константы и настройки
-- Инициализация бота и диспетчера
+### Pickle data files
+- `users.pkl` — users.
+- `pools.pkl` — pools.
+- `batches.pkl` — grain batches.
+- `logistics_cards.pkl` — logistics-provider cards.
+- `expeditor_cards.pkl` — freight-forwarder cards.
+- `shipping_requests.pkl` — delivery requests.
+- `logistic_offers.pkl` — logistics offers.
+- `expeditor_pool_offers.pkl` — freight-forwarder offers for pools.
+- `expeditor_request_offers.pkl` — freight-forwarder offers for requests.
 
-#### 2. Глобальные структуры данных (строки 100-200)
-- `users`, `pools`, `batches`
-- `logistics_cards`, `expeditor_cards`
-- `shipping_requests`, `logistic_offers`, `expeditor_offers`
+---
 
-#### 3. FSM States (строки 1300-1500)
+## 📁 Code structure
+
+### Main sections
+
+#### 1. Imports and configuration (lines 1–200)
+- Library imports.
+- Constants and settings.
+- Bot and dispatcher initialization.
+
+#### 2. Global data structures (lines 100–200)
+- `users`, `pools`, `batches`.
+- `logistics_cards`, `expeditor_cards`.
+- `shipping_requests`, `logistic_offers`, `expeditor_offers`.
+
+#### 3. FSM states (lines 1300–1500)
 - `RegistrationStatesGroup`
 - `CreatePoolStatesGroup`
 - `JoinPoolStatesGroup`
 - `EditProfileStates`
 - `BroadcastStates`
-- И другие...
+- and others.
 
-#### 4. Вспомогательные функции (строки 200-3000)
-- Валидация данных
-- Форматирование сообщений
-- Построение клавиатур
-- Функции уведомлений
-- Функции экспорта данных
+#### 4. Helper functions (lines 200–3000)
+- Data validation.
+- Message formatting.
+- Keyboard construction.
+- Notification helpers.
+- Data-export functions.
 
-#### 5. Handlers (строки 4000-33000)
-- **Admin handlers** (строки 4500-6500)
-- **Registration handlers** (строки 6700-8000)
-- **Pool handlers** (строки 10000-13000)
-- **Batch handlers** (строки 10000-12000)
-- **Logistic handlers** (строки 25000-28000)
-- **Expeditor handlers** (строки 18000-20000)
-- **Notification handlers** (строки 3500-4000)
+#### 5. Handlers (lines 4000–33000)
+- **Admin handlers** (lines 4500–6500)
+- **Registration handlers** (lines 6700–8000)
+- **Pool handlers** (lines 10000–13000)
+- **Batch handlers** (lines 10000–12000)
+- **Logistics handlers** (lines 25000–28000)
+- **Freight-forwarder handlers** (lines 18000–20000)
+- **Notification handlers** (lines 3500–4000)
 
-#### 6. Функции сохранения/загрузки (строки 700-900)
-- `save_data()` — сохранение всех данных
-- `load_data()` — загрузка всех данных
-- `save_*_to_pickle()` — сохранение отдельных структур
-
----
-
-## 🔧 Известные проблемы / TODO
-
-### Помеченные кандидаты на удаление:
-- `parse_price()` — не используется
-- `get_all_pools_with_format()` — не используется
-- `translate_pool_status()` — не используется
-- `parse_join_pool_callback()` — не используется
-- `validate_batch_volume()` — не используется
-- `migrate_all_existing_pools()` — одноразовая миграция
-- `migrate_old_pools()` — одноразовая миграция
-
-### Улучшения:
-- Добавить больше валидации при создании пулов/партий
-- Улучшить обработку ошибок Telegram API
-- Добавить rate limiting для массовых операций
-- Оптимизировать работу с большими объёмами данных
+#### 6. Save/load functions (lines 700–900)
+- `save_data()` — persist all data.
+- `load_data()` — load all data.
+- `save_*_to_pickle()` — persist individual structures.
 
 ---
 
-## 📝 Примечания
+## 🔧 Known issues / TODO
 
-- Все данные хранятся в памяти и периодически сохраняются в pickle-файлы
-- Для работы с Google Sheets требуется настройка `gs` объекта
-- Логирование ведётся через стандартный модуль `logging`
-- Все функции соответствуют принципам КОНТЕКСТ7 (полный код, обработка ошибок, логирование, docstring)
+### Marked removal candidates
+- `parse_price()` — unused.
+- `get_all_pools_with_format()` — unused.
+- `translate_pool_status()` — unused.
+- `parse_join_pool_callback()` — unused.
+- `validate_batch_volume()` — unused.
+- `migrate_all_existing_pools()` — one-time migration.
+- `migrate_old_pools()` — one-time migration.
+
+### Improvements
+- Add stronger validation when creating pools and batches.
+- Improve Telegram API error handling.
+- Add rate limiting for bulk operations.
+- Optimize large-volume data processing.
 
 ---
 
-## 🔗 Связанные документы
+## 📝 Notes
 
-- `docs/README.md` — индекс документации
-- `docs/reports_2026-02-16.tar.gz` — архив отчётов аудита и тестирования
+- All data is held in memory and periodically persisted to pickle files.
+- Google Sheets integration requires a configured `gs` object.
+- Logging uses Python's standard `logging` module.
+- Functions follow the project's CONTEXT7 conventions: complete implementation, error handling, logging and docstrings.
+
+---
+
+## 🔗 Related documents
+
+- `docs/README.md` — documentation index.
+- `docs/CUSTOMER_OVERVIEW.md` — non-technical stakeholder overview.
+- `docs/reports_2026-02-16.tar.gz` — archived audit and testing reports.
