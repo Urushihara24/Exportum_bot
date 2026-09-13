@@ -1,50 +1,50 @@
-# EXPORTUM Bot - простое описание для заказчика
+# EXPORTUM Bot — Simple Customer Overview
 
-## Что это за бот
+## What this bot is
 
-`EXPORTUM Bot` - это Telegram-бот для организации поставок зерна.
-Он связывает в одном месте:
-- фермеров (кто продает зерно),
-- экспортеров (кто формирует отгрузки),
-- логистов (кто организует перевозку),
-- экспедиторов (кто сопровождает перевозку).
+`EXPORTUM Bot` is a Telegram bot for coordinating grain shipments.
+It brings together:
+- farmers who sell grain,
+- exporters who assemble shipments,
+- logistics providers who organize transportation,
+- freight forwarders who coordinate shipment handling.
 
-Бот помогает пройти путь от заявки до завершенной перевозки без хаоса в чатах и таблицах.
+The bot helps participants move from an initial request to a completed shipment without losing context across chats and spreadsheets.
 
-## Какую проблему решает
+## What problem it solves
 
-Без системы процессы часто "расползаются":
-- заявки теряются,
-- статусы непонятны,
-- сложно понять, кто сейчас отвечает за этап,
-- возникают ошибки при повторных назначениях.
+Without a shared system, operational processes tend to fragment:
+- requests get lost,
+- statuses become unclear,
+- responsibility for the current stage is difficult to identify,
+- duplicate or repeated assignments cause errors.
 
-Бот делает процесс прозрачным: у каждой заявки, пула и перевозки есть понятный статус и ответственный.
+The bot makes the process transparent: every request, pool and shipment has a clear status and responsible participant.
 
-## Как это работает в 5 шагах
+## How it works in five steps
 
-1. Экспортер или фермер создает заявку/пул.
-2. Логисты отправляют свои предложения.
-3. Заказчик выбирает логиста.
-4. Экспедиторы отправляют предложения.
-5. Заказчик выбирает экспедитора, и перевозка переходит в работу до завершения.
+1. An exporter or farmer creates a request or pool.
+2. Logistics providers submit offers.
+3. The customer selects a logistics provider.
+4. Freight forwarders submit offers.
+5. The customer selects a freight forwarder and the shipment moves into active execution until completion.
 
-## Что получает бизнес
+## Business value
 
-- Единый процесс в Telegram (без отдельного сложного интерфейса).
-- Прозрачная цепочка действий по каждой заявке.
-- Контроль этапов: кто выбран, что в работе, что завершено.
-- Снижение операционных ошибок за счет проверок статусов.
-- Быстрый запуск и удобная работа для участников с телефона.
+- One operational flow inside Telegram without a separate complex interface.
+- Clear action history for every request.
+- Stage control: who was selected, what is active and what is complete.
+- Fewer operational mistakes through status-transition checks.
+- Fast onboarding and convenient mobile access for participants.
 
-## Что уже реализовано
+## Already implemented
 
-- Работа с ролями: фермер, экспортер, логист, экспедитор, админ.
-- Создание и ведение пулов, заявок и партий.
-- Подача и выбор предложений логистов и экспедиторов.
-- Управление статусами заявок, офферов, сделок и доставок.
-- Базовая аналитика и административные действия.
+- Role-based flows for farmers, exporters, logistics providers, freight forwarders and administrators.
+- Creation and management of pools, requests and grain batches.
+- Submission and selection of logistics and freight-forwarder offers.
+- Status management for requests, offers, deals and deliveries.
+- Basic analytics and administrative operations.
 
-## Коротко
+## In short
 
-Это рабочий инструмент для координации агрологистики в Telegram: от формирования заявки до закрытия перевозки с понятной ответственностью на каждом этапе.
+This is an operational Telegram tool for agricultural logistics: from creating a request to closing a shipment, with clear responsibility at every stage.
