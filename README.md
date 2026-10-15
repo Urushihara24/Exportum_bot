@@ -1,4 +1,6 @@
-# 🤖 EXPORTUM Bot — Production Documentation
+# 🤖 EXPORTUM Bot — Agricultural Logistics Automation
+
+Telegram workflow automation for coordinating grain pools, offers, logistics and freight-forwarding operations across multiple participant roles.
 
 <div align="center">
 
@@ -11,6 +13,17 @@
 [![CI](https://img.shields.io/github/actions/workflow/status/Urushihara24/Exportum_bot/ci.yml?branch=main&style=for-the-badge&label=CI)](https://github.com/Urushihara24/Exportum_bot/actions/workflows/ci.yml)
 
 </div>
+
+## Product snapshot
+
+| Area | Capability |
+|---|---|
+| **Roles** | farmer, exporter, logistics provider, freight forwarder and administrator workflows |
+| **Trade flow** | grain batches, pools, offers, participant selection, deals and delivery lifecycle |
+| **Operations** | role-aware Telegram FSM, notifications, analytics, broadcast and CSV/JSON export |
+| **Data** | in-memory domain state with pickle persistence plus Google Sheets/reporting integrations |
+| **Runtime baseline** | clean-runner verified on Python 3.11 with dependency install, `pip check`, import smoke, compile and shell validation |
+| **Known migration** | `aiogram 2.x` / `aiohttp 3.8.x` modernization is tracked explicitly in issue #3; Python 3.12 is not claimed yet |
 
 ## 🚀 Quick start
 
