@@ -1,13 +1,14 @@
-# 🤖 EXPORTUM Bot — Documentation
+# 🤖 EXPORTUM Bot — Production Documentation
 
 <div align="center">
 
-[![Python](https://img.shields.io/badge/Python-3.x-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/Python-3.11-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
 [![Aiogram](https://img.shields.io/badge/Aiogram-2.25.2-26A5E4?style=for-the-badge&logo=telegram&logoColor=white)](https://docs.aiogram.dev/)
 [![Telegram](https://img.shields.io/badge/Telegram-Bot-26A5E4?style=for-the-badge&logo=telegram&logoColor=white)](https://core.telegram.org/bots)
 [![Pandas](https://img.shields.io/badge/Pandas-Data-150458?style=for-the-badge&logo=pandas&logoColor=white)](https://pandas.pydata.org/)
 [![Google Sheets](https://img.shields.io/badge/Google_Sheets-Integration-34A853?style=for-the-badge&logo=googlesheets&logoColor=white)](https://developers.google.com/sheets/api)
 [![pytest](https://img.shields.io/badge/pytest-Verification-0A9EDC?style=for-the-badge&logo=pytest&logoColor=white)](https://pytest.org/)
+[![CI](https://img.shields.io/github/actions/workflow/status/Urushihara24/Exportum_bot/ci.yml?branch=main&style=for-the-badge&label=CI)](https://github.com/Urushihara24/Exportum_bot/actions/workflows/ci.yml)
 
 </div>
 
@@ -21,11 +22,17 @@ python3 -m venv .venv
 ./run.sh
 ```
 
+### Verified runtime baseline
+
+The current dependency set is clean-runner verified on **Python 3.11**: full dependency installation, `pip check`, core-library import smoke, runtime compilation, shell syntax and `.env` hygiene are enforced by CI.
+
+Python 3.12 support is intentionally not claimed yet. The remaining `aiogram 2.x` / `aiohttp 3.8.x` compatibility and security migration is tracked in [#3](https://github.com/Urushihara24/Exportum_bot/issues/3); it is not hidden with vulnerability ignores.
+
 ## 📋 Description
 
 **EXPORTUM** is a Telegram bot for an agricultural logistics platform that connects farmers, exporters, logistics providers and freight forwarders to coordinate grain shipments efficiently.
 
-## 🧠 Status logic (current as of 2026-03-13)
+## 🧠 Status logic
 
 ### Request lifecycle
 - `active/open/new/has_offers` — request is open to logistics providers.
