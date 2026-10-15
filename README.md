@@ -11,6 +11,7 @@ Telegram workflow automation for coordinating grain pools, offers, logistics and
 [![Google Sheets](https://img.shields.io/badge/Google_Sheets-Integration-34A853?style=for-the-badge&logo=googlesheets&logoColor=white)](https://developers.google.com/sheets/api)
 [![pytest](https://img.shields.io/badge/pytest-Verification-0A9EDC?style=for-the-badge&logo=pytest&logoColor=white)](https://pytest.org/)
 [![CI](https://img.shields.io/github/actions/workflow/status/Urushihara24/Exportum_bot/ci.yml?branch=main&style=for-the-badge&label=CI)](https://github.com/Urushihara24/Exportum_bot/actions/workflows/ci.yml)
+[![Security](https://img.shields.io/github/actions/workflow/status/Urushihara24/Exportum_bot/security.yml?branch=main&style=for-the-badge&label=Security)](https://github.com/Urushihara24/Exportum_bot/actions/workflows/security.yml)
 
 </div>
 
