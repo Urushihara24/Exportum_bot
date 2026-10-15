@@ -11,8 +11,9 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.11", "3.12"]
     steps:
@@ -20,6 +21,26 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install declared dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip check
+      - name: Smoke-import core runtime dependencies
+        run: |
+          python - <<'PY'
+          import aiogram
+          import aiohttp
+          import pandas
+          import gspread
+          import requests
+          import pydantic
+          import bs4
+          import apscheduler
+          print("dependency import smoke: ok")
+          PY
       - name: Compile Python runtime
         run: python -m py_compile main.py
       - name: Validate shell launcher syntax
