@@ -37,6 +37,8 @@ jobs:
           import apscheduler
           print("dependency import smoke: ok")
           PY
+      - name: Run migration characterization tests
+        run: python -m pytest -q tests
       - name: Compile Python runtime
         run: python -m py_compile main.py
       - name: Validate shell launcher syntax
